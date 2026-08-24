@@ -1,0 +1,723 @@
+# -*- coding: utf-8 -*-
+"""hy3api - SQLite 数据层"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import secrets
+import sqlite3
+import threading
+import time
+
+def _resolve_db_path() -> str:
+    """数据库位置优先级：HY3API_DB > HY3API_DATA_DIR/hy3api.db > 代码目录。
+
+    容器里挂 volume 到 /data 并设 HY3API_DATA_DIR=/data 即可持久化。
+    """
+    p = os.environ.get("HY3API_DB")
+    if p:
+        return p
+    d = os.environ.get("HY3API_DATA_DIR")
+    if d:
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, "hy3api.db")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hy3api.db")
+
+
+DB_PATH = _resolve_db_path()
+
+_local = threading.local()
+_write_lock = threading.RLock()
+
+# 首次初始化用的默认凭据，可用环境变量覆盖（仅在数据库为空时生效）
+DEFAULT_ADMIN_PASSWORD = os.environ.get("HY3API_ADMIN_PASSWORD") or "admin"
+DEFAULT_API_KEY = os.environ.get("HY3API_DEFAULT_KEY") or "hy3api"
+
+
+def get_conn() -> sqlite3.Connection:
+    """返回一个【全新】的 SQLite 连接。
+
+    重要：每次都新建连接，不缓存。原因——
+
+    在 WAL 模式下，长生命周期的缓存连接会持有「首次读时的快照」，导致跨线程
+    （统计落库后台线程写入、请求线程读取）读到陈旧数据。改为每次新建连接后，
+    每个读都看到最新已提交内容，彻底消除该竞态。
+
+    调用方均以 `db.get_conn().execute(...)` 形式使用，表达式结束后连接引用计数
+    归零、由 __del__ 立即关闭，不会泄漏文件描述符；开销仅为每次约亚毫秒级的
+    连接创建，相对上游网络往返可忽略。
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    # autocommit：每条语句独立事务，读永远看到最新提交。
+    conn.isolation_level = None
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def hash_pw(pw: str, salt: str | None = None) -> str:
+    salt = salt or secrets.token_hex(8)
+    h = hashlib.sha256((salt + pw).encode("utf-8")).hexdigest()
+    return "%s$%s" % (salt, h)
+
+
+def verify_pw(pw: str, stored: str) -> bool:
+    try:
+        salt, _ = stored.split("$", 1)
+    except ValueError:
+        return False
+    return secrets.compare_digest(hash_pw(pw, salt), stored)
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT,
+    updated_at  INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS accounts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform        TEXT NOT NULL,
+    label           TEXT DEFAULT '',
+    email           TEXT DEFAULT '',
+    uid             TEXT DEFAULT '',
+    nickname        TEXT DEFAULT '',
+    enterprise_id   TEXT DEFAULT '',
+    enterprise_name TEXT DEFAULT '',
+    access_token    TEXT NOT NULL,
+    refresh_token   TEXT DEFAULT '',
+    token_type      TEXT DEFAULT 'Bearer',
+    expires_at      INTEGER DEFAULT 0,
+    domain          TEXT DEFAULT '',
+    state           TEXT DEFAULT '',
+    source          TEXT DEFAULT '',
+    enabled         INTEGER DEFAULT 1,
+    weight          INTEGER DEFAULT 1,
+    status          TEXT DEFAULT 'active',
+    status_reason   TEXT DEFAULT '',
+    plan_type       TEXT DEFAULT '',
+    quota_total     REAL DEFAULT 0,
+    quota_used      REAL DEFAULT 0,
+    quota_remain    REAL DEFAULT 0,
+    quota_unit      TEXT DEFAULT 'credits',
+    quota_raw       TEXT DEFAULT '',
+    quota_updated_at INTEGER DEFAULT 0,
+    checkin_today   INTEGER DEFAULT 0,
+    checkin_streak  INTEGER DEFAULT 0,
+    checkin_last_date TEXT DEFAULT '',
+    checkin_credit  INTEGER DEFAULT 0,
+    checkin_updated_at INTEGER DEFAULT 0,
+    req_count       INTEGER DEFAULT 0,
+    fail_count      INTEGER DEFAULT 0,
+    last_used       INTEGER DEFAULT 0,
+    last_error      TEXT DEFAULT '',
+    created_at      INTEGER,
+    updated_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_accounts_platform ON accounts(platform, enabled);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT DEFAULT '',
+    api_key     TEXT NOT NULL UNIQUE,
+    enabled     INTEGER DEFAULT 1,
+    platform    TEXT DEFAULT '',
+    req_count   INTEGER DEFAULT 0,
+    last_used   INTEGER DEFAULT 0,
+    created_at  INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS logs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           INTEGER,
+    api_key_id   INTEGER,
+    account_id   INTEGER,
+    platform     TEXT,
+    model        TEXT,
+    status       INTEGER,
+    stream       INTEGER,
+    duration_ms  INTEGER,
+    prompt_chars INTEGER DEFAULT 0,
+    error        TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts DESC);
+
+CREATE TABLE IF NOT EXISTS pending_login (
+    state       TEXT PRIMARY KEY,
+    platform    TEXT,
+    auth_url    TEXT,
+    label       TEXT DEFAULT '',
+    created_at  INTEGER,
+    done        INTEGER DEFAULT 0
+);
+"""
+
+DEFAULT_SETTINGS = {
+    # 留空表示从运行时探测注册表自动选择首个 chat 模型；不内置模型 ID。
+    "default_model": "",
+    "strategy": "least_used",
+    "auto_refresh": "1",
+    "refresh_ahead": "900",
+    "model_base_override": "",
+    "allow_model_passthrough": "1",
+    "log_retention": "2000",
+    # 国际站要求首条 system 消息，客户端没传时用它补齐
+    "system_prompt": "",
+    # 每日签到：每天到点自动签到 + 手动签到（仅 CN 域平台）
+    "auto_checkin": "1",
+    "checkin_time": "00:00",
+    # 积分阈值门控：账号剩余积分低于阈值时，禁止调用「会扣积分」的模型
+    # （hy3 等计费模型）；free_models 列出的模型视为免费，永远放行。
+    "credit_threshold": "1",
+    "free_models": "",
+    # 是否开放「公共号池扩充」入口：终端用户可扫码/网页登录把自己的账号贡献进号池
+    "public_join_enabled": "1",
+}
+
+
+def init_db():
+    conn = get_conn()
+    with _write_lock:
+        conn.executescript(SCHEMA)
+        conn.commit()
+
+    _migrate_accounts_columns()
+    _migrate_logs_columns()
+
+    if get_setting("admin_password") is None:
+        set_setting("admin_password", hash_pw(DEFAULT_ADMIN_PASSWORD))
+    for k, v in DEFAULT_SETTINGS.items():
+        if get_setting(k) is None:
+            set_setting(k, v)
+
+    row = conn.execute("SELECT COUNT(*) c FROM api_keys").fetchone()
+    if row["c"] == 0:
+        add_api_key("默认密钥", DEFAULT_API_KEY)
+
+
+def _migrate_accounts_columns():
+    """为已存在的 accounts 表补齐签到相关字段（SCHEMA 的 IF NOT EXISTS 不会改已有表）。
+
+    仅在列缺失时 ALTER，保证老库升级无损。
+    """
+    needed = {
+        "checkin_today": "INTEGER DEFAULT 0",
+        "checkin_streak": "INTEGER DEFAULT 0",
+        "checkin_last_date": "TEXT DEFAULT ''",
+        "checkin_credit": "INTEGER DEFAULT 0",
+        "checkin_updated_at": "INTEGER DEFAULT 0",
+        "source": "TEXT DEFAULT ''",
+    }
+    with _write_lock:
+        c = get_conn()
+        existing = {r[1] for r in c.execute("PRAGMA table_info(accounts)")}
+        for col, typ in needed.items():
+            if col not in existing:
+                c.execute("ALTER TABLE accounts ADD COLUMN %s %s" % (col, typ))
+        c.commit()
+
+
+def _migrate_logs_columns():
+    """为已存在的 logs 表补齐 token 用量与积分扣费字段。
+
+    新增列：
+        prompt_tokens     - 提示 tokens（来自上游 usage）
+        completion_tokens - 补全 tokens
+        total_tokens      - 合计 tokens
+        credit_cost       - 本次调用从账号扣除的积分（按 model_price 折算）
+    """
+    needed = {
+        "prompt_tokens": "INTEGER DEFAULT 0",
+        "completion_tokens": "INTEGER DEFAULT 0",
+        "total_tokens": "INTEGER DEFAULT 0",
+        "credit_cost": "REAL DEFAULT 0",
+        # 1 = credit_cost 来自上游 usage.credit；0 = 历史人工估算/未知。
+        # 统计面板只汇总真实上游积分，避免把旧估算值冒充实际扣费。
+        "credit_actual": "INTEGER DEFAULT 0",
+    }
+    with _write_lock:
+        c = get_conn()
+        existing = {r[1] for r in c.execute("PRAGMA table_info(logs)")}
+        for col, typ in needed.items():
+            if col not in existing:
+                c.execute("ALTER TABLE logs ADD COLUMN %s %s" % (col, typ))
+        # 复合索引（按模型+日期聚合用）
+        existing_idx = {
+            (r[0] if len(r) > 0 else "")
+            for r in c.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_logs_%'"
+            )
+        }
+        for idx_name, cols in (
+            ("idx_logs_model_ts", "model,ts"),
+            ("idx_logs_platform_ts", "platform,ts"),
+        ):
+            if idx_name not in existing_idx:
+                c.execute("CREATE INDEX IF NOT EXISTS %s ON logs(%s)" % (idx_name, cols))
+        c.commit()
+
+
+def get_secret_key() -> str:
+    """Flask session 密钥。
+
+    优先取环境变量；否则持久化在数据库里，保证容器重启后登录态不失效。
+    """
+    env = os.environ.get("HY3API_SECRET")
+    if env:
+        return env
+    v = get_setting("_secret_key")
+    if not v:
+        v = secrets.token_hex(32)
+        set_setting("_secret_key", v)
+    return v
+
+
+# ------------------------------ settings ------------------------------
+
+def get_setting(key: str, default=None):
+    row = get_conn().execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value):
+    with _write_lock:
+        c = get_conn()
+        c.execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, str(value), int(time.time())))
+        c.commit()
+
+
+def all_settings() -> dict:
+    rows = get_conn().execute("SELECT key,value FROM settings").fetchall()
+    return {r["key"]: r["value"] for r in rows}
+
+
+# --------------------------------------------------------------------------
+# 动态模型注册表（运行时真实探测得到，不是内置目录）
+# --------------------------------------------------------------------------
+
+def get_model_registry() -> dict:
+    """返回 {model_id: {"type": "chat"|"image"|"audio", "platforms": [...]} }。"""
+    import json as _json
+    raw = get_setting("discovered_models", "{}") or "{}"
+    try:
+        d = _json.loads(raw)
+    except Exception:
+        d = {}
+    return d if isinstance(d, dict) else {}
+
+
+def set_model_registry(registry: dict) -> None:
+    import json as _json
+    set_setting("discovered_models", _json.dumps(registry, ensure_ascii=False))
+
+
+# --------------------------------------------------------------------------
+# 探测负面缓存（运行时真实探测得到的「不存在」结论，带 TTL）
+# --------------------------------------------------------------------------
+# 客户端请求一个注册表外的模型时，proxy.model_route 会触发实时探测回退
+# （见 discovery.live_probe_model）。若探测确认该模型在各平台均不可用，
+# 把结论缓存一段时间，避免对同一个不存在的模型反复发起昂贵的真实请求。
+# 缓存条目 {model_id: unix_ts}；TTL 由 proxy 侧常量控制，过期后自动重探。
+
+def get_probe_failures() -> dict:
+    """返回 {model_id: unix_ts}。"""
+    import json as _json
+    raw = get_setting("model_probe_failures", "{}") or "{}"
+    try:
+        d = _json.loads(raw)
+    except Exception:
+        d = {}
+    return d if isinstance(d, dict) else {}
+
+
+def set_probe_failures(failures: dict) -> None:
+    import json as _json
+    set_setting("model_probe_failures", _json.dumps(failures, ensure_ascii=False))
+
+
+# ------------------------------ accounts ------------------------------
+
+def add_account(platform, access_token, refresh_token="", expires_at=0, domain="",
+                token_type="Bearer", email="", uid="", nickname="",
+                enterprise_id="", enterprise_name="", state="", label="",
+                source="") -> int:
+    now = int(time.time())
+    with _write_lock:
+        c = get_conn()
+        cur = c.execute(
+            """INSERT INTO accounts(platform,label,email,uid,nickname,enterprise_id,
+               enterprise_name,access_token,refresh_token,token_type,expires_at,domain,
+               state,source,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (platform, label, email, uid, nickname, enterprise_id, enterprise_name,
+             access_token, refresh_token or "", token_type, int(expires_at or 0),
+             domain or "", state, source or "", now, now))
+        c.commit()
+        return cur.lastrowid
+
+
+def find_account_by_uid(platform, uid):
+    if not uid:
+        return None
+    return get_conn().execute(
+        "SELECT * FROM accounts WHERE platform=? AND uid=?", (platform, uid)).fetchone()
+
+
+def update_account(account_id: int, **fields):
+    if not fields:
+        return
+    fields["updated_at"] = int(time.time())
+    cols = ", ".join("%s=?" % k for k in fields)
+    vals = list(fields.values()) + [account_id]
+    with _write_lock:
+        c = get_conn()
+        c.execute("UPDATE accounts SET %s WHERE id=?" % cols, vals)
+        c.commit()
+
+
+def delete_account(account_id: int):
+    with _write_lock:
+        c = get_conn()
+        c.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+        c.commit()
+
+
+def get_account(account_id: int):
+    return get_conn().execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+
+
+def list_accounts(platform: str | None = None) -> list:
+    sql = "SELECT * FROM accounts"
+    args = []
+    if platform:
+        sql += " WHERE platform=?"
+        args.append(platform)
+    sql += " ORDER BY id ASC"
+    return get_conn().execute(sql, args).fetchall()
+
+
+def pick_account(platform: str | None = None, strategy: str = "least_used",
+                 exclude: list | None = None, min_quota: float = 0):
+    """按策略选出一个可用账号。exclude 为已失败的 account_id 列表。
+
+    min_quota > 0 时仅选「剩余积分 >= min_quota」的账号；若账号从未刷新过额度
+    （quota_updated_at=0，无法判断），一律放行，避免误杀未初始化的账号。
+    """
+    sql = "SELECT * FROM accounts WHERE enabled=1 AND status!='banned'"
+    args = []
+    if platform:
+        sql += " AND platform=?"
+        args.append(platform)
+    if exclude:
+        sql += " AND id NOT IN (%s)" % ",".join("?" * len(exclude))
+        args.extend(exclude)
+    if min_quota:
+        sql += " AND (quota_remain >= ? OR quota_updated_at = 0)"
+        args.append(min_quota)
+
+    if strategy == "round_robin":
+        sql += " ORDER BY last_used ASC, id ASC"
+    elif strategy == "random":
+        sql += " ORDER BY RANDOM()"
+    else:
+        sql += " ORDER BY req_count ASC, last_used ASC, id ASC"
+
+    return get_conn().execute(sql + " LIMIT 1", args).fetchone()
+
+
+def count_accounts(platform: str | None = None, enabled: int | None = None) -> int:
+    sql = "SELECT COUNT(*) c FROM accounts WHERE 1=1"
+    args = []
+    if platform:
+        sql += " AND platform=?"
+        args.append(platform)
+    if enabled is not None:
+        sql += " AND enabled=?"
+        args.append(int(enabled))
+    return get_conn().execute(sql, args).fetchone()["c"]
+
+
+def bump_account(account_id: int, ok: bool, error: str = ""):
+    now = int(time.time())
+    with _write_lock:
+        c = get_conn()
+        if ok:
+            c.execute("UPDATE accounts SET req_count=req_count+1, last_used=?, "
+                      "last_error='' WHERE id=?", (now, account_id))
+        else:
+            c.execute("UPDATE accounts SET req_count=req_count+1, fail_count=fail_count+1, "
+                      "last_used=?, last_error=? WHERE id=?", (now, (error or "")[:500], account_id))
+        c.commit()
+
+
+def save_quota(account_id: int, summary: dict):
+    update_account(
+        account_id,
+        plan_type=summary.get("plan_type", ""),
+        quota_total=summary.get("total", 0),
+        quota_used=summary.get("used", 0),
+        quota_remain=summary.get("remain", 0),
+        quota_unit=summary.get("unit", "credits"),
+        quota_raw=json.dumps(summary.get("packages", []), ensure_ascii=False)[:20000],
+        quota_updated_at=int(time.time()),
+    )
+
+
+# ------------------------------ api keys ------------------------------
+
+def add_api_key(name: str, key: str | None = None, platform: str = "") -> str:
+    key = key or ("sk-hy3-" + secrets.token_urlsafe(24))
+    with _write_lock:
+        c = get_conn()
+        c.execute("INSERT OR IGNORE INTO api_keys(name,api_key,platform,created_at) "
+                  "VALUES(?,?,?,?)", (name, key, platform, int(time.time())))
+        c.commit()
+    return key
+
+
+def list_api_keys() -> list:
+    return get_conn().execute("SELECT * FROM api_keys ORDER BY id ASC").fetchall()
+
+
+def get_api_key(key: str):
+    return get_conn().execute(
+        "SELECT * FROM api_keys WHERE api_key=? AND enabled=1", (key,)).fetchone()
+
+
+def delete_api_key(kid: int):
+    with _write_lock:
+        c = get_conn()
+        c.execute("DELETE FROM api_keys WHERE id=?", (kid,))
+        c.commit()
+
+
+def toggle_api_key(kid: int, enabled: int):
+    with _write_lock:
+        c = get_conn()
+        c.execute("UPDATE api_keys SET enabled=? WHERE id=?", (int(enabled), kid))
+        c.commit()
+
+
+def bump_api_key(kid: int):
+    with _write_lock:
+        c = get_conn()
+        c.execute("UPDATE api_keys SET req_count=req_count+1, last_used=? WHERE id=?",
+                  (int(time.time()), kid))
+        c.commit()
+
+
+# ------------------------------ logs ------------------------------
+
+def add_log(api_key_id, account_id, platform, model, status, stream,
+            duration_ms, prompt_chars=0, error="",
+            prompt_tokens=0, completion_tokens=0, total_tokens=0,
+            credit_cost=0.0, credit_actual=False):
+    with _write_lock:
+        c = get_conn()
+        c.execute("""INSERT INTO logs(ts,api_key_id,account_id,platform,model,status,
+                     stream,duration_ms,prompt_chars,error,
+                     prompt_tokens,completion_tokens,total_tokens,credit_cost,credit_actual)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (int(time.time()), api_key_id, account_id, platform, model, status,
+                   1 if stream else 0, duration_ms, prompt_chars, (error or "")[:500],
+                   int(prompt_tokens or 0), int(completion_tokens or 0),
+                   int(total_tokens or 0), float(credit_cost or 0),
+                   1 if credit_actual else 0))
+        c.commit()
+
+
+def overview_usage(days: int = 7) -> dict:
+    """聚合仪表盘数据：剩余额度 / 调用趋势 / 各模型 / 各平台 / 扣费明细。"""
+    import time as _t
+    c = get_conn()
+    now = int(_t.time())
+    day_ago = now - 86400
+    week_ago = now - 86400 * days
+
+    # 剩余额度（号池所有账号的剩余积分合计 = quota_remain 之和）
+    pool_row = c.execute(
+        "SELECT COALESCE(SUM(COALESCE(quota_remain,0)), 0.0) credits, COUNT(*) total, "
+        "       SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) enabled "
+        "FROM accounts"
+    ).fetchone()
+    pool_credits = float(pool_row["credits"] or 0)
+
+    # 今日调用
+    today = c.execute(
+        "SELECT COUNT(*) c, COALESCE(SUM(total_tokens), 0) tokens, "
+        "       COALESCE(SUM(prompt_tokens), 0) pt, "
+        "       COALESCE(SUM(completion_tokens), 0) ct, "
+        "       COALESCE(SUM(CASE WHEN credit_actual=1 THEN credit_cost ELSE 0 END), 0.0) cost "
+        "FROM logs WHERE ts>=? AND status<400",
+        (day_ago,),
+    ).fetchone()
+    today_calls = int(today["c"] or 0)
+
+    # 7 天每日调用量（含 0 填充）
+    bucket_rows = c.execute(
+        "SELECT (ts/?)*? AS bucket, "
+        "       COUNT(*) c, COALESCE(SUM(total_tokens),0) tokens, "
+        "       COALESCE(SUM(CASE WHEN credit_actual=1 THEN credit_cost ELSE 0 END),0.0) cost "
+        "FROM logs WHERE ts>=? "
+        "GROUP BY bucket ORDER BY bucket ASC",
+        (86400, 86400, week_ago),
+    ).fetchall()
+    by_day = {}
+    for r in bucket_rows:
+        key = str(r["bucket"])
+        by_day[key] = {
+            "bucket": key,
+            "calls": int(r["c"] or 0),
+            "tokens": int(r["tokens"] or 0),
+            "cost": float(r["cost"] or 0),
+        }
+    series = []
+    for i in range(days):
+        b = (now - (days - 1 - i) * 86400) // 86400 * 86400
+        rec = by_day.get(str(b)) or {"bucket": str(b), "calls": 0, "tokens": 0, "cost": 0}
+        rec["bucket"] = str(b)
+        series.append(rec)
+
+    # 按模型
+    by_model_rows = c.execute(
+        "SELECT model, COUNT(*) c, COALESCE(SUM(total_tokens),0) tokens, "
+        "       COALESCE(SUM(CASE WHEN credit_actual=1 THEN credit_cost ELSE 0 END),0.0) cost "
+        "FROM logs WHERE ts>=? AND status<400 AND model<>'' "
+        "GROUP BY model ORDER BY tokens DESC LIMIT 12",
+        (week_ago,),
+    ).fetchall()
+    by_model = [
+        {"model": r["model"] or "-", "calls": int(r["c"] or 0),
+         "tokens": int(r["tokens"] or 0), "cost": float(r["cost"] or 0)}
+        for r in by_model_rows
+    ]
+
+    # 按平台
+    by_platform_rows = c.execute(
+        "SELECT platform, COUNT(*) c, COALESCE(SUM(total_tokens),0) tokens, "
+        "       COALESCE(SUM(CASE WHEN credit_actual=1 THEN credit_cost ELSE 0 END),0.0) cost "
+        "FROM logs WHERE ts>=? AND status<400 AND platform<>'' "
+        "GROUP BY platform ORDER BY cost DESC",
+        (week_ago,),
+    ).fetchall()
+    by_platform = [
+        {"platform": r["platform"] or "-", "calls": int(r["c"] or 0),
+         "tokens": int(r["tokens"] or 0), "cost": float(r["cost"] or 0)}
+        for r in by_platform_rows
+    ]
+
+    # 扣费明细（最近 10 条 > 0）
+    deduct_rows = c.execute(
+        "SELECT id, ts, platform, model, account_id, status, "
+        "       total_tokens, credit_cost "
+        "FROM logs WHERE ts>=? AND credit_actual=1 AND credit_cost>0 "
+        "ORDER BY id DESC LIMIT 10",
+        (day_ago,),
+    ).fetchall()
+    deductions = [
+        {
+            "id": int(r["id"]),
+            "ts": int(r["ts"] or 0),
+            "platform": r["platform"] or "",
+            "model": r["model"] or "",
+            "account_id": int(r["account_id"] or 0),
+            "status": int(r["status"] or 0),
+            "tokens": int(r["total_tokens"] or 0),
+            "cost": float(r["credit_cost"] or 0),
+        }
+        for r in deduct_rows
+    ]
+
+    return {
+        "now": now,
+        "pool": {
+            "credits": pool_credits,
+            "accounts": int(pool_row["total"] or 0),
+            "enabled": int(pool_row["enabled"] or 0),
+        },
+        "today": {
+            "calls": today_calls,
+            "tokens": int(today["tokens"] or 0),
+            "prompt_tokens": int(today["pt"] or 0),
+            "completion_tokens": int(today["ct"] or 0),
+            "cost": float(today["cost"] or 0),
+        },
+        "series": series,
+        "by_model": by_model,
+        "by_platform": by_platform,
+        "deductions": deductions,
+        "credit_source": "upstream_usage",
+    }
+
+
+def list_logs(limit: int = 100) -> list:
+    return get_conn().execute(
+        "SELECT * FROM logs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+
+def trim_logs(keep: int = 2000):
+    with _write_lock:
+        c = get_conn()
+        c.execute("DELETE FROM logs WHERE id NOT IN "
+                  "(SELECT id FROM logs ORDER BY id DESC LIMIT ?)", (keep,))
+        c.commit()
+
+
+def stats() -> dict:
+    c = get_conn()
+    day_ago = int(time.time()) - 86400
+    row = c.execute(
+        "SELECT COUNT(*) total, SUM(CASE WHEN status<400 THEN 1 ELSE 0 END) ok "
+        "FROM logs WHERE ts>=?", (day_ago,)).fetchone()
+    acc = c.execute(
+        "SELECT COUNT(*) total, SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) active, "
+        "SUM(quota_remain) remain FROM accounts").fetchone()
+    keys = c.execute("SELECT COUNT(*) total FROM api_keys WHERE enabled=1").fetchone()
+    return {
+        "req_24h": row["total"] or 0,
+        "ok_24h": row["ok"] or 0,
+        "accounts": acc["total"] or 0,
+        "accounts_active": acc["active"] or 0,
+        "quota_remain": round(acc["remain"] or 0, 2),
+        "keys": keys["total"] or 0,
+    }
+
+
+# ------------------------------ pending login ------------------------------
+
+def add_pending(state, platform, auth_url, label=""):
+    with _write_lock:
+        c = get_conn()
+        c.execute("INSERT OR REPLACE INTO pending_login(state,platform,auth_url,label,"
+                  "created_at,done) VALUES(?,?,?,?,?,0)",
+                  (state, platform, auth_url, label, int(time.time())))
+        c.commit()
+
+
+def get_pending(state):
+    return get_conn().execute(
+        "SELECT * FROM pending_login WHERE state=?", (state,)).fetchone()
+
+
+def finish_pending(state):
+    with _write_lock:
+        c = get_conn()
+        c.execute("UPDATE pending_login SET done=1 WHERE state=?", (state,))
+        c.commit()
+
+
+def cleanup_pending(older_than: int = 3600):
+    with _write_lock:
+        c = get_conn()
+        c.execute("DELETE FROM pending_login WHERE created_at < ?",
+                  (int(time.time()) - older_than,))
+        c.commit()
+
+
+def row_to_dict(row) -> dict:
+    return dict(row) if row is not None else {}

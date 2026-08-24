@@ -1,0 +1,65 @@
+# ==========================================================================
+# 备选 Dockerfile：在容器内从源码构建前端（不需要本地先 npm run build）
+#
+# 使用：
+#   docker build -f Dockerfile.fullbuild -t hy3api:latest .
+#   或 docker-compose.yml 里 build 段加 dockerfile: Dockerfile.fullbuild
+#
+# 代价：需要拉 node 镜像 + 联网装 ~300MB npm 依赖，国内服务器较慢。
+#       网络不佳时建议用默认 Dockerfile（本地构建好 dist 再传）。
+# ==========================================================================
+
+# ---------- Stage 1: 构建前端 ----------
+FROM node:22-bookworm-slim AS webbuild
+
+WORKDIR /fe
+
+# 仅先拷清单，命中层缓存
+COPY frontend/package.json frontend/package-lock.json ./
+
+# ⚠️ 必须用 npm install 而非 npm ci：
+#    package-lock.json 是在 Windows 上生成的，optionalDependencies 里只记录了
+#    win32 平台的原生包（@tailwindcss/oxide-win32-*、@rollup/rollup-win32-*）。
+#    npm ci 严格按 lock 安装 → Linux 下缺 oxide/rollup 原生二进制 → build 失败。
+#    npm install 会按当前平台重新解析 optional deps。
+RUN npm install --no-audit --no-fund
+
+COPY frontend/ ./
+RUN npm run build \
+    && test -s dist/index.html
+
+# ---------- Stage 2: 运行时 ----------
+FROM python:3.12-slim
+
+LABEL org.opencontainers.image.title="hy3api" \
+      org.opencontainers.image.description="WorkBuddy / CodeBuddy CN / CodeBuddy 三平台 hy3 模型反代与号池面板"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TZ=Asia/Shanghai \
+    HY3API_DATA_DIR=/data \
+    HY3API_HOST=0.0.0.0 \
+    HY3API_PORT=8787
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app.py db.py providers.py proxy.py responses.py discovery.py ./
+COPY --from=webbuild /fe/dist/ ./frontend/dist/
+
+RUN useradd -r -u 10001 -m -d /home/hy3api hy3api \
+    && mkdir -p /data \
+    && chown -R hy3api:hy3api /app /data
+USER hy3api
+
+VOLUME ["/data"]
+EXPOSE 8787
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request,sys; \
+sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/health',timeout=4).status==200 else 1)"
+
+ENTRYPOINT ["python", "app.py"]

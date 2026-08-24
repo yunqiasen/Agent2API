@@ -1,0 +1,538 @@
+import { useEffect, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  Activity,
+  CheckCircle2,
+  FileUp,
+  Gift,
+  RefreshCw,
+  Trash2,
+  UserPlus,
+  Users,
+  KeyRound,
+  Coins,
+} from "lucide-react";
+import { toast } from "sonner";
+import { QRCodeSVG } from "qrcode.react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  Account,
+  apiDelete,
+  apiGet,
+  apiPatch,
+  apiPost,
+  ago,
+  num,
+  platName,
+  PLATFORMS,
+} from "@/lib/api";
+import {
+  Tile,
+  Chip,
+  PageHeader,
+  Progress,
+  type Tone,
+} from "@/lib/design";
+
+function QuotaCell({ a }: { a: Account }) {
+  const t = a.quota_total || 0;
+  const r = a.quota_remain || 0;
+  if (!t) return <span className="text-xs text-muted-foreground">未获取</span>;
+  const pct = Math.max(0, Math.min(100, (r / t) * 100));
+  const tone: Tone = pct < 10 ? "rose" : pct < 30 ? "amber" : "emerald";
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between text-xs">
+        <span className="text-muted-foreground">额度</span>
+        <span className="font-mono tabular-nums">
+          {num(r)} / {num(t)} {a.quota_unit || ""}
+        </span>
+      </div>
+      <Progress value={r} max={t} tone={tone} />
+      <div className="text-[11px] text-muted-foreground">
+        {(a.quota_packages?.length || 0) > 0 ? `${a.quota_packages!.length} 个套餐 · ` : ""}
+        {ago(a.quota_updated_at)}
+      </div>
+    </div>
+  );
+}
+
+function StatusBadge({ a }: { a: Account }) {
+  if (a.status === "active")
+    return <Chip tone="emerald">正常</Chip>;
+  if (a.status === "banned")
+    return <Chip tone="rose">封禁</Chip>;
+  return <Chip tone="slate">{a.status}</Chip>;
+}
+
+function TokenBadge({ a }: { a: Account }) {
+  const exp = a.expires_at_sec || 0;
+  const now = Math.floor(Date.now() / 1000);
+  if (!exp) return <Chip tone="slate">无有效期</Chip>;
+  if (exp <= now) return <Chip tone="rose">已过期</Chip>;
+  if (exp - now < 900) return <Chip tone="amber">即将过期</Chip>;
+  return <Chip tone="emerald">有效</Chip>;
+}
+
+function CheckinBadge({ a }: { a: Account }) {
+  if (!a.supports_checkin) return <Chip tone="slate">不适用</Chip>;
+  if (a.checkin_today)
+    return (
+      <span className="inline-flex items-center gap-1">
+        <Chip tone="emerald">已签到</Chip>
+        <span className="text-[11px] text-muted-foreground">连续 {a.checkin_streak || 0} 天</span>
+      </span>
+    );
+  return (
+    <span className="inline-flex items-center gap-1">
+      <Chip tone="slate">未签到</Chip>
+      {a.checkin_credit ? (
+        <span className="text-[11px] text-amber-600 dark:text-amber-400">可领 {a.checkin_credit} 积分</span>
+      ) : null}
+    </span>
+  );
+}
+
+function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOpenChange: (v: boolean) => void; onAdded: () => void }) {
+  const [platform, setPlatform] = useState(PLATFORMS[0].key);
+  const [label, setLabel] = useState("");
+  const [authUrl, setAuthUrl] = useState("");
+  const [state, setState] = useState("");
+  const [log, setLog] = useState("等待授权…");
+  const [started, setStarted] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timer.current) clearInterval(timer.current);
+    };
+  }, []);
+
+  function stop() {
+    if (timer.current) {
+      clearInterval(timer.current);
+      timer.current = null;
+    }
+  }
+
+  function reset() {
+    stop();
+    setAuthUrl("");
+    setState("");
+    setStarted(false);
+    setLog("等待授权…");
+    setBusy(false);
+  }
+
+  async function start() {
+    setBusy(true);
+    setLog("等待授权…");
+    try {
+      const d = await apiPost<{ ok: boolean; state: string; auth_url: string }>("/api/login/start", {
+        platform,
+        label: label || "后台添加",
+      });
+      setAuthUrl(d.auth_url);
+      setState(d.state);
+      setStarted(true);
+      let n = 0;
+      stop();
+      timer.current = setInterval(async () => {
+        n += 1;
+        if (n > 150) {
+          stop();
+          setLog("超时，请重试");
+          return;
+        }
+        try {
+          const r = await apiPost<{ ok: boolean; account_id?: number; pending?: boolean; msg?: string; error?: string }>(
+            "/api/login/poll",
+            { state: d.state }
+          );
+          if (r.ok) {
+            stop();
+            toast.success("账号已加入号池");
+            reset();
+            onOpenChange(false);
+            onAdded();
+          } else {
+            setLog(`等待授权… (${n}s) ${r.msg || r.error || ""}`);
+          }
+        } catch (e) {
+          setLog("轮询出错：" + (e instanceof Error ? e.message : ""));
+        }
+      }, 2000);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "获取授权链接失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(v) => {
+        if (!v) reset();
+        onOpenChange(v);
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>添加账号</DialogTitle>
+          <DialogDescription>扫码或网页登录授权，账号将加入号池。</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div className="space-y-2">
+            <Label>平台</Label>
+            <Select value={platform} onValueChange={setPlatform}>
+              <SelectTrigger className="h-9 bg-background">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {PLATFORMS.map((p) => (
+                  <SelectItem key={p.key} value={p.key}>
+                    {p.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-2">
+            <Label>备注（可选）</Label>
+            <Input className="h-9 bg-background" placeholder="例如 主号" value={label} onChange={(e) => setLabel(e.target.value)} />
+          </div>
+          {!started ? (
+            <Button className="w-full" onClick={start} disabled={busy}>
+              {busy ? "获取中…" : "获取授权链接"}
+            </Button>
+          ) : (
+            <Tabs defaultValue="scan">
+              <TabsList className="grid w-full grid-cols-2">
+                <TabsTrigger value="scan">扫码登录</TabsTrigger>
+                <TabsTrigger value="web">网页登录</TabsTrigger>
+              </TabsList>
+              <TabsContent value="scan" className="flex flex-col items-center gap-3 pt-4">
+                <div className="rounded-lg bg-white p-3">
+                  {authUrl && <QRCodeSVG value={authUrl} size={176} level="M" />}
+                </div>
+                <p className="text-center text-xs text-muted-foreground">用手机扫码完成授权，本窗口会自动检测。</p>
+              </TabsContent>
+              <TabsContent value="web" className="space-y-3 pt-4">
+                <textarea readOnly rows={3} value={authUrl} className="w-full rounded-md border border-input bg-background px-2.5 py-2 font-mono text-xs" />
+                <Button variant="secondary" className="w-full" onClick={() => window.open(authUrl, "_blank")}>
+                  在浏览器打开
+                </Button>
+              </TabsContent>
+            </Tabs>
+          )}
+          {started && (
+            <pre className="whitespace-pre-wrap break-all rounded-md bg-muted/40 p-3 text-xs text-muted-foreground">
+              {log}
+            </pre>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function ImportDialog({ open, onOpenChange, onAdded }: { open: boolean; onOpenChange: (v: boolean) => void; onAdded: () => void }) {
+  const [platform, setPlatform] = useState(PLATFORMS[0].key);
+  const [json, setJson] = useState("");
+  const [at, setAt] = useState("");
+  const [rt, setRt] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function doImport() {
+    setBusy(true);
+    try {
+      const body: any = { platform };
+      if (json.trim()) body.json_text = json.trim();
+      else {
+        body.access_token = at.trim();
+        body.refresh_token = rt.trim();
+      }
+      const d = await apiPost<{ added: number; updated: number }>("/api/accounts/import_token", body);
+      toast.success(`导入完成：新增 ${d.added}，更新 ${d.updated}`);
+      setJson("");
+      setAt("");
+      setRt("");
+      onOpenChange(false);
+      onAdded();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "导入失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>导入 Token / JSON</DialogTitle>
+          <DialogDescription>粘贴 Cockpit Tools 导出的 JSON，或手填 access_token。</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <div className="space-y-2">
+            <Label>平台</Label>
+            <Select value={platform} onValueChange={setPlatform}>
+              <SelectTrigger className="h-9 bg-background">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {PLATFORMS.map((p) => (
+                  <SelectItem key={p.key} value={p.key}>
+                    {p.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-2">
+            <Label>JSON（支持数组，按 uid 去重）</Label>
+            <textarea
+              rows={5}
+              value={json}
+              onChange={(e) => setJson(e.target.value)}
+              placeholder='[{"access_token":"...","refresh_token":"...","uid":"...","email":"..."}]'
+              className="w-full rounded-md border border-input bg-background px-2.5 py-2 font-mono text-xs"
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-2">
+              <Label>access_token</Label>
+              <Input className="h-9 bg-background font-mono text-xs" value={at} onChange={(e) => setAt(e.target.value)} />
+            </div>
+            <div className="space-y-2">
+              <Label>refresh_token</Label>
+              <Input className="h-9 bg-background font-mono text-xs" value={rt} onChange={(e) => setRt(e.target.value)} />
+            </div>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+            取消
+          </Button>
+          <Button onClick={doImport} disabled={busy}>
+            {busy ? "导入中…" : "导入"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export function Accounts() {
+  const [list, setList] = useState<Account[]>([]);
+  const [addOpen, setAddOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+
+  function load() {
+    apiGet<Account[]>("/api/accounts")
+      .then(setList)
+      .catch((e) => toast.error(e instanceof Error ? e.message : "加载失败"));
+  }
+  useEffect(load, []);
+
+  const now = Math.floor(Date.now() / 1000);
+  const total = list.length;
+  const enabled = list.filter((a) => a.enabled).length;
+  const claimable = list.reduce(
+    (s, a) => s + (a.supports_checkin && !a.checkin_today ? a.checkin_credit || 0 : 0),
+    0
+  );
+  const expiring = list.filter(
+    (a) => a.expires_at_sec && a.expires_at_sec - now < 900 && a.expires_at_sec > now
+  ).length;
+
+  async function toggle(id: number, on: boolean) {
+    await apiPatch(`/api/accounts/${id}`, { enabled: on ? 1 : 0 });
+    toast.success(on ? "已启用" : "已停用");
+    load();
+  }
+  async function del(id: number) {
+    if (!confirm(`确认删除账号 #${id}？`)) return;
+    await apiDelete(`/api/accounts/${id}`);
+    toast.success("已删除");
+    load();
+  }
+  async function refresh(id: number) {
+    toast("刷新中…");
+    try {
+      const d = await apiPost<{ ok: boolean; error?: string }>(`/api/accounts/${id}/refresh`, {});
+      toast.success(d.ok ? "已刷新令牌与额度" : "失败：" + (d.error || ""));
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "失败");
+    }
+    load();
+  }
+  async function checkin(id: number) {
+    toast("签到中…");
+    try {
+      const d = await apiPost<{ ok: boolean; claimed_credit?: number; error?: string }>(`/api/accounts/${id}/checkin`, {});
+      if (d.ok) toast.success(d.claimed_credit ? `已签到，获得 ${d.claimed_credit} 积分` : "已签到");
+      else toast.error("签到失败：" + (d.error || ""));
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "签到失败");
+    }
+    load();
+  }
+  async function quotaAll() {
+    toast("正在刷新全部额度…");
+    const d = await apiPost<{ results: { ok: boolean }[] }>("/api/accounts/quota_all", {});
+    const ok = d.results.filter((x) => x.ok).length;
+    toast.success(`完成：成功 ${ok} / ${d.results.length}`);
+    load();
+  }
+  async function checkinAll() {
+    toast("正在签到全部账号…");
+    await apiPost("/api/accounts/checkin_all", {});
+    toast.success("签到完成");
+    load();
+  }
+
+  return (
+    <div className="mx-auto w-full max-w-[1280px] space-y-5 p-5 md:p-7">
+      <PageHeader
+        icon={Users}
+        title="号池"
+        subtitle="管理接入的账号与额度 · 扫码添加或导入 Token"
+        right={
+          <>
+            <Button onClick={() => setAddOpen(true)} className="gap-1.5">
+              <UserPlus className="size-4" /> 添加账号
+            </Button>
+            <Button variant="secondary" onClick={() => setImportOpen(true)} className="gap-1.5">
+              <FileUp className="size-4" /> 导入 Token
+            </Button>
+            <Button variant="secondary" onClick={quotaAll} className="gap-1.5">
+              <Coins className="size-4" /> 刷新额度
+            </Button>
+            <Button variant="secondary" onClick={checkinAll} className="gap-1.5">
+              <Gift className="size-4" /> 全部签到
+            </Button>
+            <Button variant="ghost" size="icon" onClick={load} aria-label="刷新">
+              <RefreshCw className="size-4" />
+            </Button>
+          </>
+        }
+      />
+
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <Tile tone="indigo" icon={Users} label="账号总数" value={num(total)} hint="个" delay={0} />
+        <Tile tone="emerald" icon={Activity} label="已启用" value={num(enabled)} hint="个" delay={80} />
+        <Tile tone="amber" icon={Gift} label="今日可领积分" value={num(claimable)} hint="分" delay={160} />
+        <Tile tone="rose" icon={AlertTriangle} label="即将过期" value={num(expiring)} hint="个" delay={240} />
+      </div>
+
+      {list.length === 0 ? (
+        <div className="rounded-xl border bg-card px-5 py-16 text-center text-sm text-muted-foreground animate-in fade-in">
+          号池为空，点右上角「添加账号」开始接入
+        </div>
+      ) : (
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          {list.map((a, i) => {
+            const pt = (["indigo", "violet", "emerald", "amber", "cyan", "sky", "fuchsia", "orange"] as Tone[])[
+              i % 8
+            ];
+            return (
+              <div
+                key={a.id}
+                className="group flex flex-col rounded-xl border bg-card p-4 transition-all duration-300 hover:-translate-y-0.5 hover:shadow-sm animate-in fade-in slide-in-from-bottom-2"
+                style={{ animationDelay: `${Math.min(i, 12) * 45}ms` }}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="inline-flex size-8 items-center justify-center rounded-lg bg-secondary text-secondary-foreground">
+                      <KeyRound className="size-4" />
+                    </span>
+                    <div className="flex flex-col">
+                      <Chip>{platName(a.platform)}</Chip>
+                      <span className="mt-1 font-mono text-[11px] text-muted-foreground">#{a.id}</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <StatusBadge a={a} />
+                    <Switch checked={!!a.enabled} onCheckedChange={(v) => toggle(a.id, v)} />
+                  </div>
+                </div>
+
+                <div className="mt-3">
+                  <div className="truncate text-sm font-medium">{a.email || a.nickname || a.label || "-"}</div>
+                  <div className="font-mono text-[11px] text-muted-foreground">{(a.uid || "").slice(0, 22)}</div>
+                </div>
+
+                <div className="my-3 h-px bg-border" />
+
+                <div className="space-y-2.5">
+                  <QuotaCell a={a} />
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-muted-foreground">令牌</span>
+                    <span className="flex items-center gap-1.5">
+                      <TokenBadge a={a} />
+                      <span className="font-mono text-[11px] text-muted-foreground">{a.has_refresh ? "有刷新" : "无刷新"}</span>
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-muted-foreground">签到</span>
+                    <CheckinBadge a={a} />
+                  </div>
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-muted-foreground">调用</span>
+                    <span className="tabular-nums">
+                      {a.req_count || 0} 次 · 失败 {a.fail_count || 0} · {ago(a.last_used)}
+                    </span>
+                  </div>
+                  {a.last_error && (
+                    <div className="truncate rounded-md bg-rose-500/10 px-2 py-1 text-[11px] text-rose-600 dark:text-rose-400" title={a.last_error}>
+                      {a.last_error.slice(0, 40)}…
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-3 flex items-center gap-1 border-t pt-3">
+                  {a.supports_checkin && (
+                    <Button variant="ghost" size="sm" className="gap-1 text-emerald-600 dark:text-emerald-400" onClick={() => checkin(a.id)}>
+                      <CheckCircle2 className="size-3.5" /> 签到
+                    </Button>
+                  )}
+                  <Button variant="ghost" size="sm" className="gap-1" onClick={() => refresh(a.id)}>
+                    <RefreshCw className="size-3.5" /> 刷新
+                  </Button>
+                  <Button variant="ghost" size="sm" className="ml-auto gap-1 text-rose-600 dark:text-rose-400" onClick={() => del(a.id)}>
+                    <Trash2 className="size-3.5" /> 删除
+                  </Button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <AddAccountDialog open={addOpen} onOpenChange={setAddOpen} onAdded={load} />
+      <ImportDialog open={importOpen} onOpenChange={setImportOpen} onAdded={load} />
+    </div>
+  );
+}
