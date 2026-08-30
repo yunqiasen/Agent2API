@@ -209,7 +209,7 @@ def api_chat():
 
     _enqueue_stats(lambda: db.bump_api_key(kr["id"]))
 
-    is_trae = acc.get("platform") == "trae"
+    is_trae = proxy._is_trae_acc(acc)
 
     if want_stream:
         def generate():
@@ -493,7 +493,7 @@ def api_responses():
     # 非流式：聚合上游 chat 流 → 重排为 Responses 对象
     try:
         chat_obj = (proxy.aggregate_trae_stream(resp, model)
-                    if acc.get("platform") == "trae"
+                    if proxy._is_trae_acc(acc)
                     else proxy.aggregate_stream(resp, model))
     except Exception as e:
         db.bump_account(acc["id"], False, str(e))
@@ -1244,7 +1244,7 @@ def panel_test():
         return jsonify({"ok": False, "error": str(e)}), 200
     try:
         out = (proxy.aggregate_trae_stream(resp, model)
-               if acc.get("platform") == "trae"
+               if proxy._is_trae_acc(acc)
                else proxy.aggregate_stream(resp, model))
     except Exception as e:
         return jsonify({"ok": False, "error": "聚合失败: %s" % e}), 200

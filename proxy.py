@@ -456,8 +456,13 @@ def _upstream_headers(acc: dict, session_id: str | None = None) -> dict:
     )
 
 
+def _is_trae_acc(acc: dict) -> bool:
+    """账号是否 Trae 渠道（统一 provider 判断，避免散落字符串比较）。"""
+    return P._is_trae(acc.get("platform"))
+
+
 def _upstream_url(acc: dict) -> str:
-    if P.PLATFORMS.get(acc["platform"], {}).get("provider") == "trae":
+    if _is_trae_acc(acc):
         return P.chat_url(acc["platform"])
     override = (db.get_setting("model_base_override") or "").strip()
     return P.chat_url(acc["platform"], model_base=override or None)
@@ -870,8 +875,7 @@ def probe_account(account_row, model: str, timeout=(5, 30)) -> dict:
             return {"ok": False, "ms": int((time.time() - t0) * 1000),
                     "platform": acc["platform"], "model": model,
                     "error": "HTTP %s %s" % (resp.status_code, text)}
-        out = (aggregate_trae_stream(resp, model)
-               if acc.get("platform") == "trae"
+        out = (aggregate_trae_stream(resp, model) if _is_trae_acc(acc)
                else aggregate_stream(resp, model))
         msg = ((out.get("choices") or [{}])[0].get("message") or {})
         reply = str(msg.get("content") or "")[:120]
