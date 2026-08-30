@@ -360,11 +360,19 @@ def run_discovery() -> dict:
         # 任务并释放执行器。正在运行的探测受 _PROBE_TIMEOUT 约束，会在秒级内自行结束。
         ex.shutdown(wait=False, cancel_futures=True)
 
-    # 保留历史上已探测到、但本次因超时而未复核的模型，避免「刷新后模型变少」。
+    # 合并历史记录：Trae 官方目录不参与逐项探测，其平台标记必须保留；
+    # 本次未复核的模型也保留（探测超时/失败不等于下线）。
     prior = db.get_model_registry()
     for mid, rec in prior.items():
-        if mid not in registry and isinstance(rec, dict) and rec.get("platforms"):
+        if not isinstance(rec, dict) or not rec.get("platforms"):
+            continue
+        if mid not in registry:
             registry[mid] = rec
+            continue
+        cur = registry[mid]
+        for p in rec["platforms"]:
+            if p not in cur.get("platforms", []):
+                cur.setdefault("platforms", []).append(p)
 
     db.set_model_registry(registry)
 
