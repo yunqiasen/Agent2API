@@ -1142,7 +1142,8 @@ def panel_settings():
                "model_base_override", "allow_model_passthrough",
                "log_retention", "system_prompt", "auto_checkin", "checkin_time",
                "credit_threshold", "free_models", "public_join_enabled",
-               "trae_aha_device_id", "model_route_priority")
+               "trae_aha_device_id", "model_route_priority",
+               "model_platform_disabled")
     for k in allowed:
         if k in data:
             db.set_setting(k, data[k])
@@ -1180,6 +1181,8 @@ def panel_models_discover():
         "exposed": exposed,
         "total": len(registry),
         "discovered_at": int(time.time()),
+        # 渠道×模型开关状态：{platform: [model_id]}，卡片据此渲染禁用态
+        "disabled": {p: sorted(ids) for p, ids in proxy.get_model_disabled_map().items()},
         # 文本/音频已同步返回；图像探测在后台进行，前端轮询本接口的 progress 版本
         # 即可看到生图模型陆续出现，无需阻塞本次响应。
         "image_discovering": discovery.image_discovery_running(),
@@ -1210,6 +1213,7 @@ def panel_models_discover_progress():
         "exposed": exposed,
         "total": len(registry),
         "discovered_at": int(time.time()),
+        "disabled": {p: sorted(ids) for p, ids in proxy.get_model_disabled_map().items()},
         "image_discovering": discovery.image_discovery_running(),
     })
 

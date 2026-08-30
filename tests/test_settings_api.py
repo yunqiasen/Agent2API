@@ -36,3 +36,22 @@ def test_settings_rejects_unknown_keys_implicitly(client):
     c.post("/api/settings", json={"admin_password": "hack", "whatever": "x"})
     assert db.get_setting("admin_password", "") != "hack"
     assert db.get_setting("whatever", "") == ""
+
+
+def test_model_switch_setting_roundtrip(client):
+    """渠道×模型开关设置可经公共设置接口读写。"""
+    c, db = client
+    cfg = {"workbuddy": ["glm-5.3"], "trae": []}
+    r = c.post("/api/settings", json={"model_platform_disabled": json.dumps(cfg)})
+    assert r.get_json()["ok"] is True
+    out = c.get("/api/settings").get_json()
+    assert json.loads(out["model_platform_disabled"]) == cfg
+
+
+def test_models_discover_progress_includes_disabled_map(client):
+    """模型目录响应携带开关状态，供卡片渲染禁用态。"""
+    c, db = client
+    db.set_model_registry({"glm-5.3": {"type": "chat", "platforms": ["workbuddy", "trae"]}})
+    db.set_setting("model_platform_disabled", json.dumps({"workbuddy": ["glm-5.3"]}))
+    out = c.get("/api/models/discover/progress").get_json()
+    assert out["disabled"] == {"workbuddy": ["glm-5.3"]}
