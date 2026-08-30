@@ -90,3 +90,66 @@ def test_retry_failed_checkins_only_targets_due_accounts(isolated_db, monkeypatc
     # 标记已签的 a2 与不支持签到的 codebuddy 不该被重试
     proxy.retry_failed_checkins()
     assert set(called) == {a1, a3}
+
+
+# ---------------- 渠道×模型开关（model_platform_disabled） ----------------
+
+def _disabled_cfg(mapping):
+    def fake_get(k, d=None):
+        if k == "model_platform_disabled":
+            return json.dumps(mapping)
+        return ""
+    return fake_get
+
+
+def test_model_switch_disabled_platform_removed_from_candidates(registry, monkeypatch):
+    """关闭 workbuddy 的 deep-model 后，候选剔除 workbuddy，其余保留。"""
+    monkeypatch.setattr("db.get_setting",
+                        _disabled_cfg({"workbuddy": ["deep-model"]}))
+    assert proxy.model_route("deep-model")[1] == ["codebuddy_cn", "codebuddy"]
+
+
+def test_model_switch_all_platforms_disabled_yields_no_candidates(registry, monkeypatch):
+    """三渠道全关：候选为空，调度层据此 503。"""
+    monkeypatch.setattr("db.get_setting", _disabled_cfg({
+        "workbuddy": ["deep-model"],
+        "codebuddy_cn": ["deep-model"],
+        "codebuddy": ["deep-model"],
+    }))
+    assert proxy.model_route("deep-model")[1] == []
+
+
+def test_model_switch_beats_explicit_key_binding(registry, monkeypatch):
+    """开关全局生效：Key 绑定 workbuddy 且该模型在该渠道被关 → 无候选；
+    未禁用的绑定渠道不受影响。"""
+    monkeypatch.setattr("db.get_setting",
+                        _disabled_cfg({"workbuddy": ["deep-model"]}))
+    assert proxy.resolve_platform_candidates("deep-model", "workbuddy") == []
+    assert proxy.resolve_platform_candidates("deep-model", "codebuddy") == ["codebuddy"]
+
+
+def test_model_switch_only_affects_listed_model(registry, monkeypatch):
+    """关闭只影响列出的模型：workbuddy 的其它模型照常。"""
+    reg = dict(registry)
+    reg["wb-only-model"] = {"type": "chat", "platforms": ["workbuddy"]}
+    monkeypatch.setattr("db.get_model_registry", lambda: reg)
+    monkeypatch.setattr("db.get_setting",
+                        _disabled_cfg({"workbuddy": ["deep-model"]}))
+    assert proxy.model_route("wb-only-model")[1] == ["workbuddy"]
+
+
+def test_model_switch_invalid_json_keeps_candidates(registry, monkeypatch):
+    """配置写坏时不炸、不拦截任何平台。"""
+    monkeypatch.setattr("db.get_setting", lambda k, d=None: "{bad")
+    assert proxy.model_route("deep-model")[1] == ["workbuddy", "codebuddy_cn", "codebuddy"]
+
+
+def test_list_models_hides_fully_disabled_model(registry, monkeypatch):
+    """三渠道全关的模型从 /v1/models 消失；部分关闭仍可见。"""
+    monkeypatch.setattr("db.get_setting", _disabled_cfg({
+        "workbuddy": ["deep-model"],
+        "codebuddy_cn": ["deep-model"],
+        "codebuddy": ["deep-model"],
+    }))
+    assert "deep-model" not in proxy.list_models()
+    assert "single-model" in proxy.list_models()

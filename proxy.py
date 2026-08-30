@@ -358,6 +358,38 @@ def _apply_route_priority(mid: str, platforms: list[str]) -> list[str]:
                                             platforms.index(x)))
 
 
+def get_model_disabled_map() -> dict:
+    """渠道×模型开关：{platform_key: set(model_id)}。
+
+    设置 model_platform_disabled 为 JSON {"workbuddy": ["glm-5.3"], ...}；
+    开关是全局的：真实调用 / Key 绑定 / 对外清单统一生效，测活与探测不受影响。
+    """
+    raw = (db.get_setting("model_platform_disabled") or "").strip()
+    if not raw:
+        return {}
+    try:
+        cfg = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(cfg, dict):
+        return {}
+    out = {}
+    for plat, ids in cfg.items():
+        if isinstance(ids, list):
+            out[str(plat)] = {str(x) for x in ids}
+    return out
+
+
+def _filter_disabled_platforms(mid: str, platforms: list[str]) -> list[str]:
+    """从候选平台中剔除「该模型已被管理员关闭」的渠道。"""
+    if not platforms:
+        return platforms
+    disabled = get_model_disabled_map()
+    if not disabled:
+        return platforms
+    return [p for p in platforms if mid not in disabled.get(p, ())]
+
+
 def model_route(model: str | None) -> tuple[str | None, list[str]]:
     """返回 (type, platforms)。
 
@@ -372,13 +404,15 @@ def model_route(model: str | None) -> tuple[str | None, list[str]]:
     reg = db.get_model_registry()
     rec = reg.get(mid)
     if isinstance(rec, dict) and rec.get("platforms"):
-        return rec.get("type", "chat"), _apply_route_priority(mid, list(rec["platforms"]))
+        plats = _apply_route_priority(mid, list(rec["platforms"]))
+        return rec.get("type", "chat"), _filter_disabled_platforms(mid, plats)
     # 未知模型：先看负面缓存，避免重复昂贵探测
     if _probe_failed_recently(mid):
         return None, []
     live = _live_probe_model(mid)
     if live and live.get("platforms"):
-        return live.get("type", "chat"), _apply_route_priority(mid, list(live["platforms"]))
+        plats = _apply_route_priority(mid, list(live["platforms"]))
+        return live.get("type", "chat"), _filter_disabled_platforms(mid, plats)
     _mark_probe_failed(mid)
     return None, []
 
@@ -405,7 +439,8 @@ def resolve_platform_candidates(model: str | None,
     """
     bound = str(requested_platform or "").strip()
     if bound:
-        return [bound]
+        # 模型开关是全局的：绑定的渠道若被管理员关闭该模型，同样拦截。
+        return _filter_disabled_platforms(str(model or "").strip(), [bound])
     return model_platform_candidates(model)
 
 
@@ -1040,5 +1075,14 @@ def default_model() -> str:
 
 
 def list_models() -> list:
-    """返回真实探测注册表中的全部模型，不合并任何配置或静态默认值。"""
-    return P.catalog_models()
+    """返回真实探测注册表中的模型；三渠道全关的模型对外隐藏。"""
+    reg = db.get_model_registry()
+    disabled = get_model_disabled_map()
+    out = []
+    for mid in sorted(reg.keys()):
+        rec = reg.get(mid)
+        plats = rec.get("platforms") if isinstance(rec, dict) else None
+        if plats is not None and not [p for p in plats if mid not in disabled.get(p, ())]:
+            continue
+        out.append(mid)
+    return out
