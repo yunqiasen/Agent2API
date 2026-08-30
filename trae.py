@@ -403,9 +403,11 @@ def do_checkin(access_token, device_id=None, timeout: int = DEFAULT_TIMEOUT,
             "storage.json 中 iCubeAuthInfo://icube-dc: 后面的 16 位数字。"
             % (("空" if not device_id else "hex/UUID")))
 
+    if attempts < 1:
+        raise RuntimeError("签到失败：attempts 必须 >= 1")
     last = {}
     delays = (10, 15, 22, 30)
-    for i in range(max(1, attempts)):
+    for i in range(attempts):
         r = _session().post(UG_HOST + EP_CHECKIN_CLAIM,
                             headers=ug_headers(access_token, device_id), json={},
                             timeout=timeout)
@@ -424,7 +426,7 @@ def do_checkin(access_token, device_id=None, timeout: int = DEFAULT_TIMEOUT,
                 "raw": d,
             }
         # 9074：设备号有效前提下才可能是瞬时量控，递增退避重试
-        if code == 9074 and i < max(1, attempts) - 1:
+        if code == 9074 and i < attempts - 1:
             time.sleep(delays[min(i, len(delays) - 1)])
             continue
         if code == 9074:

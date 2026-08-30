@@ -51,3 +51,11 @@ def test_ug_headers_match_official_client_contract():
     assert h["X-Device-Type"] == "Windows"
     assert h["X-Device-Id"] == AHA_DID
     assert h["Authorization"] == "Cloud-IDE-JWT token"
+
+
+def test_checkin_rejects_invalid_attempt_count_without_request():
+    """attempts<=0 时不该先打一次上游再报「重试后仍失败」。"""
+    with patch.object(trae, "_session") as sess:
+        with pytest.raises(RuntimeError, match="attempts"):
+            trae.do_checkin("token", device_id=AHA_DID, attempts=0)
+    sess.assert_not_called()
