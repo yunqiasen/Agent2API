@@ -102,6 +102,7 @@ export interface ModelDiscoverResponse {
   exposed: ModelEntry[]; // 对外 /v1/models 暴露的清单
   total?: number;
   discovered_at?: number;
+  disabled?: Record<string, string[]>; // 渠道×模型开关：被关闭的模型 id 列表
   image_discovering?: boolean; // 后台图像探测是否仍在进行
 }
 export interface OverviewStats {
@@ -177,6 +178,7 @@ export interface Settings {
   public_join_enabled?: string;
   trae_aha_device_id?: string;
   model_route_priority?: string;
+  model_platform_disabled?: string;
 }
 
 /* ---------- 公共号池接入（用户主动提交账号） ---------- */

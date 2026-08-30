@@ -12,8 +12,10 @@ import {
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
 import {
   apiGet,
+  apiPost,
   type ModelDiscoverResponse,
   type PlatformInfo,
   PLATFORMS,
@@ -48,15 +50,39 @@ function kindBadge(kind?: string) {
   return null;
 }
 
-function ModelChip({ id, name, kind }: { id: string; name: string; kind?: string }) {
+function ModelChip({
+  id,
+  name,
+  kind,
+  enabled,
+  onToggle,
+}: {
+  id: string;
+  name: string;
+  kind?: string;
+  enabled?: boolean; // 传入即显示渠道×模型开关；不传则纯展示（对外暴露区）
+  onToggle?: (enabled: boolean) => void;
+}) {
+  const switchable = enabled !== undefined && onToggle;
   return (
     <div className="relative">
       <span
-        className="inline-flex flex-col items-start gap-0 rounded-lg border border-border bg-secondary px-2.5 py-1 text-xs transition-colors text-secondary-foreground"
+        className={
+          "inline-flex flex-col items-start gap-0 rounded-lg border border-border bg-secondary px-2.5 py-1 text-xs transition-colors text-secondary-foreground" +
+          (switchable && !enabled ? " opacity-45 saturate-0" : "")
+        }
       >
         <span className="flex items-center gap-1 leading-tight font-medium">
           {name}
           {kindBadge(kind)}
+          {switchable && (
+            <Switch
+              checked={enabled}
+              onCheckedChange={onToggle}
+              className="ml-1 scale-90"
+              aria-label={`开关 ${name}`}
+            />
+          )}
         </span>
         <span className="font-mono text-[10px] leading-tight opacity-70">↳ {id}</span>
       </span>
@@ -71,6 +97,8 @@ function PlatformCard({
   loading,
   note,
   delay = 0,
+  disabledIds,
+  onToggleModel,
 }: {
   keyId: string;
   label: string;
@@ -78,6 +106,8 @@ function PlatformCard({
   loading: boolean;
   note?: string;
   delay?: number;
+  disabledIds?: Set<string>;
+  onToggleModel?: (modelId: string, enabled: boolean) => void;
 }) {
   const [open, setOpen] = useState(true);
   const tone = toneFor(keyId);
@@ -114,7 +144,16 @@ function PlatformCard({
         {open && (
           <div className="flex flex-wrap gap-1.5 px-5 pb-4 pt-1">
             {models.map((m) => (
-              <ModelChip key={m.id} id={m.id} name={m.name} kind={m.kind} />
+              <ModelChip
+                key={m.id}
+                id={m.id}
+                name={m.name}
+                kind={m.kind}
+                enabled={!(disabledIds?.has(m.id))}
+                onToggle={
+                  onToggleModel ? (v) => onToggleModel(m.id, v) : undefined
+                }
+              />
             ))}
             {models.length === 0 && !loading && (
               <p className="text-xs text-muted-foreground">
@@ -134,6 +173,32 @@ export function Models() {
   const [loading, setLoading] = useState(false);
   const [imageDiscovering, setImageDiscovering] = useState(false);
   const [lastFetched, setLastFetched] = useState<number | null>(null);
+  const [disabledMap, setDisabledMap] = useState<Record<string, string[]>>({});
+
+  // 渠道×模型开关：全局生效（真实调用 / Key 绑定 / 对外清单一并拦截），
+  // 测活与探测不受开关影响。配置持久化在 model_platform_disabled 设置项。
+  async function toggleModel(platform: string, modelId: string, enabled: boolean) {
+    const next: Record<string, string[]> = { ...disabledMap };
+    const cur = new Set(next[platform] ?? []);
+    if (enabled) {
+      cur.delete(modelId);
+    } else {
+      cur.add(modelId);
+    }
+    next[platform] = [...cur].sort();
+    setDisabledMap(next); // 乐观更新
+    try {
+      await apiPost("/api/settings", {
+        model_platform_disabled: JSON.stringify(next),
+      });
+      toast.success(
+        `${platformLabel(platform)} 的 ${modelId} 已${enabled ? "开启" : "关闭"}`,
+      );
+    } catch (e) {
+      setDisabledMap(disabledMap); // 回滚
+      toast.error(e instanceof Error ? e.message : "保存失败");
+    }
+  }
 
   // 后台图像探测轮询：discover 同步只返回文本/音频，生图模型由后台线程陆续写入
   // 注册表；轮询 progress 接口把新出现的图像模型实时展示出来（不阻塞刷新响应）。
@@ -146,6 +211,7 @@ export function Models() {
       try {
         const d = await apiGet<ModelDiscoverResponse>("/api/models/discover/progress");
         setData(d);
+        setDisabledMap(d.disabled ?? {});
         setLastFetched(Date.now());
         if (d.image_discovering && round > 1) {
           pollImageProgress(round - 1);
@@ -167,6 +233,7 @@ export function Models() {
     try {
       const d = await apiGet<ModelDiscoverResponse>("/api/models/discover");
       setData(d);
+      setDisabledMap(d.disabled ?? {});
       setLastFetched(Date.now());
       const total = d.platforms.reduce((s, p) => s + (p.models?.length || 0), 0);
       if (d.image_discovering) {
@@ -246,6 +313,8 @@ export function Models() {
             loading={loading && data === null}
             note={p.note}
             delay={i * 60}
+            disabledIds={new Set(disabledMap[p.platform] ?? [])}
+            onToggleModel={(mid, v) => toggleModel(p.platform, mid, v)}
           />
         ))}
         {!data &&
