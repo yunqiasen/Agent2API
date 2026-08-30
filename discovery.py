@@ -36,11 +36,13 @@ _IMAGE_OVERALL_TIMEOUT = 180
 # 任何探测不到的 ID 不会进入对外目录；未来上游新增模型只要被探测命中即自动收录。
 PROBE_SEED = [
     # ---- 文本 / 对话 ----
-    "hy3", "auto",
+    "hy3", "hy3-x", "auto",
+    "hy4-preview", "hy4-preview-x",
+    "glm-5.3", "glm-5.3-flash",
     "glm-5.2", "glm-5.1", "glm-5.0", "glm-5v-turbo", "glm-4.6",
     "minimax-m3", "minimax-m2",
-    "kimi-k3", "kimi-k2.7", "kimi-k2.6", "kimi-k2.5", "kimi-k2.7-code",
-    "deepseek-v4-flash", "deepseek-v3.2", "deepseek-v4",
+    "kimi-k3", "kimi-k3-1", "kimi-k2.7", "kimi-k2.6", "kimi-k2.5", "kimi-k2.7-code",
+    "deepseek-v4-flash", "deepseek-v3.2", "deepseek-v4", "deepseek-v4-pro",
     "qwen3-max", "qwen3-coder",
     "hunyuan-turbo", "hunyuan-2.0",
     # ---- 图像生成 ----
@@ -274,6 +276,32 @@ def _run_image_discovery():
             _image_discovery_running = False
 
 
+def sync_upstream_catalogs() -> dict:
+    """优先用上游官方 CLI 模型目录刷新注册表；失败的平台回落到真实探测。
+
+    返回 {platform: [新增模型 ID]}。官方目录来自 CLI 客户端白名单，可直接使用；
+    上游未开放该接口（如国际站 500）时保持原探测机制，不额外发真实模型请求。
+    """
+    result = {}
+    for platform in P.PLATFORMS:
+        acc = None
+        try:
+            acc = _account_for(platform)
+        except Exception:
+            acc = None
+        if not acc or not (acc.get("access_token") or "").strip():
+            result[platform] = []
+            continue
+        try:
+            result[platform] = P.merge_upstream_models(
+                platform, acc["access_token"], uid=acc.get("uid") or None,
+                machine_id=acc.get("machine_id") or None,
+                device_id=acc.get("device_id") or None)
+        except Exception:
+            result[platform] = []
+    return result
+
+
 def run_discovery() -> dict:
     """跨三平台并行探测 PROBE_SEED，构建并持久化模型注册表。
 
@@ -295,7 +323,11 @@ def run_discovery() -> dict:
             platform_acc[platform] = None
 
     # 相位 1：仅文本 / 音频候选（图像走后台，避免拖慢同步响应）
-    ta_tasks = [(p, mid) for p in P.PLATFORMS for mid in PROBE_SEED
+    # Trae 使用官方 get_detail_param 目录（sync_upstream_catalogs 已收录），
+    # 不参与逐项真实探测，避免为每个模型消耗真实额度。
+    probe_platforms = [p for p in P.PLATFORMS
+                       if P.PLATFORMS[p].get("provider") != "trae"]
+    ta_tasks = [(p, mid) for p in probe_platforms for mid in PROBE_SEED
                 if model_type_from_id(mid) != "image"]
     registry: dict = {}
 
@@ -352,6 +384,9 @@ def live_probe_model(mid: str):
         return None
     rec = None
     for platform in P.PLATFORMS:
+        if P.PLATFORMS[platform].get("provider") == "trae":
+            # Trae 模型以官方目录为准；请求未收录模型时直接走候选平台探测。
+            continue
         try:
             ok, typ, info = probe_model_on_platform(platform, mid)
         except Exception:

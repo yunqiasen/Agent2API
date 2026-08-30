@@ -92,6 +92,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     expires_at      INTEGER DEFAULT 0,
     domain          TEXT DEFAULT '',
     state           TEXT DEFAULT '',
+    machine_id      TEXT DEFAULT '',
+    device_id       TEXT DEFAULT '',
     source          TEXT DEFAULT '',
     enabled         INTEGER DEFAULT 1,
     weight          INTEGER DEFAULT 1,
@@ -209,6 +211,8 @@ def _migrate_accounts_columns():
         "checkin_credit": "INTEGER DEFAULT 0",
         "checkin_updated_at": "INTEGER DEFAULT 0",
         "source": "TEXT DEFAULT ''",
+        "machine_id": "TEXT DEFAULT ''",
+        "device_id": "TEXT DEFAULT ''",
     }
     with _write_lock:
         c = get_conn()
@@ -345,18 +349,19 @@ def set_probe_failures(failures: dict) -> None:
 def add_account(platform, access_token, refresh_token="", expires_at=0, domain="",
                 token_type="Bearer", email="", uid="", nickname="",
                 enterprise_id="", enterprise_name="", state="", label="",
-                source="") -> int:
+                source="", machine_id="", device_id="") -> int:
     now = int(time.time())
     with _write_lock:
         c = get_conn()
         cur = c.execute(
             """INSERT INTO accounts(platform,label,email,uid,nickname,enterprise_id,
                enterprise_name,access_token,refresh_token,token_type,expires_at,domain,
-               state,source,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               state,source,machine_id,device_id,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (platform, label, email, uid, nickname, enterprise_id, enterprise_name,
              access_token, refresh_token or "", token_type, int(expires_at or 0),
-             domain or "", state, source or "", now, now))
+             domain or "", state, source or "", machine_id or "", device_id or "",
+             now, now))
         c.commit()
         return cur.lastrowid
 

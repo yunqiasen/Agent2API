@@ -18,6 +18,7 @@ import uuid
 import db
 import providers as P
 import requests
+import trae
 
 _refresh_locks: dict[int, threading.Lock] = {}
 _locks_guard = threading.Lock()
@@ -117,7 +118,8 @@ def refresh_quota(account_row) -> dict:
     s = P.collect_quota(acc["platform"], acc["access_token"],
                         uid=acc.get("uid") or None,
                         enterprise_id=acc.get("enterprise_id") or None,
-                        domain=acc.get("domain") or None)
+                        domain=acc.get("domain") or None,
+                        device_id=acc.get("device_id") or None)
     db.save_quota(acc["id"], s)
     return s
 
@@ -125,6 +127,16 @@ def refresh_quota(account_row) -> dict:
 # --------------------------------------------------------------------------
 # 每日签到
 # --------------------------------------------------------------------------
+
+def _checkin_device_id(acc: dict):
+    """签到用设备号：TraeWork 优先用设置里的 16 位 Aha 设备号（全号池通用，
+    风控只校验设备注册有效性，不绑定账号），未配置回退账号自带 device_id。"""
+    if P._is_trae(acc.get("platform")):
+        aha = (db.get_setting("trae_aha_device_id") or "").strip()
+        if aha:
+            return aha
+    return acc.get("device_id") or None
+
 
 def refresh_checkin_status(account_row) -> dict:
     """查询签到状态并落库。返回归一化状态字典。"""
@@ -135,12 +147,14 @@ def refresh_checkin_status(account_row) -> dict:
     st = P.fetch_checkin_status(acc["platform"], acc["access_token"],
                                 uid=acc.get("uid") or None,
                                 enterprise_id=acc.get("enterprise_id") or None,
-                                domain=acc.get("domain") or None)
+                                domain=acc.get("domain") or None,
+                                device_id=_checkin_device_id(acc))
     today = _dt.datetime.now().strftime("%Y-%m-%d")
     db.update_account(acc["id"],
                       checkin_today=1 if st.get("today_checked_in") else 0,
                       checkin_streak=int(st.get("streak_days") or 0),
-                      checkin_last_date=st.get("last_checkin_date") or "",
+                      checkin_last_date=st.get("last_checkin_date")
+                                        or (today if st.get("today_checked_in") else ""),
                       checkin_credit=int(st.get("today_credit") or 0),
                       checkin_updated_at=int(time.time()))
     return st
@@ -154,7 +168,13 @@ def checkin_account(account_row) -> dict:
     res = P.do_checkin(acc["platform"], acc["access_token"],
                        uid=acc.get("uid") or None,
                        enterprise_id=acc.get("enterprise_id") or None,
-                       domain=acc.get("domain") or None)
+                       domain=acc.get("domain") or None,
+                       device_id=_checkin_device_id(acc))
+    # 领取成功后刷新额度：Trae 签到直接加 credits，立即回读号池余额
+    try:
+        refresh_quota(db.get_account(acc["id"]))
+    except Exception:
+        pass
     # 领取成功后用状态接口回写 today/streak/last_date，保证与上游一致
     try:
         refresh_checkin_status(db.get_account(acc["id"]))
@@ -212,6 +232,27 @@ def run_auto_checkin_if_due():
 
     checkin_all(silent=True)
     db.set_setting("_last_checkin_run_date", today)
+
+
+def retry_failed_checkins():
+    """每小时补签一次今日仍未签到的账号（TraeWork 上游量控/风控窗口解除后
+    可自动补领；其它平台失败也顺带重试）。由后台维护线程调用。"""
+    if db.get_setting("auto_checkin", "1") != "1":
+        return
+    now = time.time()
+    if now - float(db.get_setting("_last_checkin_retry_ts", "0") or 0) < 3600:
+        return
+    db.set_setting("_last_checkin_retry_ts", str(int(now)))
+    for row in db.list_accounts():
+        a = dict(row)
+        if not a["enabled"] or a.get("checkin_today"):
+            continue
+        if not P.supports_checkin(a["platform"]):
+            continue
+        try:
+            checkin_account(db.get_account(a["id"]))
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -286,6 +327,37 @@ def _mark_probe_failed(mid: str) -> None:
     db.set_probe_failures(d)
 
 
+def _apply_route_priority(mid: str, platforms: list[str]) -> list[str]:
+    """按「模型调用优先级」设置重排平台候选。
+
+    设置 model_route_priority 为 JSON：
+      {"default": ["workbuddy","trae","codebuddy"],
+       "overrides": {"glm-5": ["trae","workbuddy","codebuddy"]}}
+    单模型覆盖优先于全局默认；配置中未出现的平台排在最后并保持原相对顺序。
+    """
+    if not platforms:
+        return platforms
+    raw = (db.get_setting("model_route_priority") or "").strip()
+    if not raw:
+        return platforms
+    try:
+        cfg = json.loads(raw)
+    except Exception:
+        return platforms
+    order = None
+    if isinstance(cfg, dict):
+        ov = cfg.get("overrides")
+        if isinstance(ov, dict) and isinstance(ov.get(mid), list):
+            order = ov[mid]
+        elif isinstance(cfg.get("default"), list):
+            order = cfg["default"]
+    if not order:
+        return platforms
+    rank = {p: i for i, p in enumerate(order)}
+    return sorted(platforms, key=lambda x: (rank.get(x, len(rank)),
+                                            platforms.index(x)))
+
+
 def model_route(model: str | None) -> tuple[str | None, list[str]]:
     """返回 (type, platforms)。
 
@@ -300,13 +372,13 @@ def model_route(model: str | None) -> tuple[str | None, list[str]]:
     reg = db.get_model_registry()
     rec = reg.get(mid)
     if isinstance(rec, dict) and rec.get("platforms"):
-        return rec.get("type", "chat"), list(rec["platforms"])
+        return rec.get("type", "chat"), _apply_route_priority(mid, list(rec["platforms"]))
     # 未知模型：先看负面缓存，避免重复昂贵探测
     if _probe_failed_recently(mid):
         return None, []
     live = _live_probe_model(mid)
     if live and live.get("platforms"):
-        return live.get("type", "chat"), list(live["platforms"])
+        return live.get("type", "chat"), _apply_route_priority(mid, list(live["platforms"]))
     _mark_probe_failed(mid)
     return None, []
 
@@ -379,10 +451,14 @@ def _upstream_headers(acc: dict, session_id: str | None = None) -> dict:
         session_id=session_id,
         enterprise_id=acc.get("enterprise_id") or None,
         domain=acc.get("domain") or None,
+        machine_id=acc.get("machine_id") or None,
+        device_id=acc.get("device_id") or None,
     )
 
 
 def _upstream_url(acc: dict) -> str:
+    if P.PLATFORMS.get(acc["platform"], {}).get("provider") == "trae":
+        return P.chat_url(acc["platform"])
     override = (db.get_setting("model_base_override") or "").strip()
     return P.chat_url(acc["platform"], model_base=override or None)
 
@@ -408,6 +484,7 @@ def open_upstream(acc: dict, body: dict, timeout: object = 300):
             r = requests.post(url, headers=headers, json=payload,
                               timeout=timeout, stream=True)
             r.encoding = "utf-8"
+            r._hy3_platform = acc.get("platform") or ""
             return r
         except (requests.exceptions.SSLError,
                 requests.exceptions.ConnectionError,
@@ -700,7 +777,186 @@ def generate_image(body: dict, platform: str | None = None, max_retry: int = 3):
     raise ProxyError("模型 %s 的候选平台号池中没有可用账号" % model, status=503)
 
 
+def _trae_openai_sse_events(resp, model: str):
+    """把 Trae SOLO SSE 逐事件转换成 OpenAI chat.completion.chunk SSE。"""
+    resp_id = "chatcmpl-" + uuid.uuid4().hex[:24]
+    created = int(time.time())
+    state = {"event": "", "data": []}
+    finish = "stop"
+    usage = None
+
+    def chunk(delta=None, finish_reason=None, with_usage=False):
+        obj = {
+            "id": resp_id, "object": "chat.completion.chunk", "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta or {},
+                         "finish_reason": finish_reason}],
+        }
+        if with_usage:
+            obj["usage"] = usage or {"prompt_tokens": 0, "completion_tokens": 0,
+                                     "total_tokens": 0}
+        return ("data: %s\n\n" % json.dumps(obj, ensure_ascii=False)).encode("utf-8")
+
+    def dispatch(event, payload):
+        nonlocal finish, usage
+        if not payload:
+            return None
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            return None
+        if event == "output":
+            delta = {}
+            if obj.get("response"):
+                delta["content"] = obj["response"]
+            if obj.get("reasoning_content"):
+                delta["reasoning_content"] = obj["reasoning_content"]
+            return chunk(delta) if delta else None
+        if event == "token_usage":
+            usage = obj
+            return None
+        if event == "done":
+            finish = obj.get("finish_reason") or finish
+            return None
+        return None
+
+    yield chunk({"role": "assistant"})
+    for line in _sse_lines(resp):
+        if line is None:
+            continue
+        if line.startswith("event:"):
+            state["event"] = line[6:].strip()
+        elif line.startswith("data:"):
+            state["data"].append(line[5:])
+        elif line == "":
+            if state["event"] or state["data"]:
+                out = dispatch(state["event"], "".join(state["data"]).strip())
+                state["event"], state["data"] = "", []
+                if out:
+                    yield out
+    if state["event"] or state["data"]:
+        out = dispatch(state["event"], "".join(state["data"]).strip())
+        if out:
+            yield out
+    yield chunk(delta={}, finish_reason=finish, with_usage=True)
+    yield b"data: [DONE]\n\n"
+
+
+def probe_account(account_row, model: str, timeout=(5, 30)) -> dict:
+    """对指定账号用指定模型发一次真实测活请求（固定 ping / max_tokens=1）。
+
+    锁定该账号直连上游（不走号池调度），用于判断单账号死活。
+    返回 {ok, ms, model, platform, reply|error}；不写调用计数。
+    """
+    acc = ensure_token(account_row)
+    body = {"model": model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1}
+    t0 = time.time()
+    resp = None
+    try:
+        resp = open_upstream(acc, body, timeout=timeout)
+    except Exception as e:
+        return {"ok": False, "ms": int((time.time() - t0) * 1000),
+                "platform": acc["platform"], "model": model,
+                "error": "连接上游失败: %s" % e}
+    try:
+        if resp.status_code >= 400:
+            text = ""
+            try:
+                text = resp.text[:300]
+            except Exception:
+                pass
+            return {"ok": False, "ms": int((time.time() - t0) * 1000),
+                    "platform": acc["platform"], "model": model,
+                    "error": "HTTP %s %s" % (resp.status_code, text)}
+        out = (aggregate_trae_stream(resp, model)
+               if acc.get("platform") == "trae"
+               else aggregate_stream(resp, model))
+        msg = ((out.get("choices") or [{}])[0].get("message") or {})
+        reply = str(msg.get("content") or "")[:120]
+        return {"ok": True, "ms": int((time.time() - t0) * 1000),
+                "platform": acc["platform"], "model": model, "reply": reply}
+    except Exception as e:
+        return {"ok": False, "ms": int((time.time() - t0) * 1000),
+                "platform": acc["platform"], "model": model,
+                "error": "响应解析失败: %s" % e}
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
 def aggregate_stream(resp, model: str) -> dict:
+    """把上游 SSE 流聚合成一个标准的 OpenAI 非流式响应体。"""
+    content_parts = []
+    reasoning_parts = []
+    finish_reason = "stop"
+    resp_id = "chatcmpl-" + uuid.uuid4().hex[:24]
+    created = int(time.time())
+    usage = None
+    role = "assistant"
+
+    for line in _sse_lines(resp):
+        if not line or not line.startswith("data:"):
+            continue
+        chunk = line[5:].strip()
+        if not chunk or chunk == "[DONE]":
+            continue
+        try:
+            j = json.loads(chunk)
+        except Exception:
+            continue
+
+        resp_id = j.get("id") or resp_id
+        created = j.get("created") or created
+        model = j.get("model") or model
+        if j.get("usage"):
+            usage = j["usage"]
+
+        for ch in (j.get("choices") or []):
+            delta = ch.get("delta") or ch.get("message") or {}
+            if delta.get("role"):
+                role = delta["role"]
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+            if delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
+            if ch.get("finish_reason"):
+                finish_reason = ch["finish_reason"]
+
+    message = {"role": role, "content": "".join(content_parts)}
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
+
+    out = {
+        "id": resp_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+    }
+    if usage:
+        out["usage"] = usage
+    else:
+        # 上游未返回 usage 时只能标记为未知，不能按字符数伪造 token。
+        # 保留 OpenAI 兼容字段，但日志侧会把它视为非真实积分来源。
+        out["usage"] = {"prompt_tokens": 0, "completion_tokens": 0,
+                        "total_tokens": 0}
+    return out
+
+
+def aggregate_trae_stream(resp, model: str) -> dict:
+    """把 Trae SOLO SSE 聚合成标准 OpenAI 非流式响应。"""
+    agg = trae.SSEAggregator()
+    for line in _sse_lines(resp):
+        if line is not None:
+            agg.feed_line(line)
+    agg.finish()
+    return agg.result(model)
+
+
     """把上游 SSE 流聚合成一个标准的 OpenAI 非流式响应体。"""
     content_parts = []
     reasoning_parts = []

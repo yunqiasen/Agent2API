@@ -1,0 +1,33 @@
+services:
+  hy3api:
+    image: hy3api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hy3api
+    restart: unless-stopped
+    ports:
+      - "8530:8530"
+    volumes:
+      - hy3api-data:/data
+    environment:
+      TZ: Asia/Shanghai
+      HY3API_HOST: "0.0.0.0"
+      HY3API_PORT: "8530"
+      HY3API_THREADS: "16"
+      HY3API_DATA_DIR: "/data"
+      HY3API_ADMIN_PASSWORD: "875133"
+      HY3API_DEFAULT_KEY: "sk-hy3-8F2qK9vB4mZ6nX1cA3pL7"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,sys,urllib.request; port=os.environ.get('HY3API_PORT','8530'); r=urllib.request.urlopen('http://127.0.0.1:'+port+'/health',timeout=4); sys.exit(0 if r.status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  hy3api-data:

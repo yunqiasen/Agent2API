@@ -2,7 +2,7 @@
 
 export const PLATFORMS = [
   { key: "workbuddy", name: "WorkBuddy" },
-  { key: "codebuddy_cn", name: "CodeBuddy CN" },
+  { key: "trae", name: "TraeWork" },
   { key: "codebuddy", name: "CodeBuddy 国际" },
 ] as const;
 
@@ -175,6 +175,8 @@ export interface Settings {
   credit_threshold?: string;
   free_models?: string;
   public_join_enabled?: string;
+  trae_aha_device_id?: string;
+  model_route_priority?: string;
 }
 
 /* ---------- 公共号池接入（用户主动提交账号） ---------- */

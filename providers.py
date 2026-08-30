@@ -2,10 +2,10 @@
 """
 hy3api - 平台适配层
 
-支持三个平台的 SSO 设备授权登录、令牌刷新、套餐额度查询：
-  - workbuddy     WorkBuddy      (www.codebuddy.cn, platform=workbuddy)
-  - codebuddy_cn  CodeBuddy CN   (www.codebuddy.cn, platform=ide)
-  - codebuddy     CodeBuddy 国际 (www.codebuddy.ai, platform=ide)
+支持三个平台的账号、令牌、额度与模型管理：
+  - workbuddy  WorkBuddy      (www.codebuddy.cn, platform=workbuddy)
+  - trae       TraeWork       (www.trae.cn, SOLO Cloud IDE)
+  - codebuddy  CodeBuddy 国际 (www.codebuddy.ai, platform=ide)
 
 流程与常量来自 cockpit-tools 源码（crates/cockpit-core/src/modules/*_oauth.rs），
 对话接口来自本地客户端日志实测。
@@ -19,6 +19,7 @@ import uuid
 
 import db
 import requests
+import trae
 
 # --------------------------------------------------------------------------
 # 平台定义
@@ -37,16 +38,20 @@ PLATFORMS = {
         "session_header": "X-WorkBuddy-Session-Id",
         "supports_checkin": True,
     },
-    "codebuddy_cn": {
-        "key": "codebuddy_cn",
-        "label": "CodeBuddy CN",
-        "api_base": "https://www.codebuddy.cn",
-        "prefix": "/v2/plugin",
-        "platform": "ide",
-        "model_base": "https://copilot.tencent.com",
-        "chat_path": "/v2/chat/completions",
-        "config_path": "/v3/config",
-        "session_header": "X-CodeBuddy-Session-Id",
+    # 2026-08-29 实测：WorkBuddy 与 CodeBuddy CN 同账号、同额度、同模型，
+    # 拆两个平台只会重复扣同一池子，因此移除 codebuddy_cn，仅保留 WorkBuddy。
+    "trae": {
+        "key": "trae",
+        "label": "TraeWork",
+        "api_base": "https://www.trae.cn",
+        "prefix": "",
+        "platform": "trae",
+        "model_base": "https://trae-api-cn.mchost.guru",
+        "chat_path": "/api/agent/v3/llm_utils_chat",
+        "config_path": "/api/ide/v1/get_detail_param",
+        "session_header": "X-Trae-Session-Id",
+        # Trae 三类请求头与 WorkBuddy 完全不同，见 trae.py
+        "provider": "trae",
         "supports_checkin": True,
     },
     "codebuddy": {
@@ -80,6 +85,11 @@ class ProviderError(Exception):
     pass
 
 
+def _is_trae(platform_key: str) -> bool:
+    """是否 Trae 渠道。"""
+    return PLATFORMS.get(platform_key, {}).get("provider") == "trae"
+
+
 def get_platform(key: str) -> dict:
     p = PLATFORMS.get(key)
     if not p:
@@ -88,8 +98,8 @@ def get_platform(key: str) -> dict:
 
 
 PLATFORM_NOTES = {
-    "workbuddy": "与 CodeBuddy CN 同一 Keycloak realm，令牌互通，共用 copilot.tencent.com 网关",
-    "codebuddy_cn": "与 WorkBuddy 同账号体系，仅 platform 参数不同",
+    "workbuddy": "国内网关 copilot.tencent.com；原 CodeBuddy CN 与其同额度同模型，已合并",
+    "trae": "Trae SOLO Cloud IDE 网关，账号/额度独立",
     "codebuddy": "国际站，独立账号与独立网关",
 }
 
@@ -146,6 +156,21 @@ def _msg(body: dict) -> str:
 def start_login(platform_key: str, timeout: int = 20) -> dict:
     """POST {api_base}{prefix}/auth/state?platform={platform} -> state + authUrl"""
     p = get_platform(platform_key)
+    if _is_trae(platform_key):
+        machine_id = uuid.uuid4().hex + uuid.uuid4().hex[:16]
+        device_id = uuid.uuid4().hex + uuid.uuid4().hex[:16]
+        return {
+            "platform": platform_key,
+            "state": uuid.uuid4().hex,
+            "auth_url": trae.build_login_url(machine_id, device_id),
+            "login_id": uuid.uuid4().hex,
+            "expires_in": OAUTH_TIMEOUT_SECONDS,
+            "interval": OAUTH_POLL_INTERVAL,
+            "created_at": int(time.time()),
+            "trae_machine_id": machine_id,
+            "trae_device_id": device_id,
+            "auth_mode": "callback",
+        }
     url = "%s%s/auth/state?platform=%s" % (p["api_base"], p["prefix"], p["platform"])
     try:
         r = _session().post(url, json={}, timeout=timeout)
@@ -185,6 +210,10 @@ def poll_token(platform_key: str, state: str, timeout: int = 20) -> dict | None:
 
     返回 None 表示尚未授权（code=11217 login ing...），成功返回 token 字典。
     """
+    # Trae 没有 /auth/token 轮询端点（网页授权只能回调导入），直接返回等待中，
+    # 避免对错误端点轮询抛出 "Expecting value" 误导报错。
+    if _is_trae(platform_key):
+        return None
     p = get_platform(platform_key)
     url = "%s%s/auth/token?state=%s" % (p["api_base"], p["prefix"], state)
     try:
@@ -219,6 +248,8 @@ def poll_token(platform_key: str, state: str, timeout: int = 20) -> dict | None:
 
 def fetch_account_info(platform_key: str, access_token: str, state: str | None = None,
                        domain: str | None = None, timeout: int = 20) -> dict:
+    if _is_trae(platform_key):
+        return trae.get_user_info(access_token, timeout=timeout)
     """GET {prefix}/login/account?state=...  或退化到 {prefix}/accounts"""
     p = get_platform(platform_key)
     headers = {"Authorization": "Bearer %s" % access_token}
@@ -262,6 +293,8 @@ def fetch_account_info(platform_key: str, access_token: str, state: str | None =
 
 def refresh_token(platform_key: str, access_token: str, refresh_tok: str,
                   domain: str | None = None, timeout: int = 20) -> dict:
+    if _is_trae(platform_key):
+        return trae.exchange_token(refresh_tok, timeout=timeout)
     p = get_platform(platform_key)
     url = "%s%s/auth/token/refresh" % (p["api_base"], p["prefix"])
     headers = {
@@ -456,8 +489,17 @@ def summarize_quota(user_resource: dict, dosage: dict, payment: dict) -> dict:
     return out
 
 
-def collect_quota(platform_key, access_token, uid=None, enterprise_id=None, domain=None) -> dict:
-    """一次性抓取三个额度接口并汇总，任一失败不影响其他。"""
+def collect_quota(platform_key, access_token, uid=None, enterprise_id=None,
+                   domain=None, device_id=None) -> dict:
+    """一次性抓取额度并汇总；Trae 走独立积分接口。"""
+    if _is_trae(platform_key):
+        try:
+            remain = trae.fetch_credit(access_token, device_id=device_id)
+            return {"plan_type": "", "total": remain, "used": 0, "remain": remain,
+                    "unit": "credits", "packages": [], "errors": [], "raw": {}}
+        except Exception as e:
+            return {"plan_type": "", "total": 0, "used": 0, "remain": 0,
+                    "unit": "credits", "packages": [], "errors": [str(e)], "raw": {}}
     errors = []
     ur = dn = pt = {}
     try:
@@ -484,13 +526,18 @@ def collect_quota(platform_key, access_token, uid=None, enterprise_id=None, doma
 # --------------------------------------------------------------------------
 
 def build_model_headers(platform_key, access_token, uid=None, session_id=None,
-                        enterprise_id=None, domain=None) -> dict:
+                        enterprise_id=None, domain=None, machine_id=None,
+                        device_id=None) -> dict:
     """构造模型网关必需的请求头。
 
     实测结论：Authorization 是唯一强制项；会话 ID / X-User-Id 用于来源标识，
     带上可提升成功率与配额归属准确性。
     """
     p = get_platform(platform_key)
+    if _is_trae(platform_key):
+        return trae.solo_headers(access_token, uid=uid, machine_id=machine_id,
+                                 device_id=device_id, stream=True,
+                                 session_id=session_id)
     h = {
         "Authorization": "Bearer %s" % access_token,
         "Content-Type": "application/json",
@@ -523,6 +570,9 @@ def normalize_body(platform_key: str, body: dict,
         但带 system 同样正常，故补齐不会有副作用。
       - 三平台一致：stream 必须为 true，非流式一律 11101。
     """
+    if _is_trae(platform_key):
+        return trae.normalize_body(body, body.get("model") or "")
+
     p = get_platform(platform_key)
     out = dict(body)
     out["stream"] = True
@@ -565,7 +615,146 @@ def config_url(platform_key: str, model_base: str | None = None) -> str:
     return "%s%s" % ((model_base or p["model_base"]).rstrip("/"), p["config_path"])
 
 
-def fetch_models(platform_key, access_token, uid=None, model_base=None, timeout=20) -> list:
+def _fetch_config_models(platform_key, access_token, timeout=20) -> list:
+    """读取 /v3/config 的 agents[cli].models（国际站可用）。"""
+    p = get_platform(platform_key)
+    headers = {
+        "Authorization": "Bearer %s" % access_token,
+        "Accept": "application/json",
+        "Origin": p["api_base"],
+        "Referer": p["api_base"] + "/",
+        "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2",
+    }
+    try:
+        r = _session().get(config_url(platform_key), headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            return []
+        body = r.json() or {}
+        if not _ok(body):
+            return []
+        agents = (body.get("data") or {}).get("agents") or []
+        for agent in agents:
+            if agent.get("name") == "cli":
+                ids = agent.get("models") or []
+                return [str(x).strip() for x in ids if str(x).strip()]
+        return []
+    except Exception:
+        return []
+
+
+def fetch_upstream_models(platform_key, access_token, timeout=20, uid=None,
+                           machine_id=None, device_id=None) -> list:
+    """读取上游官方模型目录（CLI agent 白名单）。
+
+    实测（2026-08-29）：
+      - GET {model_base}/console/enterprises/personal/models 可用；
+      - data.agents[].name == "cli" 的 models 是 CLI 客户端可用模型白名单；
+      - data.models[] 只是模型元数据全集，包含非 CLI 可用项，不能直接当目录；
+      - www.codebuddy.ai 当前返回 500，保留探测回退即可。
+    """
+    p = get_platform(platform_key)
+    if _is_trae(platform_key):
+        return fetch_trae_models(platform_key, access_token, uid=uid,
+                                 machine_id=machine_id, device_id=device_id)
+    base = (p.get("model_base") or "").rstrip("/")
+    headers = {
+        "Authorization": "Bearer %s" % access_token,
+        "Accept": "application/json",
+        "Origin": p["api_base"],
+        "Referer": p["api_base"] + "/",
+        "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2",
+    }
+    try:
+        r = _session().get(base + "/console/enterprises/personal/models",
+                           headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            # 国际站该路径当前 500；/v3/config 有同样的 agents[cli].models 目录
+            return _fetch_config_models(platform_key, access_token, timeout)
+        body = r.json() or {}
+        if not _ok(body):
+            return _fetch_config_models(platform_key, access_token, timeout)
+        data = body.get("data") or {}
+        agents = data.get("agents") or []
+        for agent in agents:
+            if agent.get("name") == "cli":
+                ids = agent.get("models") or []
+                return [str(x).strip() for x in ids if str(x).strip()]
+        return []
+    except Exception:
+        return []
+
+
+def merge_upstream_models(platform_key, access_token, uid=None,
+                           machine_id=None, device_id=None) -> list:
+    """把官方目录里的 CLI 模型合并进运行时注册表，返回新增模型 ID。
+
+    只标记平台与 chat 类型；这些模型来自 CLI 官方白名单，因此不再逐个真实请求。
+    """
+    ids = fetch_upstream_models(platform_key, access_token, uid=uid,
+                                 machine_id=machine_id, device_id=device_id)
+    if not ids:
+        return []
+    reg = db.get_model_registry()
+    added = []
+    for mid in ids:
+        rec = reg.get(mid)
+        if not isinstance(rec, dict):
+            rec = {"type": model_type(mid), "platforms": []}
+        rec["type"] = rec.get("type") or model_type(mid)
+        if platform_key not in rec.get("platforms", []):
+            rec.setdefault("platforms", []).append(platform_key)
+        if mid not in reg:
+            added.append(mid)
+        reg[mid] = rec
+    db.set_model_registry(reg)
+    return added
+
+
+TRAE_INTERNAL_MODELS = {
+    "browser_use_subagent", "file_search_agent", "explore_sub_agent_v2", "summary",
+    "sagitta", "aquila", "custom_model_placeholder", "custom_model_1M_text",
+    "custom_model_1M", "custom_model_kimi", "custom_model_claude",
+    "custom_model_gpt-5", "custom_model_no-fc", "custom_model_deepseek_chat",
+    "custom_model_deepseek_reasoner", "custom_model_deepseek_v4",
+}
+
+
+# Trae 官方目录的展示名（来自 get_detail_param 的 display_name）
+TRAE_MODEL_DISPLAY_NAMES = {
+    "DeepSeek-V4-Flash-Official": "DeepSeek-V4-Flash 正式版",
+    "DeepSeek-V4-Pro-Official": "DeepSeek-V4-Pro 正式版",
+    "DeepSeek-V4-Flash": "DeepSeek-V4-Flash",
+    "DeepSeek-V4-Pro": "DeepSeek-V4-Pro",
+    "Doubao-Seed-2.1-Pro": "Doubao-Seed-2.1-Pro",
+    "Doubao-Seed-2.1-Turbo": "Doubao-Seed-2.1-Turbo",
+    "Doubao-Seed-2.0-Code": "Doubao-Seed-2.0-Code",
+    "Doubao-Seed-Evolving": "Doubao-Seed-Evolving",
+    "glm-5": "GLM-5",
+    "glm-5-turbo": "GLM-5-Turbo",
+    "kimi-k2.7-code": "Kimi-K2.7-Code",
+    "qwen3.8-max": "Qwen3.8-Max",
+    "qwen-3.7-plus": "Qwen-3.7-Plus",
+    "seed-code-pro-0430": "Seed-Code-Pro-0430",
+}
+
+
+def fetch_trae_models(platform_key, access_token, uid=None, machine_id=None,
+                      device_id=None) -> list:
+    """Trae 官方模型目录（过滤内部/子代理/占位模型）。"""
+    items = trae.fetch_model_catalog(access_token, uid=uid, machine_id=machine_id,
+                                     device_id=device_id)
+    # 上游 display_name 会把多个 config_name 映射成同一显示名（如 seed-code-pro-0430
+    # 也显示 Seed-2.1-Pro），仅在缺省映射不存在时写入，避免覆盖人工准确命名。
+    for x in items:
+        name = str(x.get("name") or "").strip()
+        if name and x["id"] not in TRAE_MODEL_DISPLAY_NAMES:
+            TRAE_MODEL_DISPLAY_NAMES[x["id"]] = name
+    return [x["id"] for x in items
+            if x["id"] not in TRAE_INTERNAL_MODELS
+            and not x["id"].startswith("custom_model_")]
+
+
+def available_models(platform_key: str) -> list:
     """返回该平台「真实探测确认可用」的模型 id 列表。
 
     上游无模型枚举接口（/v3/config 仅 productFeatures，/v1/models 404），因此模型
@@ -593,9 +782,11 @@ def catalog_models() -> list:
 
 
 def model_name(mid: str) -> str:
-    """展示名不写死：从模型 id 自动生成可读名称（如 hunyuan-image-v3.0-art → Hunyuan Image V3.0 Art）。"""
+    """展示名：优先使用上游 display_name，其次按 id 自动生成可读名称。"""
     if not mid:
         return mid
+    if mid in TRAE_MODEL_DISPLAY_NAMES:
+        return TRAE_MODEL_DISPLAY_NAMES[mid]
     return " ".join(w.capitalize() for w in str(mid).replace("_", "-").split("-") if w)
 
 
@@ -627,7 +818,7 @@ def catalog_entries(platform_key: str) -> list:
 
 
 # --------------------------------------------------------------------------
-# 每日签到（仅 CN 域平台: workbuddy / codebuddy_cn）
+# 每日签到（workbuddy / trae；codebuddy 国际站无签到）
 # --------------------------------------------------------------------------
 #
 # 实测接口(2026-08-05, 真实账号, cockpit-tools 同款):
@@ -649,8 +840,11 @@ def _checkin_claim_url(platform_key: str) -> str:
 
 
 def fetch_checkin_status(platform_key, access_token, uid=None, enterprise_id=None,
-                         domain=None, timeout=20) -> dict:
+                         domain=None, timeout=20, device_id=None) -> dict:
     """查询当前签到活动状态与今日是否已签到。"""
+    if _is_trae(platform_key):
+        return trae.fetch_checkin_status(access_token, device_id=device_id,
+                                         timeout=timeout)
     if not supports_checkin(platform_key):
         return {"supported": False, "today_checked_in": False,
                 "streak_days": 0, "claimable": False, "raw": {}}
@@ -692,8 +886,10 @@ def fetch_checkin_status(platform_key, access_token, uid=None, enterprise_id=Non
 
 
 def do_checkin(platform_key, access_token, uid=None, enterprise_id=None,
-               domain=None, timeout=20) -> dict:
+               domain=None, timeout=20, device_id=None) -> dict:
     """领取今日签到积分。返回领取结果（含本次获得积分）。"""
+    if _is_trae(platform_key):
+        return trae.do_checkin(access_token, device_id=device_id, timeout=timeout)
     if not supports_checkin(platform_key):
         raise ProviderError("该平台不支持签到")
 

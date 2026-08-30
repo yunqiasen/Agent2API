@@ -25,6 +25,7 @@ import db
 import providers as P
 import proxy
 import discovery
+import trae
 import responses as R
 from flask import (Flask, Response, jsonify, request, send_from_directory,
                    session, stream_with_context)
@@ -208,17 +209,25 @@ def api_chat():
 
     _enqueue_stats(lambda: db.bump_api_key(kr["id"]))
 
+    is_trae = acc.get("platform") == "trae"
+
     if want_stream:
         def generate():
             ok = True
             err = ""
             usage_tracker = proxy.SSEUsageTracker()
             try:
-                # 原样透传上游字节，同时旁路解析最终 SSE 帧的真实 usage。
-                for chunk in resp.iter_content(chunk_size=None):
-                    if chunk:
+                if is_trae:
+                    # Trae SOLO SSE 不是 OpenAI chunk，需逐帧转换。
+                    for chunk in proxy._trae_openai_sse_events(resp, model):
                         usage_tracker.feed(chunk)
                         yield chunk
+                else:
+                    # 原样透传上游字节，同时旁路解析最终 SSE 帧的真实 usage。
+                    for chunk in resp.iter_content(chunk_size=None):
+                        if chunk:
+                            usage_tracker.feed(chunk)
+                            yield chunk
             except Exception as e:      # 上游中断
                 ok = False
                 err = str(e)
@@ -245,7 +254,8 @@ def api_chat():
 
     # 非流式：上游只支持流式 → 本层聚合
     try:
-        out = proxy.aggregate_stream(resp, model)
+        out = (proxy.aggregate_trae_stream(resp, model) if is_trae
+               else proxy.aggregate_stream(resp, model))
     except Exception as e:
         db.bump_account(acc["id"], False, str(e))
         _log(kr["id"], acc["id"], acc["platform"], model, 502, False,
@@ -482,7 +492,9 @@ def api_responses():
 
     # 非流式：聚合上游 chat 流 → 重排为 Responses 对象
     try:
-        chat_obj = proxy.aggregate_stream(resp, model)
+        chat_obj = (proxy.aggregate_trae_stream(resp, model)
+                    if acc.get("platform") == "trae"
+                    else proxy.aggregate_stream(resp, model))
     except Exception as e:
         db.bump_account(acc["id"], False, str(e))
         _log(kr["id"], acc["id"], acc["platform"], model, 502, False,
@@ -710,6 +722,33 @@ def panel_account_checkin(aid):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/accounts/<int:aid>/probe", methods=["POST"])
+@admin_required
+def panel_account_probe(aid):
+    """单账号测活：锁定该账号用指定模型发一次真实请求。"""
+    row = db.get_account(aid)
+    if row is None:
+        return jsonify({"ok": False, "error": "账号不存在"}), 404
+    data = request.get_json(silent=True) or {}
+    model = (data.get("model") or "").strip()
+    if not model:
+        return jsonify({"ok": False, "error": "缺少 model"}), 400
+    try:
+        res = proxy.probe_account(dict(row), model)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+    return jsonify(res)
+
+
+@app.route("/api/platforms/<key>/models")
+@admin_required
+def panel_platform_models(key):
+    """轻量目录：注册表中该平台已探测确认的模型（卡片测活下拉用）。"""
+    if key not in P.PLATFORMS:
+        return jsonify({"ok": False, "error": "未知平台"}), 404
+    return jsonify({"ok": True, "models": P.catalog_entries(key)})
+
+
 @app.route("/api/accounts/checkin_all", methods=["POST"])
 @admin_required
 def panel_checkin_all():
@@ -739,7 +778,25 @@ def panel_import_token():
         if isinstance(parsed, dict):
             parsed = [parsed]
         for it in parsed:
-            if isinstance(it, dict) and (it.get("access_token") or it.get("accessToken")):
+            if not isinstance(it, dict):
+                continue
+            # 兼容 ai-multi-platform-proxy 的 auths/*.json：
+            # {"platform":"trae","account":{...},"auth":{...}}
+            if it.get("auth") and isinstance(it["auth"], dict):
+                acc = it.get("account") or {}
+                a = it["auth"]
+                items.append({
+                    "access_token": a.get("accessToken") or a.get("access_token"),
+                    "refresh_token": a.get("refreshToken") or a.get("refresh_token"),
+                    "uid": acc.get("uid") or "",
+                    "nickname": acc.get("nickname") or "",
+                    "enterprise_id": acc.get("enterpriseId") or "",
+                    "domain": a.get("domain") or "",
+                    "expires_at": a.get("expiresAt") or 0,
+                    "machine_id": a.get("machineId") or "",
+                    "device_id": a.get("deviceId") or "",
+                })
+            elif it.get("access_token") or it.get("accessToken"):
                 items.append(it)
     else:
         at = (data.get("access_token") or "").strip()
@@ -752,6 +809,8 @@ def panel_import_token():
             "uid": data.get("uid") or "",
             "domain": data.get("domain") or "",
             "expires_at": data.get("expires_at") or 0,
+            "machine_id": data.get("machine_id") or "",
+            "device_id": data.get("device_id") or "",
         })
 
     added, updated = 0, 0
@@ -767,6 +826,8 @@ def panel_import_token():
             uid=uid, nickname=it.get("nickname") or "",
             enterprise_id=it.get("enterprise_id") or "",
             enterprise_name=it.get("enterprise_name") or "",
+            machine_id=it.get("machine_id") or "",
+            device_id=it.get("device_id") or "",
         )
         if exist:
             db.update_account(exist["id"], status="active", status_reason="", **fields)
@@ -872,6 +933,97 @@ def public_join_poll():
 # ==========================================================================
 # 控制面板 - SSO 登录添加账号
 # ==========================================================================
+
+@app.route("/api/login/trae_callback", methods=["POST"])
+@admin_required
+def panel_login_trae_callback():
+    """Trae 特有：粘贴登录回调 URL，解析 token 并入库。
+
+    Trae 授权后跳到不可达的 127.0.0.1，需要用户复制完整回调链接；
+    这里解析 refreshToken → ExchangeToken → GetUserInfo → 入库。
+    """
+    from urllib.parse import urlparse, parse_qs, unquote
+
+    data = request.get_json(silent=True) or {}
+    callback = (data.get("callback_url") or data.get("url") or "").strip()
+    if not callback:
+        return jsonify({"ok": False, "error": "缺少 callback_url"}), 400
+    try:
+        q = parse_qs(urlparse(callback).query)
+    except Exception as e:
+        return jsonify({"ok": False, "error": "回调 URL 解析失败: %s" % e}), 400
+
+    def one(k):
+        v = q.get(k) or []
+        return v[0] if v else ""
+
+    refresh = one("refreshToken")
+    user_jwt = {}
+    user_info = {}
+    for k, target in (("userJwt", user_jwt), ("userInfo", user_info)):
+        raw = one(k)
+        if not raw:
+            continue
+        for text in (raw, unquote(raw)):
+            try:
+                obj = json.loads(text)
+                if isinstance(obj, dict):
+                    target.update(obj)
+                    break
+            except Exception:
+                continue
+
+    token = ""
+    expires_at = 0
+    if refresh:
+        try:
+            tok = trae.exchange_token(refresh)
+            token = tok["access_token"]
+            refresh = tok["refresh_token"]
+            expires_at = int(tok["expires_at"] or 0)
+        except Exception as e:
+            return jsonify({"ok": False, "error": "ExchangeToken 失败: %s" % e}), 400
+    else:
+        jwt = user_jwt.get("Token") or user_jwt.get("token") or ""
+        if not jwt:
+            return jsonify({"ok": False, "error": "回调中没有 refreshToken / userJwt.Token"}), 400
+        token = jwt
+        expires_at = int(user_jwt.get("TokenExpireAt") or 0) or 0
+
+    try:
+        info = trae.get_user_info(token)
+    except Exception as e:
+        info = {"uid": "", "nickname": "", "enterprise_id": ""}
+
+    uid = info.get("uid") or str(user_info.get("UserID") or "")
+    nickname = info.get("nickname") or str(user_info.get("ScreenName") or "")
+    ent = info.get("enterprise_id") or str(user_info.get("TenantID") or "")
+    if not uid:
+        return jsonify({"ok": False, "error": "无法获取 uid，token 可能已失效"}), 400
+
+    # machine/device 若前端传回则保存；否则由导入字段/默认值兜底
+    machine_id = data.get("machine_id") or ""
+    device_id = data.get("device_id") or ""
+    exist = db.find_account_by_uid("trae", uid)
+    fields = dict(
+        access_token=token, refresh_token=refresh,
+        expires_at=expires_at, domain="trae.cn",
+        email="", uid=uid, nickname=nickname,
+        enterprise_id=ent, enterprise_name="",
+        machine_id=machine_id, device_id=device_id,
+    )
+    if exist:
+        db.update_account(exist["id"], status="active", status_reason="", **fields)
+        aid = exist["id"]
+    else:
+        aid = db.add_account("trae", label=data.get("label") or "", **fields)
+    try:
+        proxy.refresh_quota(db.get_account(aid))
+    except Exception:
+        pass
+    return jsonify({"ok": True, "account_id": aid, "uid": uid,
+                    "nickname": nickname})
+
 
 @app.route("/api/login/start", methods=["POST"])
 @admin_required
@@ -989,7 +1141,8 @@ def panel_settings():
     allowed = ("default_model", "strategy", "auto_refresh", "refresh_ahead",
                "model_base_override", "allow_model_passthrough",
                "log_retention", "system_prompt", "auto_checkin", "checkin_time",
-               "credit_threshold", "free_models", "public_join_enabled")
+               "credit_threshold", "free_models", "public_join_enabled",
+               "trae_aha_device_id", "model_route_priority")
     for k in allowed:
         if k in data:
             db.set_setting(k, data[k])
@@ -1005,6 +1158,9 @@ def panel_models_discover():
     DB（discovered_models），下游 /v1/models 与请求调度全部读这张注册表。
     """
     try:
+        # 先拉官方 CLI 目录，零成本收录新模型；再跑真实探测补齐官方目录未覆盖的
+        # 平台（如国际站）与图像 / 音频模型。
+        discovery.sync_upstream_catalogs()
         registry = discovery.run_discovery()
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -1087,7 +1243,9 @@ def panel_test():
     except proxy.ProxyError as e:
         return jsonify({"ok": False, "error": str(e)}), 200
     try:
-        out = proxy.aggregate_stream(resp, model)
+        out = (proxy.aggregate_trae_stream(resp, model)
+               if acc.get("platform") == "trae"
+               else proxy.aggregate_stream(resp, model))
     except Exception as e:
         return jsonify({"ok": False, "error": "聚合失败: %s" % e}), 200
     finally:
@@ -1163,6 +1321,10 @@ def _maintenance_loop():
                 proxy.run_auto_checkin_if_due()
             except Exception:
                 pass
+            try:
+                proxy.retry_failed_checkins()
+            except Exception:
+                pass
             db.trim_logs(int(db.get_setting("log_retention", "2000") or 2000))
             db.cleanup_pending()
         except Exception:
@@ -1199,6 +1361,7 @@ def main():
     if not db.get_model_registry():
         def _bootstrap_discover():
             try:
+                discovery.sync_upstream_catalogs()
                 discovery.run_discovery()
                 reg = db.get_model_registry()
                 print("  自动模型探测完成，已收录 %d 个模型" % len(reg), flush=True)

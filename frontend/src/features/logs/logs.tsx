@@ -19,7 +19,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { CallLog, apiDelete, apiGet, fmtTs, platName, PLATFORMS } from "@/lib/api";
+import { apiDelete, apiGet, fmtTs, platName, PLATFORMS, type CallLog } from "@/lib/api";
 import { PageHeader, SectionCard, Chip, toneFor } from "@/lib/design";
 
 type StatusFilter = "all" | "success" | "fail";

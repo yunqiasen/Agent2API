@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { toast } from "sonner";
-import { Settings as SettingsIcon, SlidersHorizontal, Coins, Users, Save } from "lucide-react";
+import { Settings as SettingsIcon, SlidersHorizontal, Coins, Users, Save, Route, Plus, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -12,7 +12,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { PageHeader, SectionCard } from "@/lib/design";
-import { Settings, apiGet, apiPost } from "@/lib/api";
+import { apiGet, apiPost, type Settings as SettingsData } from "@/lib/api";
 
 const STRATEGIES = [
   { v: "least_used", l: "最少使用 least_used" },
@@ -55,18 +55,71 @@ function Sel({
   );
 }
 
+const PLAT_ORDER = [
+  { v: "workbuddy", l: "WorkBuddy" },
+  { v: "trae", l: "TraeWork" },
+  { v: "codebuddy", l: "CodeBuddy 国际" },
+];
+
+type PriorityCfg = { default: string[]; overrides: Record<string, string[]> };
+
+function parsePriority(raw?: string): PriorityCfg {
+  try {
+    const d = JSON.parse(raw || "");
+    if (d && Array.isArray(d.default)) {
+      return { default: d.default, overrides: d.overrides && typeof d.overrides === "object" ? d.overrides : {} };
+    }
+  } catch { /* ignore */ }
+  return { default: ["workbuddy", "trae", "codebuddy"], overrides: {} };
+}
+
+function OrderSels({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
+  const arr = [0, 1, 2].map((i) => value[i] || PLAT_ORDER[i].v);
+  return (
+    <div className="grid grid-cols-3 gap-2">
+      {[0, 1, 2].map((i) => (
+        <Select
+          key={i}
+          value={arr[i]}
+          onValueChange={(v) => {
+            const next = [...arr];
+            next[i] = v;
+            onChange(next);
+          }}
+        >
+          <SelectTrigger className="h-9 bg-background">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {PLAT_ORDER.map((o) => (
+              <SelectItem key={o.v} value={o.v}>
+                {i + 1}. {o.l}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      ))}
+    </div>
+  );
+}
+
 export function Settings() {
-  const [s, setS] = useState<Settings>({});
+  const [s, setS] = useState<SettingsData>({});
   const [saving, setSaving] = useState(false);
+  const [prio, setPrio] = useState<PriorityCfg>({ default: ["workbuddy", "trae", "codebuddy"], overrides: {} });
+  const [ovModel, setOvModel] = useState("");
 
   function load() {
-    apiGet<Settings>("/api/settings")
-      .then(setS)
+    apiGet<SettingsData>("/api/settings")
+      .then((d) => {
+        setS(d);
+        setPrio(parsePriority(d.model_route_priority));
+      })
       .catch((e) => toast.error(e instanceof Error ? e.message : "加载失败"));
   }
   useEffect(load, []);
 
-  function set(k: keyof Settings, v: string) {
+  function set(k: keyof SettingsData, v: string) {
     setS((prev) => ({ ...prev, [k]: v }));
   }
 
@@ -87,6 +140,8 @@ export function Settings() {
         credit_threshold: s.credit_threshold || "0",
         free_models: s.free_models || "",
         public_join_enabled: s.public_join_enabled || "1",
+        trae_aha_device_id: (s.trae_aha_device_id || "").trim(),
+        model_route_priority: JSON.stringify(prio),
       });
       toast.success("设置已保存");
     } catch (e) {
@@ -180,6 +235,81 @@ export function Settings() {
         <Field label="开放公共号池扩充（用户可扫码接入）">
           <Sel value={s.public_join_enabled || "1"} onChange={(v) => set("public_join_enabled", v)} options={[{ v: "1", l: "开启" }, { v: "0", l: "关闭" }]} />
         </Field>
+        <Field
+          label="TraeWork Aha 设备号（16 位纯数字）"
+          hint="签到接口风控要求。从官方客户端 storage.json 的 iCubeAuthInfo://icube-dc: 后面复制；设备级注册，全号池通用"
+        >
+          <Input
+            className="h-9 bg-background font-mono text-xs"
+            placeholder="例如 7382917465019283"
+            value={s.trae_aha_device_id || ""}
+            onChange={(e) => set("trae_aha_device_id", e.target.value)}
+          />
+        </Field>
+      </SectionCard>
+
+      <SectionCard
+        title="模型调用优先级"
+        desc="同名模型在多个渠道都存在时，按此顺序选择渠道；单模型可单独覆盖"
+        icon={Route}
+        tone="violet"
+        delay={240}
+        bodyClassName="space-y-5 p-5"
+      >
+        <Field label="全局默认顺序" hint="外部请求不指定渠道时，按 1 → 2 → 3 顺序尝试">
+          <OrderSels value={prio.default} onChange={(v) => setPrio({ ...prio, default: v })} />
+        </Field>
+
+        <div className="space-y-3">
+          <Label>单模型覆盖</Label>
+          {Object.entries(prio.overrides).map(([m, order]) => (
+            <div key={m} className="flex items-center gap-2">
+              <span className="w-44 truncate font-mono text-xs">{m}</span>
+              <div className="flex-1">
+                <OrderSels
+                  value={order}
+                  onChange={(v) => setPrio({ ...prio, overrides: { ...prio.overrides, [m]: v } })}
+                />
+              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="text-rose-600 dark:text-rose-400"
+                onClick={() => {
+                  const next = { ...prio.overrides };
+                  delete next[m];
+                  setPrio({ ...prio, overrides: next });
+                }}
+              >
+                <Trash2 className="size-4" />
+              </Button>
+            </div>
+          ))}
+          <div className="flex items-center gap-2">
+            <Input
+              className="h-9 w-44 bg-background font-mono text-xs"
+              placeholder="模型 ID，如 glm-5"
+              value={ovModel}
+              onChange={(e) => setOvModel(e.target.value)}
+            />
+            <Button
+              variant="secondary"
+              size="sm"
+              className="gap-1"
+              disabled={!ovModel.trim() || !!prio.overrides[ovModel.trim()]}
+              onClick={() => {
+                const m = ovModel.trim();
+                setPrio({ ...prio, overrides: { ...prio.overrides, [m]: [...prio.default] } });
+                setOvModel("");
+              }}
+            >
+              <Plus className="size-4" /> 添加覆盖
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            保存后立即生效，无需重启。未覆盖的模型走全局默认顺序。
+          </p>
+        </div>
       </SectionCard>
 
       <p className="text-xs text-muted-foreground">

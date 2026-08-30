@@ -190,7 +190,7 @@ export function Models() {
 
   const skeletons = [
     { k: "workbuddy", l: "WorkBuddy" },
-    { k: "codebuddy_cn", l: "CodeBuddy CN" },
+    { k: "trae", l: "TraeWork" },
     { k: "codebuddy", l: "CodeBuddy 国际" },
   ];
 

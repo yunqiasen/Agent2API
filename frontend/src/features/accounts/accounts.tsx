@@ -11,6 +11,7 @@ import {
   Users,
   KeyRound,
   Coins,
+  Zap,
 } from "lucide-react";
 import { toast } from "sonner";
 import { QRCodeSVG } from "qrcode.react";
@@ -35,7 +36,6 @@ import {
 } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
-  Account,
   apiDelete,
   apiGet,
   apiPatch,
@@ -44,6 +44,7 @@ import {
   num,
   platName,
   PLATFORMS,
+  type Account,
 } from "@/lib/api";
 import {
   Tile,
@@ -112,6 +113,83 @@ function CheckinBadge({ a }: { a: Account }) {
   );
 }
 
+type ProbeResult = { ok: boolean; ms?: number; error?: string; reply?: string; model?: string };
+
+function ProbeCell({ a }: { a: Account }) {
+  const [models, setModels] = useState<{ id: string; name: string }[]>([]);
+  const [model, setModel] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [res, setRes] = useState<ProbeResult | null>(null);
+
+  useEffect(() => {
+    apiGet<{ ok: boolean; models: { id: string; name: string; kind?: string }[] }>(`/api/platforms/${a.platform}/models`)
+      .then((d) => {
+        // 测活走 chat 端点，只列对话模型
+        const list = (d.models || []).filter((m) => m.id && (!m.kind || m.kind === "chat"));
+        setModels(list);
+        if (list.length && !model) setModel(list[0].id);
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [a.platform]);
+
+  async function probe() {
+    if (!model) {
+      toast.error("先选择模型");
+      return;
+    }
+    setBusy(true);
+    setRes(null);
+    try {
+      const d = await apiPost<ProbeResult>(`/api/accounts/${a.id}/probe`, { model });
+      setRes(d);
+      if (d.ok) toast.success(`测活通过 · ${d.ms}ms`);
+      else toast.error("测活失败：" + (d.error || ""));
+    } catch (e) {
+      setRes({ ok: false, error: e instanceof Error ? e.message : "请求失败" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center gap-1.5">
+        <span className="text-xs text-muted-foreground">测活</span>
+        <select
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          className="h-7 min-w-0 flex-1 rounded-md border border-input bg-background px-1.5 font-mono text-[11px]"
+        >
+          {models.length === 0 && <option value="">无已探测模型</option>}
+          {models.map((m) => (
+            <option key={m.id} value={m.id}>{m.id}</option>
+          ))}
+        </select>
+        <Button variant="ghost" size="sm" className="h-7 gap-1 px-2" disabled={busy || !model} onClick={probe}>
+          <Zap className="size-3.5" /> {busy ? "测中…" : "测活"}
+        </Button>
+        {res && (
+          <span
+            className={`inline-block size-2.5 shrink-0 rounded-full ${res.ok ? "bg-emerald-500" : "bg-rose-500"}`}
+            title={res.ok ? `通过 · ${res.ms}ms` : res.error}
+          />
+        )}
+      </div>
+      {res && !res.ok && res.error && (
+        <div className="rounded-md bg-rose-500/10 px-2 py-1 font-mono text-[11px] text-rose-600 dark:text-rose-400 break-all">
+          {res.error}
+        </div>
+      )}
+      {res && res.ok && (
+        <div className="text-[11px] text-emerald-600 dark:text-emerald-400">
+          通过 · {res.ms}ms{res.reply ? ` · ${res.reply.slice(0, 30)}` : ""}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOpenChange: (v: boolean) => void; onAdded: () => void }) {
   const [platform, setPlatform] = useState(PLATFORMS[0].key);
   const [label, setLabel] = useState("");
@@ -120,6 +198,11 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOp
   const [log, setLog] = useState("等待授权…");
   const [started, setStarted] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [callbackUrl, setCallbackUrl] = useState("");
+  const [callbackBusy, setCallbackBusy] = useState(false);
+  const [traeMachineId, setTraeMachineId] = useState("");
+  const [traeDeviceId, setTraeDeviceId] = useState("");
+  const isTrae = platform === "trae";
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -142,19 +225,29 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOp
     setStarted(false);
     setLog("等待授权…");
     setBusy(false);
+    setCallbackUrl("");
+    setTraeMachineId("");
+    setTraeDeviceId("");
   }
 
   async function start() {
     setBusy(true);
     setLog("等待授权…");
     try {
-      const d = await apiPost<{ ok: boolean; state: string; auth_url: string }>("/api/login/start", {
+      const d = await apiPost<{ ok: boolean; state: string; auth_url: string; trae_machine_id?: string; trae_device_id?: string }>("/api/login/start", {
         platform,
         label: label || "后台添加",
       });
+      setTraeMachineId(d.trae_machine_id || "");
+      setTraeDeviceId(d.trae_device_id || "");
       setAuthUrl(d.auth_url);
       setState(d.state);
       setStarted(true);
+      if (isTrae) {
+        // Trae 没有 token 轮询端点：网页授权后复制回调 URL 到下方导入即可
+        setLog("在浏览器完成授权后，页面会跳到 127.0.0.1（显示无法访问属正常），复制地址栏完整 URL 粘贴到下方导入。");
+        return;
+      }
       let n = 0;
       stop();
       timer.current = setInterval(async () => {
@@ -227,6 +320,51 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOp
               {busy ? "获取中…" : "获取授权链接"}
             </Button>
           ) : (
+            isTrae ? (
+              <div className="space-y-3 pt-1">
+                <textarea readOnly rows={3} value={authUrl} className="w-full rounded-md border border-input bg-background px-2.5 py-2 font-mono text-xs" />
+                <Button variant="secondary" className="w-full" onClick={() => window.open(authUrl, "_blank")}>
+                  在浏览器打开
+                </Button>
+                <div className="space-y-2 border-t pt-3">
+                  <p className="text-xs text-muted-foreground">
+                    授权完成后浏览器会跳到 127.0.0.1（页面打不开属正常），复制地址栏完整回调 URL 粘贴到下面导入。
+                  </p>
+                  <textarea
+                    rows={3}
+                    value={callbackUrl}
+                    onChange={(e) => setCallbackUrl(e.target.value)}
+                    placeholder="http://127.0.0.1:18080/authorize?refreshToken=...&userJwt=..."
+                    className="w-full rounded-md border border-input bg-background px-2.5 py-2 font-mono text-xs"
+                  />
+                  <Button
+                    className="w-full"
+                    disabled={callbackBusy || !callbackUrl.trim()}
+                    onClick={async () => {
+                      setCallbackBusy(true);
+                      try {
+                        await apiPost("/api/login/trae_callback", {
+                          callback_url: callbackUrl.trim(),
+                          machine_id: traeMachineId,
+                          device_id: traeDeviceId,
+                          label: label || "后台添加",
+                        });
+                        toast.success("Trae 账号已加入号池");
+                        reset();
+                        onOpenChange(false);
+                        onAdded();
+                      } catch (e) {
+                        toast.error(e instanceof Error ? e.message : "Trae 回调导入失败");
+                      } finally {
+                        setCallbackBusy(false);
+                      }
+                    }}
+                  >
+                    {callbackBusy ? "导入中…" : "导入回调凭证"}
+                  </Button>
+                </div>
+              </div>
+            ) : (
             <Tabs defaultValue="scan">
               <TabsList className="grid w-full grid-cols-2">
                 <TabsTrigger value="scan">扫码登录</TabsTrigger>
@@ -245,6 +383,7 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOp
                 </Button>
               </TabsContent>
             </Tabs>
+            )
           )}
           {started && (
             <pre className="whitespace-pre-wrap break-all rounded-md bg-muted/40 p-3 text-xs text-muted-foreground">
@@ -510,6 +649,7 @@ export function Accounts() {
                       {a.last_error.slice(0, 40)}…
                     </div>
                   )}
+                  <ProbeCell a={a} />
                 </div>
 
                 <div className="mt-3 flex items-center gap-1 border-t pt-3">

@@ -12,7 +12,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { ApiKey, apiDelete, apiGet, apiPatch, apiPost, ago, platName, PLATFORMS } from "@/lib/api";
+import { apiDelete, apiGet, apiPatch, apiPost, ago, platName, PLATFORMS, type ApiKey } from "@/lib/api";
 import { PageHeader, SectionCard, Chip, Copyable, type Tone } from "@/lib/design";
 
 export function Keys() {
