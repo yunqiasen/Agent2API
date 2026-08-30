@@ -1174,7 +1174,7 @@ def panel_models_discover():
             "label": p["label"],
             "models": P.catalog_entries(key),
         })
-    exposed = P.to_entries(sorted(registry.keys()))
+    exposed = P.to_entries(proxy.list_models())
     return jsonify({
         "ok": True,
         "platforms": platforms_out,
@@ -1206,7 +1206,7 @@ def panel_models_discover_progress():
             "label": p["label"],
             "models": P.catalog_entries(key),
         })
-    exposed = P.to_entries(sorted(registry.keys()))
+    exposed = P.to_entries(proxy.list_models())
     return jsonify({
         "ok": True,
         "platforms": platforms_out,

@@ -55,3 +55,19 @@ def test_models_discover_progress_includes_disabled_map(client):
     db.set_setting("model_platform_disabled", json.dumps({"workbuddy": ["glm-5.3"]}))
     out = c.get("/api/models/discover/progress").get_json()
     assert out["disabled"] == {"workbuddy": ["glm-5.3"]}
+
+
+def test_discover_exposed_reflects_disabled_switch(client):
+    """「对外暴露」清单与真实 /v1/models 一致：三渠道全关的模型不显示。"""
+    c, db = client
+    db.set_model_registry({
+        "glm-5.3": {"type": "chat", "platforms": ["workbuddy", "trae"]},
+        "deepseek-v4-flash": {"type": "chat", "platforms": ["workbuddy"]},
+    })
+    db.set_setting("model_platform_disabled", json.dumps({
+        "workbuddy": ["glm-5.3", "deepseek-v4-flash"],
+        "trae": ["glm-5.3"],
+    }))
+    out = c.get("/api/models/discover/progress").get_json()
+    ids = [m["id"] for m in out["exposed"]]
+    assert ids == []  # 两个模型都被全渠道关闭
