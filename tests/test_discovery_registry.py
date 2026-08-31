@@ -21,3 +21,19 @@ def test_run_discovery_preserves_trae_catalog_entries(isolated_db, monkeypatch):
     out = discovery.run_discovery()
     assert out["glm-5.2"]["platforms"] == ["workbuddy", "trae"]
     assert out["kimi-k3"]["platforms"] == ["trae"]
+
+
+def test_codebuddy_catalog_includes_config_fallback_models(isolated_db, monkeypatch):
+    """国际站 console/models 500 时，/v3/config 的 CLI 目录必须合并进注册表。
+
+    回归：glm-5.3/glm-5.2/kimi-k3/kimi-k2.6/minimax-m3 曾因回退断链而漏收。
+    """
+    import providers as P
+    catalog = ["default-model", "glm-5.3", "kimi-k3", "minimax-m3"]
+    monkeypatch.setattr(P, "fetch_upstream_models", lambda *a, **k: [])
+    monkeypatch.setattr(P, "_fetch_config_models", lambda *a, **k: catalog)
+    added = P.merge_upstream_models("codebuddy", "tok")
+    assert added == catalog
+    reg = isolated_db.get_model_registry()
+    for mid in catalog:
+        assert "codebuddy" in reg[mid]["platforms"]

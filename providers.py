@@ -690,8 +690,12 @@ def merge_upstream_models(platform_key, access_token, uid=None,
 
     只标记平台与 chat 类型；这些模型来自 CLI 官方白名单，因此不再逐个真实请求。
     """
+    # 国际站 /console/.../models 常年 500；fetch_upstream_models 内部已回退
+    # /v3/config 的 agents[cli].models。这里直接用它的返回值，空列表才放弃。
     ids = fetch_upstream_models(platform_key, access_token, uid=uid,
                                  machine_id=machine_id, device_id=device_id)
+    if not ids:
+        ids = _fetch_config_models(platform_key, access_token)
     if not ids:
         return []
     reg = db.get_model_registry()
