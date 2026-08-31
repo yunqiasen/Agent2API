@@ -202,3 +202,15 @@ def test_aha_pool_untouched_for_other_platforms(monkeypatch):
     monkeypatch.setattr("db.get_setting", lambda k, d=None: "1111111111111111")
     assert proxy._checkin_device_id(
         {"platform": "workbuddy", "device_id": "wb-dev"}) == "wb-dev"
+
+
+def test_aha_pool_handles_sqlite_rows(isolated_db, monkeypatch):
+    """真实 list_accounts 返回 sqlite3.Row（无 .get），分摊逻辑必须兼容。"""
+    db = isolated_db
+    a1 = db.add_account("trae", "t1", uid="u1")
+    a2 = db.add_account("trae", "t2", uid="u2")
+    monkeypatch.setattr("db.get_setting",
+                        lambda k, d=None: "1111111111111111\n2222222222222222")
+    got = {a: proxy._checkin_device_id({"id": aid, "platform": "trae"})
+           for aid, a in [(a1, "a1"), (a2, "a2")]}
+    assert got == {"a1": "1111111111111111", "a2": "2222222222222222"}

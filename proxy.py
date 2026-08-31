@@ -145,7 +145,8 @@ def _checkin_device_id(acc: dict):
         pool = _aha_device_pool()
         if pool:
             ids = sorted(a["id"] for a in db.list_accounts()
-                         if P._is_trae(a.get("platform")))
+                         if P._is_trae(a["platform"] if "platform" in a.keys()
+                                        else None))
             idx = ids.index(acc["id"]) if acc.get("id") in ids else 0
             return pool[idx % len(pool)]
     return acc.get("device_id") or None
