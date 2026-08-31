@@ -487,6 +487,11 @@ export function Accounts() {
   const [list, setList] = useState<Account[]>([]);
   const [addOpen, setAddOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  // 渠道筛选：all = 全部渠道；其余只显示对应渠道号池
+  const [platformFilter, setPlatformFilter] = useState("all");
+  const filtered = platformFilter === "all"
+    ? list
+    : list.filter((a) => a.platform === platformFilter);
 
   function load() {
     apiGet<Account[]>("/api/accounts")
@@ -496,13 +501,13 @@ export function Accounts() {
   useEffect(load, []);
 
   const now = Math.floor(Date.now() / 1000);
-  const total = list.length;
-  const enabled = list.filter((a) => a.enabled).length;
-  const claimable = list.reduce(
+  const total = filtered.length;
+  const enabled = filtered.filter((a) => a.enabled).length;
+  const claimable = filtered.reduce(
     (s, a) => s + (a.supports_checkin && !a.checkin_today ? a.checkin_credit || 0 : 0),
     0
   );
-  const expiring = list.filter(
+  const expiring = filtered.filter(
     (a) => a.expires_at_sec && a.expires_at_sec - now < 900 && a.expires_at_sec > now
   ).length;
 
@@ -546,9 +551,11 @@ export function Accounts() {
     load();
   }
   async function checkinAll() {
-    toast("正在签到全部账号…");
-    await apiPost("/api/accounts/checkin_all", {});
-    toast.success("签到完成");
+    const scope = platformFilter === "all" ? "全部渠道" : platName(platformFilter);
+    toast(`正在签到${scope}账号…`);
+    await apiPost("/api/accounts/checkin_all",
+      platformFilter === "all" ? {} : { platform: platformFilter });
+    toast.success(`签到完成（${scope}）`);
     load();
   }
 
@@ -570,7 +577,7 @@ export function Accounts() {
               <Coins className="size-4" /> 刷新额度
             </Button>
             <Button variant="secondary" onClick={checkinAll} className="gap-1.5">
-              <Gift className="size-4" /> 全部签到
+              <Gift className="size-4" /> {platformFilter === "all" ? "全部签到" : `签到${platName(platformFilter)}`}
             </Button>
             <Button variant="ghost" size="icon" onClick={load} aria-label="刷新">
               <RefreshCw className="size-4" />
@@ -586,13 +593,43 @@ export function Accounts() {
         <Tile tone="rose" icon={AlertTriangle} label="即将过期" value={num(expiring)} hint="个" delay={240} />
       </div>
 
-      {list.length === 0 ? (
+      <div className="flex flex-wrap items-center gap-1.5">
+        {[
+          { key: "all", label: "全部渠道" },
+          ...PLATFORMS.map((p) => ({ key: p.key, label: p.name })),
+        ].map((opt) => {
+          const active = platformFilter === opt.key;
+          const count = opt.key === "all"
+            ? list.length
+            : list.filter((a) => a.platform === opt.key).length;
+          return (
+            <button
+              key={opt.key}
+              type="button"
+              onClick={() => setPlatformFilter(opt.key)}
+              className={
+                "rounded-full border px-3 py-1.5 text-xs transition-colors " +
+                (active
+                  ? "border-primary bg-primary text-primary-foreground"
+                  : "border-border bg-secondary text-secondary-foreground hover:bg-secondary/70")
+              }
+            >
+              {opt.label}
+              <span className={"ml-1.5 font-mono text-[10px] " + (active ? "opacity-80" : "opacity-60")}>
+                {count}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      {filtered.length === 0 ? (
         <div className="rounded-xl border bg-card px-5 py-16 text-center text-sm text-muted-foreground animate-in fade-in">
           号池为空，点右上角「添加账号」开始接入
         </div>
       ) : (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {list.map((a, i) => {
+          {filtered.map((a, i) => {
             const pt = (["indigo", "violet", "emerald", "amber", "cyan", "sky", "fuchsia", "orange"] as Tone[])[
               i % 8
             ];

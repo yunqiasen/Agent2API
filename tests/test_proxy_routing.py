@@ -50,24 +50,39 @@ def test_route_priority_invalid_json_falls_back(registry, monkeypatch):
 
 
 
-# ---------------- 签到 X-Device-Id：凭证 device_id 优先，uid 兜底 ----------------
+# ---------------- 签到 X-Device-Id：统一用 uid ----------------
 
-def test_checkin_device_id_prefers_credential_device_id():
-    """扫码/回调导入的凭证自带 device_id（登录时注册），签到优先用它。"""
+def test_checkin_device_id_uses_uid_even_with_credential_device_id():
+    """统一用 uid：手填 token 导入的 device_id 是未注册孤儿码（实测 9074），
+    uid 对扫码/手填两类账号均稳定成功。"""
     assert proxy._checkin_device_id(
         {"platform": "trae", "uid": "3225317503410283",
          "device_id": "f0c660bada0e401195540c826388d614e61d819f228c4db4"}
-    ) == "f0c660bada0e401195540c826388d614e61d819f228c4db4"
+    ) == "3225317503410283"
 
 
-def test_checkin_device_id_falls_back_to_uid():
-    """手填 token 导入无 device_id 时，回退 uid，签到头不缺失。"""
+def test_checkin_device_id_falls_back_to_device_id_when_uid_empty():
+    """uid 为空时回退 device_id，签到头不缺失。"""
     assert proxy._checkin_device_id(
-        {"platform": "trae", "uid": "3225317503410283",
-         "device_id": ""}) == "3225317503410283"
+        {"platform": "trae", "uid": "",
+         "device_id": "hex-old"}) == "hex-old"
 
 
 def test_checkin_device_id_untouched_for_other_platforms():
     """非 Trae 平台不吃该逻辑，保持账号自身设备号。"""
     assert proxy._checkin_device_id(
         {"platform": "workbuddy", "uid": "u123", "device_id": "wb-dev"}) == "wb-dev"
+
+
+def test_checkin_all_filters_by_platform(isolated_db, monkeypatch):
+    """渠道签到：platform=trae 只签 trae 号，workbuddy 不动。"""
+    db = isolated_db
+    t1 = db.add_account("trae", "t1", uid="u1")
+    w1 = db.add_account("workbuddy", "w1", uid="u2")
+    called = []
+    monkeypatch.setattr(proxy.P, "supports_checkin", lambda p: True)
+    monkeypatch.setattr(proxy.db, "get_account", lambda aid: aid)
+    monkeypatch.setattr(proxy, "checkin_account",
+                        lambda row: called.append(row) or {"ok": True})
+    proxy.checkin_all(platform="trae")
+    assert called == [t1]

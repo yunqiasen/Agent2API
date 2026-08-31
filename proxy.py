@@ -129,17 +129,14 @@ def refresh_quota(account_row) -> dict:
 # --------------------------------------------------------------------------
 
 def _checkin_device_id(acc: dict):
-    """签到 X-Device-Id：优先凭证自带 device_id，uid 兜底。
+    """签到 X-Device-Id：用 uid（2026-08-31 全号池 6/6 实测 code 0）。
 
-    实测（2026-08-31）：上游只要求该头非空合法——凭证登录时生成的 hex
-    device_id 与 uid 均返回 code 0。凭证 device_id 是登录流程里随账号
-    注册的原生标识，优先用它最保真；缺失（手填 token 导入等场景）回退 uid。
+    实测对比：扫码导入的老号 device_id 可用；手填 token 导入的号 device_id
+    是未注册的孤儿码 → 9074。uid 对两类账号均稳定成功，因此统一用 uid，
+    规避 device_id 来源不一致的坑。
     """
     if P._is_trae(acc.get("platform")):
-        dev = str(acc.get("device_id") or "").strip()
-        if dev:
-            return dev
-        return str(acc.get("uid") or "").strip() or None
+        return str(acc.get("uid") or "").strip() or acc.get("device_id") or None
     return acc.get("device_id") or None
 
 
@@ -193,11 +190,14 @@ def checkin_account(account_row) -> dict:
     return res
 
 
-def checkin_all(silent: bool = False) -> dict:
-    """遍历所有启用且支持签到的账号，逐个领取。返回逐账号结果。"""
+def checkin_all(silent: bool = False, platform: str | None = None) -> dict:
+    """遍历启用且支持签到的账号，逐个领取。platform 指定时只签该渠道。"""
     results = []
+    want = str(platform or "").strip()
     for row in db.list_accounts():
         a = dict(row)
+        if want and a["platform"] != want:
+            continue
         if not a["enabled"]:
             continue
         if not P.supports_checkin(a["platform"]):
@@ -888,15 +888,17 @@ def _trae_openai_sse_events(resp, model: str):
 
 
 def probe_account(account_row, model: str, timeout=(5, 30)) -> dict:
-    """对指定账号用指定模型发一次真实测活请求（固定 ping / max_tokens=1）。
+    """对指定账号用指定模型发一次真实测活请求（固定 ping / max_tokens=16（低于部分模型最小值会误报 400））。
 
     锁定该账号直连上游（不走号池调度），用于判断单账号死活。
     返回 {ok, ms, model, platform, reply|error}；不写调用计数。
     """
     acc = ensure_token(account_row)
+    # max_tokens 不能用 1：GPT-5.x 系上游最小值校验会 400（integer_below_min_value），
+    # 误报成"模型不可用"。16 对所有渠道安全且依然省额度。
     body = {"model": model,
             "messages": [{"role": "user", "content": "ping"}],
-            "max_tokens": 1}
+            "max_tokens": 16}
     t0 = time.time()
     resp = None
     try:

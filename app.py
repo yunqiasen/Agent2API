@@ -752,8 +752,12 @@ def panel_platform_models(key):
 @app.route("/api/accounts/checkin_all", methods=["POST"])
 @admin_required
 def panel_checkin_all():
+    data = request.get_json(silent=True) or {}
+    platform = (data.get("platform") or "").strip()
+    if platform and platform not in P.PLATFORMS:
+        return jsonify({"ok": False, "error": "未知平台"}), 400
     try:
-        d = proxy.checkin_all(silent=False)
+        d = proxy.checkin_all(silent=False, platform=platform or None)
         return jsonify(d)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
