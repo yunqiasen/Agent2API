@@ -86,3 +86,11 @@ def test_checkin_all_filters_by_platform(isolated_db, monkeypatch):
                         lambda row: called.append(row) or {"ok": True})
     proxy.checkin_all(platform="trae")
     assert called == [t1]
+
+
+def test_checkin_device_id_accepts_sqlite_row(isolated_db):
+    """入参兼容 sqlite3.Row（不转 dict 直接传时不该崩）。"""
+    db = isolated_db
+    aid = db.add_account("trae", "t1", uid="u-123", device_id="hex")
+    row = db.get_account(aid)
+    assert proxy._checkin_device_id(row) == "u-123"

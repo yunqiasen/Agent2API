@@ -128,16 +128,20 @@ def refresh_quota(account_row) -> dict:
 # 每日签到
 # --------------------------------------------------------------------------
 
-def _checkin_device_id(acc: dict):
+def _checkin_device_id(acc):
     """签到 X-Device-Id：用 uid（2026-08-31 全号池 6/6 实测 code 0）。
 
     实测对比：扫码导入的老号 device_id 可用；手填 token 导入的号 device_id
     是未注册的孤儿码 → 9074。uid 对两类账号均稳定成功，因此统一用 uid，
     规避 device_id 来源不一致的坑。
+    兼容 dict 与 sqlite3.Row 两种入参（老代码只按 dict 写）。
     """
-    if P._is_trae(acc.get("platform")):
-        return str(acc.get("uid") or "").strip() or acc.get("device_id") or None
-    return acc.get("device_id") or None
+    def g(k):
+        return acc[k] if hasattr(acc, "keys") and k in acc.keys() else acc.get(k)
+
+    if P._is_trae(g("platform")):
+        return str(g("uid") or "").strip() or g("device_id") or None
+    return g("device_id") or None
 
 
 def refresh_checkin_status(account_row) -> dict:
