@@ -124,6 +124,21 @@ export function Settings() {
   }
 
   async function save() {
+    // 设备号池校验：一行一个 8-20 位纯数字
+    const ahaLines = (s.trae_aha_device_id || "")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const bad = ahaLines.filter((l) => !/^\d{8,20}$/.test(l));
+    if (bad.length > 0) {
+      toast.error(`设备号格式错误（第 ${ahaLines.indexOf(bad[0]) + 1} 行）：${bad[0]}，需 8-20 位纯数字`);
+      return;
+    }
+    if (new Set(ahaLines).size !== ahaLines.length) {
+      toast.error("设备号有重复，请去重后保存");
+      return;
+    }
+
     setSaving(true);
     try {
       await apiPost("/api/settings", {
@@ -140,10 +155,14 @@ export function Settings() {
         credit_threshold: s.credit_threshold || "0",
         free_models: s.free_models || "",
         public_join_enabled: s.public_join_enabled || "1",
-        trae_aha_device_id: (s.trae_aha_device_id || "").trim(),
+        trae_aha_device_id: ahaLines.join("\n"),
         model_route_priority: JSON.stringify(prio),
       });
-      toast.success("设置已保存");
+      toast.success(
+        ahaLines.length > 1
+          ? `设置已保存，${ahaLines.length} 个设备号将按账号分摊`
+          : "设置已保存",
+      );
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "保存失败");
     } finally {
@@ -236,12 +255,12 @@ export function Settings() {
           <Sel value={s.public_join_enabled || "1"} onChange={(v) => set("public_join_enabled", v)} options={[{ v: "1", l: "开启" }, { v: "0", l: "关闭" }]} />
         </Field>
         <Field
-          label="TraeWork Aha 设备号（16 位纯数字）"
-          hint="签到接口风控要求。从官方客户端 storage.json 的 iCubeAuthInfo://icube-dc: 后面复制；设备级注册，全号池通用"
+          label="TraeWork Aha 设备号池（一行一个，8-20 位纯数字）"
+          hint="签到接口风控要求。从官方客户端 storage.json 的 iCubeAuthInfo://icube-dc: 后面复制；多个设备号按账号 id 分摊，账号多于设备时环绕共享"
         >
-          <Input
-            className="h-9 bg-background font-mono text-xs"
-            placeholder="例如 7382917465019283"
+          <textarea
+            className="min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring/20"
+            placeholder={"7382917465019283\n8291746501928374"}
             value={s.trae_aha_device_id || ""}
             onChange={(e) => set("trae_aha_device_id", e.target.value)}
           />
