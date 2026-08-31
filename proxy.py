@@ -129,13 +129,17 @@ def refresh_quota(account_row) -> dict:
 # --------------------------------------------------------------------------
 
 def _checkin_device_id(acc: dict):
-    """签到用 X-Device-Id：直接用 uid（2026-08-31 实测最稳）。
+    """签到 X-Device-Id：优先凭证自带 device_id，uid 兜底。
 
-    上游 claim 接口只要求 X-Device-Id 是非空字符串；uid 每号唯一，
-    不存在"设备码一天一签"限制。旧的 16 位 Aha 校验是误判，已删。
+    实测（2026-08-31）：上游只要求该头非空合法——凭证登录时生成的 hex
+    device_id 与 uid 均返回 code 0。凭证 device_id 是登录流程里随账号
+    注册的原生标识，优先用它最保真；缺失（手填 token 导入等场景）回退 uid。
     """
     if P._is_trae(acc.get("platform")):
-        return str(acc.get("uid") or "").strip() or acc.get("device_id") or None
+        dev = str(acc.get("device_id") or "").strip()
+        if dev:
+            return dev
+        return str(acc.get("uid") or "").strip() or None
     return acc.get("device_id") or None
 
 

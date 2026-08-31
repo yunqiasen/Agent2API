@@ -50,23 +50,24 @@ def test_route_priority_invalid_json_falls_back(registry, monkeypatch):
 
 
 
-# ---------------- 签到 X-Device-Id：直接用 uid ----------------
+# ---------------- 签到 X-Device-Id：凭证 device_id 优先，uid 兜底 ----------------
 
-def test_checkin_device_id_uses_uid_for_trae(monkeypatch):
-    """TraeWork 签到 X-Device-Id 用 uid（实测最稳，无设备码概念）。"""
-    monkeypatch.setattr("db.get_setting", lambda k, d=None: "")
+def test_checkin_device_id_prefers_credential_device_id():
+    """扫码/回调导入的凭证自带 device_id（登录时注册），签到优先用它。"""
     assert proxy._checkin_device_id(
         {"platform": "trae", "uid": "3225317503410283",
-         "device_id": "hex-old"}) == "3225317503410283"
+         "device_id": "f0c660bada0e401195540c826388d614e61d819f228c4db4"}
+    ) == "f0c660bada0e401195540c826388d614e61d819f228c4db4"
 
 
-def test_checkin_device_id_falls_back_when_uid_empty():
-    """uid 为空时回退账号 device_id，签到头不至于缺失。"""
+def test_checkin_device_id_falls_back_to_uid():
+    """手填 token 导入无 device_id 时，回退 uid，签到头不缺失。"""
     assert proxy._checkin_device_id(
-        {"platform": "trae", "uid": "", "device_id": "hex-old"}) == "hex-old"
+        {"platform": "trae", "uid": "3225317503410283",
+         "device_id": ""}) == "3225317503410283"
 
 
 def test_checkin_device_id_untouched_for_other_platforms():
-    """非 Trae 平台不吃 uid 逻辑，保持账号自身设备号。"""
+    """非 Trae 平台不吃该逻辑，保持账号自身设备号。"""
     assert proxy._checkin_device_id(
         {"platform": "workbuddy", "uid": "u123", "device_id": "wb-dev"}) == "wb-dev"
