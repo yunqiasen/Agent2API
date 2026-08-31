@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-LABEL org.opencontainers.image.title="hy3api" \
+LABEL org.opencontainers.image.title="Agent2API" \
       org.opencontainers.image.description="WorkBuddy / CodeBuddy CN / CodeBuddy 三平台 hy3 模型反代与号池面板"
 
 ENV PYTHONUNBUFFERED=1 \
@@ -32,10 +32,10 @@ RUN test -s /app/frontend/dist/index.html \
     || (echo "ERROR: frontend/dist 不完整，请先执行 cd frontend && npm run build" && exit 1)
 
 # 以非 root 运行；/data 为 SQLite 持久化目录
-RUN useradd -r -u 10001 -m -d /home/hy3api hy3api \
+RUN useradd -r -u 10001 -m -d /home/agent2api agent2api \
     && mkdir -p /data \
-    && chown -R hy3api:hy3api /app /data
-USER hy3api
+    && chown -R agent2api:agent2api /app /data
+USER agent2api
 
 VOLUME ["/data"]
 EXPOSE 8787

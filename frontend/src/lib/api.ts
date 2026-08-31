@@ -1,4 +1,4 @@
-// 与 hy3api 后端的通信层（基于 Flask 会话 cookie，same-origin）
+// 与 Agent2API 后端的通信层（基于 Flask 会话 cookie，same-origin）
 
 export const PLATFORMS = [
   { key: "workbuddy", name: "WorkBuddy" },

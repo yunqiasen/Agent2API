@@ -109,7 +109,7 @@ export function AppShell() {
             </span>
             <span className="flex flex-col leading-tight">
               <span className="text-[15px] font-semibold tracking-tight text-foreground">
-                hy3api
+                Agent2API
               </span>
               <span className="text-[10px] font-normal text-muted-foreground">
                 v1 · 号池控制台

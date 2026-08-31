@@ -74,6 +74,8 @@ function parsePriority(raw?: string): PriorityCfg {
 }
 
 function OrderSels({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
+  // 三个下拉必须构成全排列：改一个位置 = 与被选中平台交换位置。
+  // 旧实现允许重复值（如 [trae,trae,codebuddy]），导致平台"消失"且路由坏数据入库。
   const arr = [0, 1, 2].map((i) => value[i] || PLAT_ORDER[i].v);
   return (
     <div className="grid grid-cols-3 gap-2">
@@ -82,7 +84,13 @@ function OrderSels({ value, onChange }: { value: string[]; onChange: (v: string[
           key={i}
           value={arr[i]}
           onValueChange={(v) => {
+            if (v === arr[i]) return;
             const next = [...arr];
+            const j = next.indexOf(v);
+            // 目标平台已在其它位置：交换，保证始终是三平台全排列
+            if (j >= 0) {
+              next[j] = next[i];
+            }
             next[i] = v;
             onChange(next);
           }}

@@ -121,7 +121,7 @@ export function JoinPage() {
             <Sparkles className="size-4" />
           </span>
           <span className="text-[15px] font-semibold tracking-tight text-foreground">
-            hy3api
+            Agent2API
           </span>
         </span>
         <div className="flex items-center gap-2">
@@ -156,7 +156,7 @@ export function JoinPage() {
               把你的账号贡献进共享号池
             </h2>
             <p className="mt-4 max-w-xs text-xs leading-6 text-muted-foreground">
-              用手机扫码或网页登录授权后，你的账号会被加入 hy3api
+              用手机扫码或网页登录授权后，你的账号会被加入 Agent2API
               的共享号池，帮助更多人稳定调用多平台模型。账号由管理员统一管理，可随时停用。
             </p>
             <ul className="mt-6 space-y-3 text-xs text-muted-foreground">
@@ -389,7 +389,7 @@ export function JoinPage() {
       </main>
 
       <footer className="mx-auto w-full max-w-[1040px] px-5 py-6 text-center text-xs text-muted-foreground sm:px-8">
-        hy3api · 共享号池与中转站
+        Agent2API · 共享号池与中转站
       </footer>
     </div>
   );

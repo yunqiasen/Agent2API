@@ -261,7 +261,7 @@ function UsageAreaChart({ series }: { series: OverviewUsage["series"] }) {
 export function Overview() {
   const [s, setS] = useState<OverviewStats | null>(null);
   const [u, setU] = useState<OverviewUsage | null>(null);
-  const [keyFirst, setKeyFirst] = useState<string>("hy3api");
+  const [keyFirst, setKeyFirst] = useState<string>("Agent2API");
   const [testPrompt, setTestPrompt] = useState("用一句话介绍你自己");
   const [testPlatform, setTestPlatform] = useState("workbuddy");
   const [testOut, setTestOut] = useState<string>("");

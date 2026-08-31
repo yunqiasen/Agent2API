@@ -39,7 +39,7 @@ export function LoginPage() {
             <Sparkles className="size-4" />
           </span>
           <span className="text-[15px] font-semibold tracking-tight text-foreground">
-            hy3api
+            Agent2API
           </span>
         </span>
         <a
@@ -56,7 +56,7 @@ export function LoginPage() {
       <main className="mx-auto flex w-full max-w-[1040px] flex-1 items-center justify-center px-5 py-10 sm:px-8 lg:px-0">
         <div className="grid w-full max-w-[900px] -translate-y-4 items-center lg:-translate-y-8 lg:grid-cols-[minmax(0,1fr)_1px_336px] lg:gap-14">
           <section className="hidden min-h-72 flex-col justify-center lg:flex">
-            <p className="text-xs font-medium text-primary">hy3api 控制台</p>
+            <p className="text-xs font-medium text-primary">Agent2API 控制台</p>
             <h2 className="mt-3 max-w-sm text-3xl font-semibold leading-tight tracking-tight">
               聚合多平台账号
               <br />
@@ -124,7 +124,7 @@ export function LoginPage() {
       </main>
 
       <footer className="mx-auto w-full max-w-[1040px] px-5 py-6 text-center text-xs text-muted-foreground sm:px-8">
-        hy3api · 共享号池与中转站
+        Agent2API · 共享号池与中转站
       </footer>
     </div>
   );

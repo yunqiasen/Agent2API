@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""hy3api - SQLite 数据层"""
+"""Agent2API - SQLite 数据层"""
 from __future__ import annotations
 
 import hashlib
@@ -11,18 +11,18 @@ import threading
 import time
 
 def _resolve_db_path() -> str:
-    """数据库位置优先级：HY3API_DB > HY3API_DATA_DIR/hy3api.db > 代码目录。
+    """数据库位置优先级：AGENT2API_DB > AGENT2API_DATA_DIR/agent2api.db > 代码目录。
 
-    容器里挂 volume 到 /data 并设 HY3API_DATA_DIR=/data 即可持久化。
+    容器里挂 volume 到 /data 并设 AGENT2API_DATA_DIR=/data 即可持久化。
     """
-    p = os.environ.get("HY3API_DB")
+    p = os.environ.get("AGENT2API_DB") or os.environ.get("HY3API_DB")
     if p:
         return p
-    d = os.environ.get("HY3API_DATA_DIR")
+    d = os.environ.get("AGENT2API_DATA_DIR") or os.environ.get("HY3API_DATA_DIR")
     if d:
         os.makedirs(d, exist_ok=True)
-        return os.path.join(d, "hy3api.db")
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hy3api.db")
+        return os.path.join(d, "agent2api.db")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent2api.db")
 
 
 DB_PATH = _resolve_db_path()
@@ -31,8 +31,8 @@ _local = threading.local()
 _write_lock = threading.RLock()
 
 # 首次初始化用的默认凭据，可用环境变量覆盖（仅在数据库为空时生效）
-DEFAULT_ADMIN_PASSWORD = os.environ.get("HY3API_ADMIN_PASSWORD") or "admin"
-DEFAULT_API_KEY = os.environ.get("HY3API_DEFAULT_KEY") or "hy3api"
+DEFAULT_ADMIN_PASSWORD = os.environ.get("AGENT2API_ADMIN_PASSWORD") or os.environ.get("HY3API_ADMIN_PASSWORD") or "admin"
+DEFAULT_API_KEY = os.environ.get("AGENT2API_DEFAULT_KEY") or "Agent2API"
 
 
 def get_conn() -> sqlite3.Connection:
@@ -268,7 +268,7 @@ def get_secret_key() -> str:
 
     优先取环境变量；否则持久化在数据库里，保证容器重启后登录态不失效。
     """
-    env = os.environ.get("HY3API_SECRET")
+    env = os.environ.get("AGENT2API_SECRET") or os.environ.get("HY3API_SECRET")
     if env:
         return env
     v = get_setting("_secret_key")
@@ -476,7 +476,7 @@ def save_quota(account_id: int, summary: dict):
 # ------------------------------ api keys ------------------------------
 
 def add_api_key(name: str, key: str | None = None, platform: str = "") -> str:
-    key = key or ("sk-hy3-" + secrets.token_urlsafe(24))
+    key = key or ("sk-agent2api-" + secrets.token_urlsafe(24))
     with _write_lock:
         c = get_conn()
         c.execute("INSERT OR IGNORE INTO api_keys(name,api_key,platform,created_at) "

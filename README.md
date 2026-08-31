@@ -1,4 +1,4 @@
-# hy3api
+# Agent2API
 
 WorkBuddy / CodeBuddy CN / CodeBuddy（国际）三平台 **hy3 模型反向代理 + 号池控制面板**。
 对外暴露标准 OpenAI 兼容接口，对内做 SSO 登录、令牌自动续期、号池调度、额度监控与调用鉴权。
@@ -33,13 +33,13 @@ python app.py
 | OpenAI Base URL | http://127.0.0.1:8787/v1 |
 | 健康检查 | http://127.0.0.1:8787/health |
 
-**默认管理员密码 `admin`，默认调用 Key `hy3api`** —— 上线前请务必在面板里改掉。
+**默认管理员密码 `admin`，默认调用 Key `Agent2API`** —— 上线前请务必在面板里改掉。
 
 调用示例：
 
 ```bash
 curl http://127.0.0.1:8787/v1/chat/completions \
-  -H "Authorization: Bearer hy3api" \
+  -H "Authorization: Bearer Agent2API" \
   -H "Content-Type: application/json" \
   -d '{"model":"hy3","messages":[{"role":"user","content":"你好"}]}'
 ```
@@ -77,7 +77,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
    `POST {api_base}/v2/plugin/auth/token/refresh`，头里带 `Authorization: Bearer {access}` + `X-Refresh-Token: {refresh}`，body 为 `{}`。三平台一致。
 
 6. **上游没有 `responses` 接口，但本代理提供。** `/v1/responses`、`/v2/responses` 上游均 404。
-   → 本服务在反代层**把 OpenAI Responses API 转译为 `chat/completions`**（`hy3api/responses.py`）：
+   → 本服务在反代层**把 OpenAI Responses API 转译为 `chat/completions`**（`responses.py`）：
    入参 `input`/`instructions`/`tools`/`tool_choice`/`text.format` 翻译为 messages/tools；
    上游 SSE 流实时转写成 Responses 事件（或聚合成 `response` 对象返回非流式）。
    详见第 5 节。
@@ -217,7 +217,7 @@ hy3api/
 
 ```bash
 curl http://127.0.0.1:8787/v1/responses \
-  -H "Authorization: Bearer hy3api" \
+  -H "Authorization: Bearer Agent2API" \
   -H "Content-Type: application/json" \
   -d '{"model":"hy3","input":"用一句中文介绍你自己","stream":false}'
 ```

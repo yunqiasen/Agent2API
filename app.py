@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-hy3api - 三平台 hy3 模型反代 + 号池控制面板
+Agent2API - 三平台模型反代 + 号池控制面板
 
 平台支持: WorkBuddy / CodeBuddy CN / CodeBuddy(国际)
 对外接口: OpenAI 兼容 /v1/chat/completions, /v1/models
-控制面板: /  (默认管理员密码 admin, 默认 API Key hy3api)
+控制面板: /  (默认管理员密码 admin, 默认 API Key Agent2API)
 
 启动:
     python app.py                 # 默认 0.0.0.0:8787
@@ -167,7 +167,7 @@ def api_models():
     if kr is None:
         return openai_error("无效的 API Key", 401, "invalid_api_key")
     now = int(time.time())
-    data = [{"id": m, "object": "model", "created": now, "owned_by": "hy3api"}
+    data = [{"id": m, "object": "model", "created": now, "owned_by": "agent2api"}
             for m in proxy.list_models()]
     return jsonify({"object": "list", "data": data})
 
@@ -1296,7 +1296,7 @@ def web_assets(fn):
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "service": "hy3api", "ts": int(time.time())})
+    return jsonify({"ok": True, "service": "agent2api", "ts": int(time.time())})
 
 
 @app.route("/<path:p>")
@@ -1339,12 +1339,12 @@ def _maintenance_loop():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="hy3api - 三平台 hy3 反代与号池面板")
-    ap.add_argument("--host", default=os.environ.get("HY3API_HOST", "0.0.0.0"))
+    ap = argparse.ArgumentParser(description="Agent2API - 三平台模型反代与号池面板")
+    ap.add_argument("--host", default=os.environ.get("AGENT2API_HOST") or os.environ.get("HY3API_HOST", "0.0.0.0"))
     ap.add_argument("--port", type=int,
-                    default=int(os.environ.get("HY3API_PORT", "8787")))
+                    default=int(os.environ.get("AGENT2API_PORT") or os.environ.get("HY3API_PORT", "8787")))
     ap.add_argument("--threads", type=int,
-                    default=int(os.environ.get("HY3API_THREADS", "16")))
+                    default=int(os.environ.get("AGENT2API_THREADS") or os.environ.get("HY3API_THREADS", "16")))
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
@@ -1352,7 +1352,7 @@ def main():
 
     n_acc = len(db.list_accounts())
     print("=" * 62, flush=True)
-    print("  hy3api 已启动", flush=True)
+    print("  Agent2API 已启动", flush=True)
     print("  监听地址 : %s:%d" % (args.host, args.port), flush=True)
     print("  控制面板 : http://127.0.0.1:%d/" % args.port, flush=True)
     print("  API 地址 : http://127.0.0.1:%d/v1" % args.port, flush=True)

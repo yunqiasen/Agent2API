@@ -12,7 +12,7 @@ sys.path.insert(0, ROOT)
 @pytest.fixture(autouse=True)
 def isolated_db(tmp_path, monkeypatch):
     """独立 SQLite：set/get 设置与账号读写不污染生产库。"""
-    monkeypatch.setenv("HY3API_DB", str(tmp_path / "test.db"))
+    monkeypatch.setenv("AGENT2API_DB", str(tmp_path / "test.db"))
     import db
     import importlib
     importlib.reload(db)
