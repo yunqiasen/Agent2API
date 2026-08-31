@@ -128,13 +128,26 @@ def refresh_quota(account_row) -> dict:
 # 每日签到
 # --------------------------------------------------------------------------
 
+def _aha_device_pool() -> list[str]:
+    """解析设置里的 Aha 设备号池：一行一个，剔除非纯数字脏行。"""
+    raw = db.get_setting("trae_aha_device_id") or ""
+    return [line.strip() for line in str(raw).splitlines()
+            if line.strip().isdigit() and 8 <= len(line.strip()) <= 20]
+
+
 def _checkin_device_id(acc: dict):
-    """签到用设备号：TraeWork 优先用设置里的 16 位 Aha 设备号（全号池通用，
-    风控只校验设备注册有效性，不绑定账号），未配置回退账号自带 device_id。"""
+    """签到用设备号：TraeWork 用设置里的 Aha 设备号池，按账号 id 分摊。
+
+    账号按 id 升序取序号 i，设备取 pool[i % len(pool)]：账号少设备时取模环绕；
+    新增设备后分配自动重排（不与账号粘死）。池为空回退账号自带 device_id。
+    """
     if P._is_trae(acc.get("platform")):
-        aha = (db.get_setting("trae_aha_device_id") or "").strip()
-        if aha:
-            return aha
+        pool = _aha_device_pool()
+        if pool:
+            ids = sorted(a["id"] for a in db.list_accounts()
+                         if P._is_trae(a.get("platform")))
+            idx = ids.index(acc["id"]) if acc.get("id") in ids else 0
+            return pool[idx % len(pool)]
     return acc.get("device_id") or None
 
 

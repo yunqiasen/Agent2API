@@ -153,3 +153,52 @@ def test_list_models_hides_fully_disabled_model(registry, monkeypatch):
     }))
     assert "deep-model" not in proxy.list_models()
     assert "single-model" in proxy.list_models()
+
+
+# ---------------- TraeWork Aha 设备号池：账号分摊轮询 ----------------
+
+def test_aha_pool_assigns_accounts_round_robin(monkeypatch):
+    """设备号池按账号序分摊：i % n，同一天账号固定用同一台。"""
+    monkeypatch.setattr("db.get_setting", lambda k, d=None: "1111111111111111\n2222222222222222")
+    accs = [{"id": 3, "platform": "trae", "device_id": "hex"},
+            {"id": 1, "platform": "trae", "device_id": "hex"},
+            {"id": 2, "platform": "trae", "device_id": "hex"}]
+    monkeypatch.setattr("db.list_accounts", lambda *a, **k: accs)
+    got = {a["id"]: proxy._checkin_device_id(a) for a in accs}
+    # 按账号 id 排序后 1→dev0, 2→dev1, 3→dev0
+    assert got == {1: "1111111111111111", 2: "2222222222222222",
+                   3: "1111111111111111"}
+
+
+def test_aha_pool_wraps_when_fewer_devices(monkeypatch):
+    """设备少于账号：取模环绕，不报错。"""
+    monkeypatch.setattr("db.get_setting", lambda k, d=None: "1111111111111111")
+    accs = [{"id": 1, "platform": "trae"}, {"id": 2, "platform": "trae"},
+            {"id": 3, "platform": "trae"}]
+    monkeypatch.setattr("db.list_accounts", lambda *a, **k: accs)
+    assert [proxy._checkin_device_id(a) for a in accs] == ["1111111111111111"] * 3
+
+
+def test_aha_pool_falls_back_without_setting(monkeypatch):
+    """未配置回退账号自带 device_id。"""
+    monkeypatch.setattr("db.get_setting", lambda k, d=None: "")
+    assert proxy._checkin_device_id(
+        {"platform": "trae", "device_id": "hex-old"}) == "hex-old"
+
+
+def test_aha_pool_skips_invalid_lines(monkeypatch):
+    """脏行（空行/非数字/UUID）被剔除，不参与分配。"""
+    monkeypatch.setattr("db.get_setting",
+                        lambda k, d=None: "uuid-x\n1111111111111111\n\n2222222222222222\n")
+    accs = [{"id": 1, "platform": "trae"}, {"id": 2, "platform": "trae"},
+            {"id": 3, "platform": "trae"}]
+    monkeypatch.setattr("db.list_accounts", lambda *a, **k: accs)
+    assert [proxy._checkin_device_id(a) for a in accs] == [
+        "1111111111111111", "2222222222222222", "1111111111111111"]
+
+
+def test_aha_pool_untouched_for_other_platforms(monkeypatch):
+    """非 Trae 平台不吃设备池，保持账号自身设备号。"""
+    monkeypatch.setattr("db.get_setting", lambda k, d=None: "1111111111111111")
+    assert proxy._checkin_device_id(
+        {"platform": "workbuddy", "device_id": "wb-dev"}) == "wb-dev"
