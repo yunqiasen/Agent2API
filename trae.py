@@ -86,9 +86,8 @@ def solo_headers(access_token, uid=None, machine_id=None, device_id=None,
 def ug_headers(access_token, device_id=None) -> dict:
     """签到 / 积分请求头（对齐官方客户端）。
 
-    风控事实（实测 + 逆向确认）：claim 接口的 x-device-id 必须是官方客户端
-    设备注册服务下发的 16 位纯数字 Aha 设备号；用自造 hex/UUID 会被软拒，
-    返回误导性 9074「当前参与用户太多」（缺失则 9004 订单参数错误）。
+    实测（2026-08-31）：x-device-id 用 uid 即可正常签到；缺失/非法时
+    返回 9074（文案「参与用户太多」是误导，真实原因是设备头不合法）。
     """
     h = {
         "Content-Type": "application/json",
@@ -382,27 +381,13 @@ def fetch_checkin_status(access_token, device_id=None, timeout: int = DEFAULT_TI
     }
 
 
-def _looks_like_aha_did(device_id) -> bool:
-    """16 位左右纯数字 = 官方客户端下发的 Aha 设备号。"""
-    s = str(device_id or "")
-    return s.isdigit() and 8 <= len(s) <= 20
-
-
 def do_checkin(access_token, device_id=None, timeout: int = DEFAULT_TIMEOUT,
                attempts: int = 3) -> dict:
     """领取签到积分。
 
-    9074「当前参与用户太多」是误导文案：绝大多数情况是设备指纹风控——
-    x-device-id 不是官方客户端注册的 16 位 Aha 数字设备号。设备号无效时
-    重试永远失败；设备号有效时 9074 才可能是瞬时量控，值得递增退避重试。
+    X-Device-Id 用 uid 即可（2026-08-31 实测）。9074 的真实含义是
+    X-Device-Id 缺失或不合法，与「参与用户太多」无关，正常情况下不会出现。
     """
-    if not _looks_like_aha_did(device_id):
-        raise RuntimeError(
-            "签到失败：x-device-id 不是官方客户端注册的 Aha 数字设备号"
-            "（当前为 %s）。请在「设置 → TraeWork Aha 设备号」填入官方客户端 "
-            "storage.json 中 iCubeAuthInfo://icube-dc: 后面的 16 位数字。"
-            % (("空" if not device_id else "hex/UUID")))
-
     if attempts < 1:
         raise RuntimeError("签到失败：attempts 必须 >= 1")
     last = {}

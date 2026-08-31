@@ -128,27 +128,14 @@ def refresh_quota(account_row) -> dict:
 # 每日签到
 # --------------------------------------------------------------------------
 
-def _aha_device_pool() -> list[str]:
-    """解析设置里的 Aha 设备号池：一行一个，剔除非纯数字脏行。"""
-    raw = db.get_setting("trae_aha_device_id") or ""
-    return [line.strip() for line in str(raw).splitlines()
-            if line.strip().isdigit() and 8 <= len(line.strip()) <= 20]
-
-
 def _checkin_device_id(acc: dict):
-    """签到用设备号：TraeWork 用设置里的 Aha 设备号池，按账号 id 分摊。
+    """签到用 X-Device-Id：直接用 uid（2026-08-31 实测最稳）。
 
-    账号按 id 升序取序号 i，设备取 pool[i % len(pool)]：账号少设备时取模环绕；
-    新增设备后分配自动重排（不与账号粘死）。池为空回退账号自带 device_id。
+    上游 claim 接口只要求 X-Device-Id 是非空字符串；uid 每号唯一，
+    不存在"设备码一天一签"限制。旧的 16 位 Aha 校验是误判，已删。
     """
     if P._is_trae(acc.get("platform")):
-        pool = _aha_device_pool()
-        if pool:
-            ids = sorted(a["id"] for a in db.list_accounts()
-                         if P._is_trae(a["platform"] if "platform" in a.keys()
-                                        else None))
-            idx = ids.index(acc["id"]) if acc.get("id") in ids else 0
-            return pool[idx % len(pool)]
+        return str(acc.get("uid") or "").strip() or acc.get("device_id") or None
     return acc.get("device_id") or None
 
 

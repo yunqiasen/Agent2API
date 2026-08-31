@@ -18,15 +18,12 @@ def client(isolated_db):
 def test_settings_roundtrip_new_fields(client):
     c, db = client
     # 初始：无值
-    assert c.get("/api/settings").get_json().get("trae_aha_device_id") in (None, "")
     # 写入
     prio = {"default": ["trae", "workbuddy", "codebuddy"], "overrides": {"glm-5": ["codebuddy"]}}
-    r = c.post("/api/settings", json={"trae_aha_device_id": "7382917465019283",
-                                      "model_route_priority": json.dumps(prio)})
+    r = c.post("/api/settings", json={"model_route_priority": json.dumps(prio)})
     assert r.get_json()["ok"] is True
     # 读回
     out = c.get("/api/settings").get_json()
-    assert out["trae_aha_device_id"] == "7382917465019283"
     assert json.loads(out["model_route_priority"]) == prio
 
 

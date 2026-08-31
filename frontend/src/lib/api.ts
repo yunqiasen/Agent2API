@@ -176,7 +176,6 @@ export interface Settings {
   credit_threshold?: string;
   free_models?: string;
   public_join_enabled?: string;
-  trae_aha_device_id?: string;
   model_route_priority?: string;
   model_platform_disabled?: string;
 }

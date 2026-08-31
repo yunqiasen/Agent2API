@@ -1142,8 +1142,7 @@ def panel_settings():
                "model_base_override", "allow_model_passthrough",
                "log_retention", "system_prompt", "auto_checkin", "checkin_time",
                "credit_threshold", "free_models", "public_join_enabled",
-               "trae_aha_device_id", "model_route_priority",
-               "model_platform_disabled")
+               "model_route_priority", "model_platform_disabled")
     for k in allowed:
         if k in data:
             db.set_setting(k, data[k])

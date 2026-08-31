@@ -1,4 +1,4 @@
-"""TraeWork 签到 seam：设备号风控 + 请求头契约。"""
+"""TraeWork 签到 seam：X-Device-Id 用 uid + 请求头契约。"""
 import json
 from unittest.mock import MagicMock, patch
 
@@ -8,14 +8,6 @@ import trae
 
 
 AHA_DID = "7382917465019283"
-
-
-def test_checkin_without_aha_device_id_rejects_with_real_reason():
-    """无效设备号必须在发请求前拦截，报真实风控原因，而不是假 9074。"""
-    with patch.object(trae, "_session") as sess:
-        with pytest.raises(RuntimeError, match="Aha.*设备号"):
-            trae.do_checkin("token", device_id="826d246811a54bd9bec931b6ed52a7cec8c566a5e4964c5d")
-    sess.assert_not_called()
 
 
 def test_checkin_with_aha_device_id_claims_success():
@@ -33,14 +25,14 @@ def test_checkin_with_aha_device_id_claims_success():
     assert headers["X-Device-Id"] == AHA_DID
 
 
-def test_checkin_9074_reports_fingerprint_not_fake_capacity():
-    """Aha 设备号有效但上游仍回 9074 时，报设备指纹/量控真相。"""
+def test_checkin_9074_reports_device_header_issue():
+    """9074 的真实含义是 X-Device-Id 不合法，文案「参与用户太多」是误导。"""
     fake = MagicMock()
     fake.status_code = 200
     fake.json.return_value = {"code": 9074, "message": "当前参与用户太多，请稍后再试"}
     with patch.object(trae, "_session") as sess:
         sess.return_value.post.return_value = fake
-        with pytest.raises(RuntimeError, match="设备指纹"):
+        with pytest.raises(RuntimeError, match="9074"):
             trae.do_checkin("token", device_id=AHA_DID, attempts=1)
 
 
