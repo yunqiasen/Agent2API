@@ -58,7 +58,12 @@ function QuotaCell({ a }: { a: Account }) {
   const t = a.quota_total || 0;
   const u = a.quota_used || 0;
   const r = a.quota_remain || 0;
-  if (!t) return <span className="text-xs text-muted-foreground">额度尚未同步</span>;
+  if (!a.quota_updated_at) {
+    return <span className="text-xs text-muted-foreground">额度尚未同步</span>;
+  }
+  if (!t) {
+    return <span className="text-xs text-muted-foreground">已同步：0 {a.quota_unit || "credits"}</span>;
+  }
   const pct = Math.max(0, Math.min(100, (r / t) * 100));
   const tone: Tone = pct < 10 ? "rose" : pct < 30 ? "amber" : "emerald";
   return (
@@ -83,7 +88,9 @@ function StatusBadge({ a }: { a: Account }) {
     return <Chip tone="emerald">已接入</Chip>;
   if (a.status === "banned")
     return <Chip tone="rose">封禁</Chip>;
-  return <Chip tone="slate">{a.status}</Chip>;
+  if (a.status === "error")
+    return <span title={a.status_reason || a.last_error || "数据刷新失败"}><Chip tone="amber">数据刷新失败</Chip></span>;
+  return <Chip tone="slate">{a.status || "未知"}</Chip>;
 }
 
 function TokenBadge({ a }: { a: Account }) {
@@ -194,7 +201,7 @@ function ProbeCell({ a }: { a: Account }) {
 }
 
 function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOpenChange: (v: boolean) => void; onAdded: () => void }) {
-  const [platform, setPlatform] = useState(PLATFORMS[0].key);
+  const [platform, setPlatform] = useState<string>(PLATFORMS[0].key);
   const [label, setLabel] = useState("");
   const [authUrl, setAuthUrl] = useState("");
   const [state, setState] = useState("");
@@ -261,13 +268,24 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOp
           return;
         }
         try {
-          const r = await apiPost<{ ok: boolean; account_id?: number; pending?: boolean; msg?: string; error?: string }>(
+          const r = await apiPost<{ ok: boolean; account_id?: number; pending?: boolean; done?: boolean; msg?: string; error?: string; quota_error?: string }>(
             "/api/login/poll",
             { state: d.state }
           );
           if (r.ok) {
             stop();
-            toast.success("账号已加入号池");
+            if (r.quota_error) {
+              toast.warning(`账号已加入号池，但额度同步失败：${r.quota_error}`, { duration: 10000 });
+            } else {
+              toast.success("账号已加入号池");
+            }
+            reset();
+            onOpenChange(false);
+            onAdded();
+          } else if (r.done) {
+            // 可能是上一次慢轮询已完成导入；终态应立即停止，不能继续轮询到超时。
+            stop();
+            toast.success(r.msg || "登录流程已完成");
             reset();
             onOpenChange(false);
             onAdded();
@@ -346,13 +364,17 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOp
                     onClick={async () => {
                       setCallbackBusy(true);
                       try {
-                        await apiPost("/api/login/trae_callback", {
+                        const result = await apiPost<{ quota_error?: string }>("/api/login/trae_callback", {
                           callback_url: callbackUrl.trim(),
                           machine_id: traeMachineId,
                           device_id: traeDeviceId,
                           label: label || "后台添加",
                         });
-                        toast.success("Trae 账号已加入号池");
+                        if (result.quota_error) {
+                          toast.warning(`Trae 账号已加入号池，但额度同步失败：${result.quota_error}`, { duration: 10000 });
+                        } else {
+                          toast.success("Trae 账号已加入号池");
+                        }
                         reset();
                         onOpenChange(false);
                         onAdded();
@@ -400,7 +422,7 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOp
 }
 
 function ImportDialog({ open, onOpenChange, onAdded }: { open: boolean; onOpenChange: (v: boolean) => void; onAdded: () => void }) {
-  const [platform, setPlatform] = useState(PLATFORMS[0].key);
+  const [platform, setPlatform] = useState<string>(PLATFORMS[0].key);
   const [json, setJson] = useState("");
   const [at, setAt] = useState("");
   const [rt, setRt] = useState("");
@@ -415,8 +437,12 @@ function ImportDialog({ open, onOpenChange, onAdded }: { open: boolean; onOpenCh
         body.access_token = at.trim();
         body.refresh_token = rt.trim();
       }
-      const d = await apiPost<{ added: number; updated: number }>("/api/accounts/import_token", body);
-      toast.success(`导入完成：新增 ${d.added}，更新 ${d.updated}`);
+      const d = await apiPost<{ added: number; updated: number; refresh_errors?: { id: number; error: string }[] }>("/api/accounts/import_token", body);
+      if (d.refresh_errors?.length) {
+        toast.warning(`导入完成，但 ${d.refresh_errors.length} 个账号额度同步失败；请查看号池状态和错误原因`, { duration: 10000 });
+      } else {
+        toast.success(`导入完成：新增 ${d.added}，更新 ${d.updated}`);
+      }
       setJson("");
       setAt("");
       setRt("");
@@ -703,7 +729,12 @@ export function Accounts() {
                   </div>
                   <div className="flex items-center justify-between text-xs">
                     <span className="text-muted-foreground">签到</span>
-                    <CheckinBadge a={a} />
+                    <span className="flex items-center gap-1.5">
+                      <CheckinBadge a={a} />
+                      {a.checkin_updated_at ? (
+                        <span className="text-[10px] text-muted-foreground">同步于 {ago(a.checkin_updated_at)}</span>
+                      ) : null}
+                    </span>
                   </div>
                   <div className="flex items-center justify-between text-xs">
                     <span className="text-muted-foreground">本站调用</span>
@@ -711,9 +742,9 @@ export function Accounts() {
                       {a.req_count || 0} 次 · 失败 {a.fail_count || 0} · {ago(a.last_used)}
                     </span>
                   </div>
-                  {a.last_error && (
-                    <div className="truncate rounded-md bg-rose-500/10 px-2 py-1 text-[11px] text-rose-600 dark:text-rose-400" title={a.last_error}>
-                      {a.last_error.slice(0, 40)}…
+                  {(a.status_reason || a.last_error) && (
+                    <div className="truncate rounded-md bg-rose-500/10 px-2 py-1 text-[11px] text-rose-600 dark:text-rose-400" title={a.status_reason || a.last_error}>
+                      {(a.status_reason || a.last_error || "").slice(0, 80)}…
                     </div>
                   )}
                   <ProbeCell a={a} />

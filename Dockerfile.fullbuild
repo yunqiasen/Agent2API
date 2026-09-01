@@ -2,7 +2,7 @@
 # 备选 Dockerfile：在容器内从源码构建前端（不需要本地先 npm run build）
 #
 # 使用：
-#   docker build -f Dockerfile.fullbuild -t hy3api:latest .
+#   docker build -f Dockerfile.fullbuild -t agent2api:latest .
 #   或 docker-compose.yml 里 build 段加 dockerfile: Dockerfile.fullbuild
 #
 # 代价：需要拉 node 镜像 + 联网装 ~300MB npm 依赖，国内服务器较慢。
@@ -31,35 +31,34 @@ RUN npm run build \
 # ---------- Stage 2: 运行时 ----------
 FROM python:3.12-slim
 
-LABEL org.opencontainers.image.title="hy3api" \
-      org.opencontainers.image.description="WorkBuddy / CodeBuddy CN / CodeBuddy 三平台 hy3 模型反代与号池面板"
+LABEL org.opencontainers.image.title="Agent2API" \
+      org.opencontainers.image.description="WorkBuddy / TraeWork / CodeBuddy 三平台 hy3 模型反代与号池面板"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     TZ=Asia/Shanghai \
-    HY3API_DATA_DIR=/data \
-    HY3API_HOST=0.0.0.0 \
-    HY3API_PORT=8787
+    AGENT2API_DATA_DIR=/data \
+    AGENT2API_HOST=0.0.0.0 \
+    AGENT2API_PORT=8530
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py db.py providers.py proxy.py responses.py discovery.py ./
+COPY app.py db.py providers.py proxy.py responses.py discovery.py trae.py ./
 COPY --from=webbuild /fe/dist/ ./frontend/dist/
 
-RUN useradd -r -u 10001 -m -d /home/hy3api hy3api \
+RUN useradd -r -u 10001 -m -d /home/agent2api agent2api \
     && mkdir -p /data \
-    && chown -R hy3api:hy3api /app /data
-USER hy3api
+    && chown -R agent2api:agent2api /app /data
+USER agent2api
 
 VOLUME ["/data"]
-EXPOSE 8787
+EXPOSE 8530
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request,sys; \
-sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/health',timeout=4).status==200 else 1)"
+    CMD python -c "import os,urllib.request,sys; port=os.environ.get('AGENT2API_PORT','8530'); r=urllib.request.urlopen('http://127.0.0.1:'+port+'/health',timeout=4); sys.exit(0 if r.status==200 else 1)"
 
 ENTRYPOINT ["python", "app.py"]

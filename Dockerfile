@@ -1,15 +1,15 @@
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="Agent2API" \
-      org.opencontainers.image.description="WorkBuddy / CodeBuddy CN / CodeBuddy 三平台 hy3 模型反代与号池面板"
+      org.opencontainers.image.description="WorkBuddy / TraeWork / CodeBuddy 三平台 hy3 模型反代与号池面板"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     TZ=Asia/Shanghai \
-    HY3API_DATA_DIR=/data \
-    HY3API_HOST=0.0.0.0 \
-    HY3API_PORT=8787
+    AGENT2API_DATA_DIR=/data \
+    AGENT2API_HOST=0.0.0.0 \
+    AGENT2API_PORT=8530
 
 WORKDIR /app
 
@@ -38,10 +38,9 @@ RUN useradd -r -u 10001 -m -d /home/agent2api agent2api \
 USER agent2api
 
 VOLUME ["/data"]
-EXPOSE 8787
+EXPOSE 8530
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request,sys; \
-sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/health',timeout=4).status==200 else 1)"
+    CMD python -c "import os,urllib.request,sys; port=os.environ.get('AGENT2API_PORT','8530'); r=urllib.request.urlopen('http://127.0.0.1:'+port+'/health',timeout=4); sys.exit(0 if r.status==200 else 1)"
 
 ENTRYPOINT ["python", "app.py"]

@@ -62,12 +62,14 @@ export function Tile({
   label,
   value,
   hint,
+  tone: _tone,
   delay = 0,
 }: {
   icon: ComponentType<{ className?: string }>;
   label: string;
   value: ReactNode;
   hint?: ReactNode;
+  tone?: Tone;
   delay?: number;
 }) {
   return (
@@ -138,7 +140,7 @@ export function SectionCard({
 }
 
 /* ---------- progress bar ---------- */
-export function Progress({ value, max }: { value: number; max: number }) {
+export function Progress({ value, max, tone: _tone }: { value: number; max: number; tone?: Tone }) {
   const pct = Math.min(100, Math.max(0, max > 0 ? (value / max) * 100 : 0));
   return (
     <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
@@ -169,7 +171,7 @@ export function Copyable({ text, className = "" }: { text: string; className?: s
 }
 
 /* ---------- chip (neutral) ---------- */
-export function Chip({ children, className = "" }: { children: ReactNode; className?: string }) {
+export function Chip({ children, className = "", tone: _tone }: { children: ReactNode; className?: string; tone?: Tone }) {
   return (
     <span
       className={`inline-flex h-5 items-center rounded-md bg-secondary px-1.5 text-[10px] font-medium text-secondary-foreground ${className}`}

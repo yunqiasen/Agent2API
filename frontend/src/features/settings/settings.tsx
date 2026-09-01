@@ -63,11 +63,29 @@ const PLAT_ORDER = [
 
 type PriorityCfg = { default: string[]; overrides: Record<string, string[]> };
 
+function normalizeOrder(raw: unknown): string[] {
+  const values = Array.isArray(raw) ? raw : [];
+  const out: string[] = [];
+  for (const value of values) {
+    const key = String(value);
+    if (PLAT_ORDER.some((p) => p.v === key) && !out.includes(key)) out.push(key);
+  }
+  for (const p of PLAT_ORDER) if (!out.includes(p.v)) out.push(p.v);
+  return out;
+}
+
 function parsePriority(raw?: string): PriorityCfg {
   try {
     const d = JSON.parse(raw || "");
-    if (d && Array.isArray(d.default)) {
-      return { default: d.default, overrides: d.overrides && typeof d.overrides === "object" ? d.overrides : {} };
+    if (d && typeof d === "object") {
+      const source = d as { default?: unknown; overrides?: Record<string, unknown> };
+      const overrides: Record<string, string[]> = {};
+      if (source.overrides && typeof source.overrides === "object") {
+        for (const [model, order] of Object.entries(source.overrides)) {
+          overrides[model] = normalizeOrder(order);
+        }
+      }
+      return { default: normalizeOrder(source.default), overrides };
     }
   } catch { /* ignore */ }
   return { default: ["workbuddy", "trae", "codebuddy"], overrides: {} };
@@ -150,6 +168,10 @@ export function Settings() {
         public_join_enabled: s.public_join_enabled || "1",
         model_route_priority: JSON.stringify(prio),
       });
+      // 以后端规范化后的持久化值为准，保存后立刻回显，避免页面切换后顺序看似丢失。
+      const persisted = await apiGet<SettingsData>("/api/settings");
+      setS(persisted);
+      setPrio(parsePriority(persisted.model_route_priority));
       toast.success("设置已保存");
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "保存失败");

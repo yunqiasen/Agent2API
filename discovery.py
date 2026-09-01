@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -86,11 +87,39 @@ def _route_err(status: int, text: str) -> bool:
                                 "backend [aiart]"))
 
 
+def _probe_stream_evidence(resp, status: int) -> tuple[bool, str]:
+    """读取聊天 SSE 的首个有意义事件，识别 HTTP 200 包装的业务错误。
+
+    上游可能用 HTTP 200 返回 ``data: {"code":11102,...}``，只看状态码
+    会把不存在模型登记成可用。这里只读到首个 choices/usage/error 事件就停止，
+    不下载完整生成结果，仍保持探测低成本。
+    """
+    for line in proxy._sse_lines(resp):
+        if not line or not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload:
+            continue
+        if payload == "[DONE]":
+            break
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+        err = proxy._sse_business_error(obj)
+        if err:
+            return False, "HTTP %s %s" % (status, err[:240])
+        if isinstance(obj, dict) and ("choices" in obj or "usage" in obj):
+            return True, "HTTP %s" % status
+    # HTTP 200 但没有 choices/usage 证据属于空流，不能据此登记模型。
+    return False, "HTTP %s empty SSE" % status
+
+
 def _probe_endpoint(acc: dict, platform: str, mid: str, typ: str):
     """对单个端点做最小请求，返回 (ok, info)。
 
-    - chat / audio：走 chat 网关，status<400 即可用；**只读状态码并立即关闭连接**，
-      不下载完整生成流（之前读 resp.text 会把整段生成拉完，极慢且浪费额度）。
+    - chat / audio：走 chat 网关，读取首个有意义 SSE 事件并立即关闭连接，
+      既能识别 HTTP 200 业务错误，也不会下载完整生成流。
     - image：走 /v2/images/generations，status<400 或 13212（任务队列满，模型仍存在）即可用。
     使用短超时 _PROBE_TIMEOUT，上游卡顿时快速失败而非无限等待。
     """
@@ -118,9 +147,9 @@ def _probe_endpoint(acc: dict, platform: str, mid: str, typ: str):
                 timeout=_PROBE_TIMEOUT)
             status = resp.status_code
             if status < 400:
-                # 模型存在：立即关闭连接，放弃下载后续生成内容（不浪费额度/时间）
+                ok, info = _probe_stream_evidence(resp, status)
                 resp.close()
-                return True, "HTTP %s" % status
+                return ok, info
             # 仅 4xx/5xx 才读取错误体（通常很小）以判定是否为「模型未注册」类错误
             text = resp.text[:300]
             resp.close()
@@ -166,7 +195,6 @@ def _status_of(info: str) -> int:
 # --------------------------------------------------------------------------
 _image_discovery_running = False
 _image_discovery_lock = threading.Lock()
-_registry_write_lock = threading.Lock()
 
 
 def image_discovery_running() -> bool:
@@ -195,14 +223,15 @@ def _image_model_missing(status: int, text: str) -> bool:
 
 
 def _merge_image_model(mid: str, platform: str) -> None:
-    """把确认可用的图像模型合并写入注册表（带锁，避免与同步探测并发写竞争）。"""
-    with _registry_write_lock:
-        reg = db.get_model_registry()
+    """把确认可用的图像模型原子合并进注册表。"""
+    def mutate(reg):
         rec = reg.setdefault(mid, {"type": "image", "platforms": []})
         rec["type"] = "image"
         if platform not in rec["platforms"]:
             rec["platforms"].append(platform)
-        db.set_model_registry(reg)
+        return reg
+
+    db.update_model_registry(mutate)
 
 
 def _start_image_discovery():
@@ -277,27 +306,32 @@ def _run_image_discovery():
 
 
 def sync_upstream_catalogs() -> dict:
-    """优先用上游官方 CLI 模型目录刷新注册表；失败的平台回落到真实探测。
+    """合并每个平台所有可用账号的官方 CLI 模型目录。
 
-    返回 {platform: [新增模型 ID]}。官方目录来自 CLI 客户端白名单，可直接使用；
-    上游未开放该接口（如国际站 500）时保持原探测机制，不额外发真实模型请求。
+    账号之间的套餐/灰度可能不同，单取第一个账号会漏掉其它账号拥有的模型。
+    本次至少成功读取一个账号后才清理平台旧目录，单账号失败不影响并集。
     """
     result = {}
     for platform in P.PLATFORMS:
-        acc = None
-        try:
-            acc = _account_for(platform)
-        except Exception:
-            acc = None
-        if not acc or not (acc.get("access_token") or "").strip():
-            result[platform] = []
-            continue
-        try:
-            result[platform] = P.merge_upstream_models(
-                platform, acc["access_token"], uid=acc.get("uid") or None,
-                machine_id=acc.get("machine_id") or None,
-                device_id=acc.get("device_id") or None)
-        except Exception:
+        ids = []
+        rows = [r for r in db.list_accounts(platform)
+                if r["enabled"] and r["status"] != "banned"]
+        for row in rows:
+            try:
+                acc = proxy.ensure_token(row)
+                token = (acc.get("access_token") or "").strip()
+                if not token:
+                    continue
+                got = P.fetch_upstream_models(
+                    platform, token, uid=acc.get("uid") or None,
+                    machine_id=acc.get("machine_id") or None,
+                    device_id=acc.get("device_id") or None)
+                ids.extend(got or [])
+            except Exception:
+                continue
+        if ids:
+            result[platform] = P.merge_upstream_model_ids(platform, ids)
+        else:
             result[platform] = []
     return result
 
@@ -362,7 +396,7 @@ def run_discovery() -> dict:
 
     # 合并历史记录：Trae 官方目录不参与逐项探测，其平台标记必须保留；
     # 本次未复核的模型也保留（探测超时/失败不等于下线）。
-    prior = db.get_model_registry()
+    prior = proxy.normalize_model_registry(db.get_model_registry())
     for mid, rec in prior.items():
         if not isinstance(rec, dict) or not rec.get("platforms"):
             continue
@@ -374,7 +408,21 @@ def run_discovery() -> dict:
             if p not in cur.get("platforms", []):
                 cur.setdefault("platforms", []).append(p)
 
-    db.set_model_registry(registry)
+    registry = proxy.normalize_model_registry(registry)
+
+    def commit(latest):
+        # 保留本轮探测期间其它线程刚写入的模型/渠道，避免整个 JSON 后写覆盖。
+        for mid, rec in proxy.normalize_model_registry(latest).items():
+            if mid not in registry:
+                registry[mid] = rec
+                continue
+            cur = registry[mid]
+            for platform in rec.get("platforms", []):
+                if platform not in cur.setdefault("platforms", []):
+                    cur["platforms"].append(platform)
+        return proxy.normalize_model_registry(registry)
+
+    registry = db.update_model_registry(commit)
 
     # 相位 2：后台图像探测（不阻塞响应）
     _start_image_discovery()
@@ -405,13 +453,21 @@ def live_probe_model(mid: str):
             if platform not in rec["platforms"]:
                 rec["platforms"].append(platform)
     if rec:
-        registry = db.get_model_registry()
-        existing = registry.get(mid, {"type": rec["type"], "platforms": []})
-        existing["type"] = rec["type"]
-        for p in rec["platforms"]:
-            if p not in existing["platforms"]:
-                existing["platforms"].append(p)
-        registry[mid] = existing
-        db.set_model_registry(registry)
-        return existing
+        result = {}
+
+        def mutate(registry):
+            existing = registry.get(mid, {"type": rec["type"], "platforms": []})
+            if not isinstance(existing, dict):
+                existing = {"type": rec["type"], "platforms": []}
+            existing["type"] = rec["type"]
+            existing.setdefault("platforms", [])
+            for platform in rec["platforms"]:
+                if platform not in existing["platforms"]:
+                    existing["platforms"].append(platform)
+            registry[mid] = existing
+            result.update(existing)
+            return registry
+
+        db.update_model_registry(mutate)
+        return result
     return None

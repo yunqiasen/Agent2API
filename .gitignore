@@ -1,5 +1,10 @@
 __pycache__/
 *.pyc
 .venv-test/
-hy3api.db
+*.db
+*.db-shm
+*.db-wal
 frontend/node_modules/
+.env
+.env.*
+!.env.example

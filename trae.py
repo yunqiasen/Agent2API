@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """TraeWork / Trae SOLO 渠道适配层。
 
-结构对齐 hy3api 的平台约定；上游协议常量、请求头、payload、SSE 解析逻辑
+结构对齐 Agent2API 的平台约定；上游协议常量、请求头、payload、SSE 解析逻辑
 移植自 ai-multi-platform-proxy（internal/provider/trae）。
 """
 from __future__ import annotations
@@ -49,6 +49,13 @@ def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": _ua(), "Accept": "application/json"})
     return s
+
+
+def _as_bool(value) -> bool:
+    """兼容上游返回 bool、数字或字符串形式的布尔值。"""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 
 def solo_headers(access_token, uid=None, machine_id=None, device_id=None,
@@ -327,6 +334,9 @@ class SSEAggregator:
             self._data = []
 
     def result(self, model: str) -> dict:
+        if self.error:
+            err = self.error if isinstance(self.error, str) else json.dumps(self.error, ensure_ascii=False)
+            raise RuntimeError("Trae 上游业务错误: %s" % err)
         msg = {"role": "assistant", "content": "".join(self.content)}
         reasoning = "".join(self.reasoning)
         if reasoning:
@@ -364,6 +374,15 @@ def fetch_quota(access_token, device_id=None, timeout: int = DEFAULT_TIMEOUT) ->
     if r.status_code >= 400:
         raise RuntimeError("积分 HTTP %s: %s" % (r.status_code, r.text[:200]))
     d = r.json() or {}
+    code = d.get("code")
+    if code is not None:
+        try:
+            code_ok = int(code) in (0, 200)
+        except (TypeError, ValueError):
+            code_ok = False
+        if not code_ok:
+            raise RuntimeError("积分业务失败(code=%s): %s" %
+                               (code, d.get("message") or d.get("msg") or "未知错误"))
     usage = d.get("usage_summary") or {}
 
     def num(v):
@@ -418,15 +437,24 @@ def fetch_checkin_status(access_token, device_id=None, timeout: int = DEFAULT_TI
     if r.status_code >= 400:
         raise RuntimeError("签到状态 HTTP %s: %s" % (r.status_code, r.text[:200]))
     d = r.json() or {}
+    code = d.get("code")
+    if code is not None:
+        try:
+            code_ok = int(code) in (0, 200)
+        except (TypeError, ValueError):
+            code_ok = False
+        if not code_ok:
+            raise RuntimeError("签到状态业务失败(code=%s): %s" %
+                               (code, d.get("message") or d.get("msg") or "未知错误"))
     return {
         "supported": True,
-        "today_checked_in": bool(d.get("checked_in")),
+        "today_checked_in": _as_bool(d.get("checked_in")),
         # 当前 Trae 响应通常不提供 streak_days；缺失必须保持未知，不能伪造 0 天。
         "streak_days": (int(d["streak_days"])
                         if d.get("streak_days") is not None else None),
         "daily_credit": float(d.get("daily_credit") or 0),
         "today_credit": float(d.get("credits") or 0),
-        "claimable": (not bool(d.get("checked_in"))) and bool(d.get("enable")),
+        "claimable": (not _as_bool(d.get("checked_in"))) and _as_bool(d.get("enable")),
         "raw": d,
     }
 
@@ -450,8 +478,13 @@ def do_checkin(access_token, device_id=None, timeout: int = DEFAULT_TIMEOUT,
             raise RuntimeError("签到 HTTP %s: %s" % (r.status_code, r.text[:200]))
         d = r.json() or {}
         last = d
-        code = int(d.get("code") or 0)
-        if code == 0 or d.get("checked_in"):
+        raw_code = d.get("code")
+        try:
+            code = int(raw_code or 0)
+        except (TypeError, ValueError):
+            raise RuntimeError("签到失败(code=%s): %s" %
+                               (raw_code, d.get("message") or d.get("msg") or "未知错误"))
+        if code == 0:
             return {
                 "ok": True,
                 "claimed_credit": float(d.get("credits") or 0),

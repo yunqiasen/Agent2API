@@ -98,6 +98,7 @@ export interface ModelDiscoverResponse {
     platform: string;
     label: string;
     models: ModelEntry[]; // 该平台可用的真实模型（探测确认）
+    note?: string;
   }[];
   exposed: ModelEntry[]; // 对外 /v1/models 暴露的清单
   total?: number;
@@ -136,7 +137,9 @@ export interface Account {
   checkin_streak_known?: boolean;
   checkin_last_date?: string;
   checkin_credit?: number;
+  checkin_updated_at?: number;
   status?: string;
+  status_reason?: string;
   last_error?: string;
   req_count?: number;
   fail_count?: number;
@@ -203,8 +206,10 @@ export interface JoinPollResp {
   nickname?: string;
   quota?: JoinQuota | null;
   pending?: boolean;
+  done?: boolean;
   msg?: string;
   error?: string;
+  quota_error?: string;
 }
 
 export interface OverviewUsage {

@@ -1,16 +1,16 @@
 # Agent2API
 
-WorkBuddy / CodeBuddy CN / CodeBuddy（国际）三平台 **hy3 模型反向代理 + 号池控制面板**。
+WorkBuddy / TraeWork / CodeBuddy（国际）三平台 **hy3 模型反向代理 + 号池控制面板**。
 对外暴露标准 OpenAI 兼容接口，对内做 SSO 登录、令牌自动续期、号池调度、额度监控与调用鉴权。
 
-> 全部接口行为均基于 **2026-08-05 真实账号实测**得出，测试脚本与原始输出保留在仓库中（`e2e_test.py` / `e2e_out.txt`）。
+> 接口契约以仓库内 `tests/` 的回归测试和当前容器实测为准；上游模型、额度与签到结果会随账号和服务端状态变化。
 
 ---
 
 ## 1. 快速开始
 
 ```bash
-# 依赖：Python 3.9+，flask / requests / waitress
+# 依赖：Python 3.10+，flask / requests / waitress
 pip install flask requests waitress
 ```
 
@@ -28,17 +28,17 @@ python app.py
 
 | 入口 | 地址 |
 |---|---|
-| 账号贡献页（默认首页） | http://127.0.0.1:8787/ |
-| 管理后台登录 | http://127.0.0.1:8787/login |
-| OpenAI Base URL | http://127.0.0.1:8787/v1 |
-| 健康检查 | http://127.0.0.1:8787/health |
+| 账号贡献页（默认首页） | http://127.0.0.1:8530/ |
+| 管理后台登录 | http://127.0.0.1:8530/login |
+| OpenAI Base URL | http://127.0.0.1:8530/v1 |
+| 健康检查 | http://127.0.0.1:8530/health |
 
-**默认管理员密码 `admin`，默认调用 Key `Agent2API`** —— 上线前请务必在面板里改掉。
+裸跑首次初始化默认管理员密码为 `admin`、默认调用 Key 为 `Agent2API`；Docker Compose 部署必须先在 `.env` 中显式设置，避免公开默认凭据。
 
 调用示例：
 
 ```bash
-curl http://127.0.0.1:8787/v1/chat/completions \
+curl http://127.0.0.1:8530/v1/chat/completions \
   -H "Authorization: Bearer Agent2API" \
   -H "Content-Type: application/json" \
   -d '{"model":"hy3","messages":[{"role":"user","content":"你好"}]}'
@@ -53,38 +53,41 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 | 平台 | key | 登录域 | platform 参数 | 模型网关 | 会话头 |
 |---|---|---|---|---|---|
 | WorkBuddy | `workbuddy` | `www.codebuddy.cn` | `workbuddy` | `copilot.tencent.com` | `X-WorkBuddy-Session-Id` |
-| CodeBuddy CN | `codebuddy_cn` | `www.codebuddy.cn` | `ide` | `copilot.tencent.com` | `X-CodeBuddy-Session-Id` |
+| TraeWork | `trae` | `www.trae.cn` | `trae` | `trae-api-cn.mchost.guru` | SOLO 专用头 |
 | CodeBuddy 国际 | `codebuddy` | `www.codebuddy.ai` | `ide` | `www.codebuddy.ai` | `X-CodeBuddy-Session-Id` |
 
 ### 关键实测结论
 
-1. **WorkBuddy 与 CodeBuddy CN 是同一套账号体系。**
-   同一 Keycloak realm（`https://www.codebuddy.cn/auth/realms/copilot`）、同一 uid、同一份 2400 credits 额度、同一个 `copilot.tencent.com` 网关，只有 `platform` 参数与会话头名不同。两边的 token 可互换使用。
+1. **WorkBuddy 与 CodeBuddy CN 使用同一套账号体系，本项目只保留 WorkBuddy 渠道。**
+   两者共用国内账号、额度和 `copilot.tencent.com` 网关；旧注册表里的 `codebuddy_cn` 引用会在启动和模型刷新时迁入 `workbuddy`，避免重复号池，同时不丢历史模型。
 
-2. **CodeBuddy 国际站是完全独立的账号与网关。**
-   国际 token 打 `copilot.tencent.com` → `401`；CN token 打 `www.codebuddy.ai` → 同样 `401`。国际站有自己的 250 credits 试用额度。
+2. **TraeWork 是独立渠道。**
+   Trae 使用 SOLO 专用请求头、请求体和 `trae-api-cn.mchost.guru` 网关，账号与国内 WorkBuddy 额度分开。
 
-3. **上游只支持流式。**
+3. **CodeBuddy 国际站是完全独立的账号与网关。**
+   国际账号使用 `www.codebuddy.ai`，与国内 WorkBuddy、TraeWork 的账号和额度分开。
+
+4. **上游只支持流式。**
    `stream=false` 一律返回 `400 {"code":11101,"msg":"Non-stream chat request is currently not supported"}`。
    → 本服务**始终以 `stream=true` 请求上游**；客户端要非流式时，由本层把 SSE 聚合成标准 `chat.completion` 响应体。
 
-4. **国际站强制首条 system 消息。**
+5. **国际站强制首条 system 消息。**
    `messages[0].role` 必须是 `system`，否则一律 `400 Parse message failed: 11101:invalid request`。
    实测矩阵：仅 user ❌ / 仅 system ✅ / system+user ✅ / user+system（顺序颠倒）❌ / 空 system + user ✅ / 多轮但无 system ❌ / system+多轮 ✅。
    → `providers.normalize_body()` 会在命中该平台时自动插入一条 system 消息（内容取设置里的「兜底 system 提示词」）。CN 网关无此限制，补齐也无副作用。
 
-5. **刷新令牌走请求头，不是 body。**
+6. **刷新令牌走请求头，不是 body。**
    `POST {api_base}/v2/plugin/auth/token/refresh`，头里带 `Authorization: Bearer {access}` + `X-Refresh-Token: {refresh}`，body 为 `{}`。三平台一致。
 
-6. **上游没有 `responses` 接口，但本代理提供。** `/v1/responses`、`/v2/responses` 上游均 404。
+7. **上游没有 `responses` 接口，但本代理提供。** `/v1/responses`、`/v2/responses` 上游均 404。
    → 本服务在反代层**把 OpenAI Responses API 转译为 `chat/completions`**（`responses.py`）：
    入参 `input`/`instructions`/`tools`/`tool_choice`/`text.format` 翻译为 messages/tools；
    上游 SSE 流实时转写成 Responses 事件（或聚合成 `response` 对象返回非流式）。
    详见第 5 节。
 
-7. **程序不内置任何模型目录，模型列表 100% 来自运行时真实探测。** 上游没有模型枚举接口（`/v3/config` 仅返回 `productFeatures`、`/v1/models` 直接 404、其它疑似枚举端点均实测 404），所以模型发现只能通过对候选 ID 发起最小请求来验证。探测逻辑集中在 `discovery.py`：
+8. **程序不内置对外模型目录，模型列表来自官方 CLI 目录与运行时真实探测。** WorkBuddy / CodeBuddy 可读取 CLI 白名单，TraeWork 读取 `get_detail_param`；官方目录不可用或未覆盖的模型再用最小请求验证。探测逻辑集中在 `discovery.py`：
    - `PROBE_SEED` 只是一份「要尝试探测的候选 ID 清单」（文本/图像/音频都涵盖），**绝不是对外目录**；探测不到的候选会被自动丢弃，探测到的才进入注册表；
-   - 每次「刷新模型目录」或首次部署启动，都会跨三平台对每个候选做最小请求，把真正可用的模型写入 **数据库注册表**（`db.get_model_registry()` / `discovered_models` 设置），并记录其 `type`（chat / image / audio）与可用 `platforms`；
+   - 每次「刷新模型目录」或首次部署启动，会合并各平台所有启用账号能读取到的官方 CLI 目录，再对候选做最小请求，把确认结果写入 **数据库注册表**（`db.get_model_registry()` / `discovered_models` 设置），并记录其 `type`（chat / image / audio）与可用 `platforms`；
    - 客户端请求一个注册表外的模型时，请求链路会触发 `live_probe_model` 实时探测回退，命中即写入注册表；探测不到则记入负面缓存并在限定 TTL 内直接返回 503，避免反复盲打上游；
    - 对外 `/v1/models`、面板「模型」页、以及请求调度（chat / 图像端点分流）**全部读这张注册表**，代码里不写死任何模型名。
    已探测固化的真实模型示例（仅供理解，不作为代码内常量）：
@@ -94,37 +97,35 @@ curl http://127.0.0.1:8787/v1/chat/completions \
    - `kimi-k2.7-code` 三网关均返回 `11102`（上游未注册），不进入目录、请求时直接 503 拦截。
    展示目录不等于每个平台都支持全部模型，实际请求由注册表里的 `platforms` 决定（见下）。
 
-8. **请求按模型类型与注册表平台分流，不盲选账号。** 未绑定平台的 Key 使用数据库注册表里该模型的 `platforms`（由 `proxy.model_route()` 读取，必要时触发 `live_probe_model` 实时探测）：
-   - 文本模型 `hy3 / glm-* / minimax-m3 / kimi-k3 / kimi-k2.5 / kimi-k2.6` 可走 **三平台**，优先国内 WorkBuddy / CodeBuddy CN，国际 CodeBuddy 作故障/额度兜底；
+9. **请求按模型类型与注册表平台分流，不盲选账号。** 未绑定平台的 Key 使用数据库注册表里该模型的 `platforms`（由 `proxy.model_route()` 读取，必要时触发 `live_probe_model` 实时探测）：
+   - 文本模型 `hy3 / glm-* / minimax-m3 / kimi-k3 / kimi-k2.5 / kimi-k2.6` 可走 **三平台**，优先国内 WorkBuddy，国际 CodeBuddy 作故障/额度兜底；
    - `auto / deepseek-v4-flash / deepseek-v3.2 / kimi-k2.7` 仅国内两网关（国际站返回 `11102`）；
    - 图像模型 `hunyuan-image-*` **只走国内网关的 `/v2/images/generations`**（国际站 `11102`；chat 网关返回 `11103 aiart 不支持`）；
    - 音频模型按 `audio` 类型标注，走 chat 网关（端点能力由上游决定，探测确认即收录）。
-   Key 显式绑定平台时绑定优先，不会越权切到其它平台。仅当上游返回 `11102 / 11103 / service info not found / model [...] not found` 这类明确的「模型未注册」错误时才切换候选平台；普通参数 400 原样返回，避免掩盖客户端错误。模型 ID 在注册表里无可用平台（且实时探测也失败）时，服务返回清晰 503，绝不在所有账号中随机碰运气。
+   Key 显式绑定平台时绑定优先，不会越权切到其它平台。上游返回 `11102 / 11103 / service info not found / model [...] not found` 这类明确的「模型未注册」错误时，会先继续尝试该渠道的其它账号（账号套餐可能不同），该渠道都失败后再切换候选渠道；普通参数 400 原样返回，避免掩盖客户端错误。模型 ID 在注册表里无可用平台（且实时探测也失败）时，服务返回清晰 503，绝不在所有账号中随机碰运气。
 
-9. **图像生成走独立端点 `/v1/images/generations`。** 图像模型（混元图像系列）与对话模型不共用 chat 网关，请求体为 OpenAI 兼容格式 `{"model","prompt","n","size",...}`，上游返回 `data.data[].url` 与 `usage.credit`。任务队列上限（`13212 JobNumExceed`）按可重试限流处理。
+10. **图像生成走独立端点 `/v1/images/generations`。** 图像模型（混元图像系列）与对话模型不共用 chat 网关，请求体为 OpenAI 兼容格式 `{"model","prompt","n","size",...}`，上游返回 `data.data[].url` 与 `usage.credit`。任务队列上限（`13212 JobNumExceed`）按可重试限流处理。
 
-10. **Token 与积分统计只认上游真实 `usage`。** 非流式请求从聚合后的最终 SSE 帧读取 `prompt_tokens` / `completion_tokens` / `total_tokens`；流式 chat 使用旁路解析器，在不改动透传字节的前提下捕获最终帧；Responses 流也会把原始 usage 回传给日志层。积分直接记录上游 `usage.credit`，包括有效的 `credit=0`，不再使用 `tokens × 固定单价` 人工换算。老版本产生的估算积分因无法无损恢复，保留日志但标记为非真实来源，不计入面板的真实积分合计与扣费明细；上游未返回 usage 时 token 记为 0（未知），不会按字符数伪造。
+11. **Token 与积分统计只认上游真实 `usage`。** 非流式请求从聚合后的最终 SSE 帧读取 `prompt_tokens` / `completion_tokens` / `total_tokens`；流式 chat 使用旁路解析器，在不改动透传字节的前提下捕获最终帧；Responses 流也会把原始 usage 回传给日志层。积分直接记录上游 `usage.credit`，包括有效的 `credit=0`，不再使用 `tokens × 固定单价` 人工换算。老版本产生的估算积分因无法无损恢复，保留日志但标记为非真实来源，不计入面板的真实积分合计与扣费明细；上游未返回 usage 时 token 记为 0（未知），不会按字符数伪造。
 
-11. **上游偶发 SSL 抖动。** `copilot.tencent.com` 会间歇性 `SSLEOFError`。已在两处加重试：同账号网络层重试（`proxy.NET_RETRY = 2`）+ 登录/额度类幂等请求的 `urllib3.Retry`。
+12. **上游偶发 SSL 抖动。** `copilot.tencent.com` 会间歇性 `SSLEOFError`。已在两处加重试：同账号网络层重试（`proxy.NET_RETRY = 2`）+ 登录/额度类幂等请求的 `urllib3.Retry`。
 
-12. **上游 SSE 不带 charset。** requests 会退化成 ISO-8859-1 解码导致中文乱码。已强制 UTF-8 解码，流式透传则直接转发原始字节。
+13. **上游 SSE 不带 charset。** requests 会退化成 ISO-8859-1 解码导致中文乱码。已强制 UTF-8 解码，流式透传则直接转发原始字节。
 
 ---
 
 ## 3. 功能
 
 **号池**
-- 三种方式加号：网页 SSO 登录、手填 access/refresh token、粘贴 Cockpit Tools 导出的 JSON（支持数组，按 uid 去重）
+- 三种方式加号：网页 SSO 登录、手填 access/refresh token、粘贴 Cockpit Tools 导出的 JSON（支持数组，按平台+uid 原位更新；旧渠道迁移会自动合并重复账号）
 - 令牌自动续期：按 `expires_at` 提前 `refresh_ahead` 秒刷新，带账号级锁避免并发重复刷新；后台线程每 5 分钟巡检
 - 调度策略：先按模型路由到国内/国际候选平台，再在平台内执行 `least_used`（默认）/ `round_robin` / `random`
-- 失败自动换号重试；401 触发强制刷新后再试；明确的模型未注册 400 才切换候选平台
-- 额度展示严格使用上游实时口径：TraeWork 读取 `usage_summary.total_amount / consumed_amount` 并保留真实套餐列表；刷新失败保留上一份成功数据并报错，不用 0 覆盖
+- 失败自动换号重试；401 触发强制刷新后再试；HTTP 200 包装的 SSE 业务错误也会在返回客户端前识别并换号；单次请求最多尝试 9 个账号，按候选渠道均分，避免坏号池长期占满 Worker
+- 额度展示严格使用上游实时口径：TraeWork 读取 `usage_summary.total_amount / consumed_amount` 并保留真实套餐列表；刷新失败保留上一份成功数据并报错，不用 0 覆盖；真实同步到 0 时明确显示 0，不再写成“未同步”
 - 账号卡片使用事实标签：`已接入`、`未过期`、`本站调用`；TraeWork 未返回连签天数时隐藏该字段，不伪造“连续 0 天”
 - 单号启停、删除、权重、备注
 - 批量签到以上游为准：单号、批量、自动签到都逐号查询上游状态；上游未签才领取，已签才跳过。本地 `checkin_today` 只做页面缓存，不参与是否请求的判断；支持按当前渠道签到，前端与容器日志均显示逐号成功/跳过/失败明细
-- TraeWork 每日签到：`X-Device-Id` 优先用凭证自带的 device_id（扫码/回调导入时随登录
-  注册的原生标识），手填 token 等无 device_id 场景回退 uid。实测（2026-08-31）两
-  者签到均 code 0；9074 文案「参与用户太多」的真实含义是设备头不合法，与容量无关
+- TraeWork 每日签到：当前统一使用凭证中的 `uid` 作为 `X-Device-Id`，因为实测它同时适配扫码登录与 Token 导入账号；模型/额度请求仍会携带凭证里的 machine/device 字段。实测（2026-08-31）全号池签到链路均能得到上游已签到结果；9074 文案「参与用户太多」不能直接当作容量结论，面板会保留原始错误。
 - 渠道×模型开关：模型页每个渠道卡片内按模型开/关（如关闭 WorkBuddy 的 glm-5.3）；
   开关全局生效——真实调用、Key 显式绑定、对外 `/v1/models` 清单一并拦截；
   三渠道全关的模型从清单隐藏；测活与模型探测不受开关影响
@@ -136,7 +137,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 **其它**
 - 调用日志：时间 / 平台 / 账号 / 模型 / 流式 / 状态码 / 耗时 / 输入字符数 / 错误
-- 面板内一键连通性测试（走完整反代链路）
+- 面板内一键连通性测试（走完整反代链路）；HTTP 200 业务错误和 SSE error 事件不会再被标成成功
 - 管理员密码修改（sha256 加盐存储）
 
 ---
@@ -144,7 +145,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 ## 4. 文件结构
 
 ```
-hy3api/
+Agent2API/
 ├── app.py               Flask 应用：OpenAI 接口 + 面板 API + 后台维护线程
 ├── providers.py         平台适配层：SSO、刷新、额度、请求头、body 规范化
 ├── proxy.py             反代引擎：令牌保活、号池调度、流式转发、非流式聚合
@@ -154,20 +155,16 @@ hy3api/
 │   ├── src/               页面与 UI 组件
 │   ├── package.json       前端依赖与构建脚本
 │   └── dist/              npm run build 生成的生产静态文件
-├── run_bg.py              后台启停辅助（Windows）
-├── e2e_test.py            端到端实测脚本
-├── e2e_out.txt            最近一次实测原始输出（27/27 通过）
-├── test_responses.py      Responses 翻译层单元测试（38/38 通过）
-├── e2e_responses.py       /v1/responses 端到端实测
-├── probe_cb2.py / probe_cb3.py 国际站接口差异探测脚本
+├── tests/                 Python 回归测试（pytest）
 ├── Dockerfile             默认运行镜像（需要先构建 frontend/dist）
 ├── Dockerfile.fullbuild   多阶段镜像（容器内自动构建前端）
 ├── docker-compose.yml     Compose 部署配置
-├── .dockerignore          排除 node_modules、数据库和开发产物
-└── hy3api.db              SQLite 数据库（自动创建，已被 .gitignore / .dockerignore 排除）
+├── .env.example           Docker 首次初始化变量模板
+├── .dockerignore          排除数据库、凭证、依赖与构建缓存
+└── agent2api.db           SQLite 数据库（自动创建，不进入 Git）
 ```
 
-数据库路径可用环境变量 `HY3API_DB` 覆盖；持久化目录用 `HY3API_DATA_DIR`（容器内指向 `/data` 卷）。会话密钥用 `HY3API_SECRET`（不设则首次启动自动生成并持久化到库里，重启不掉线）。详见第 8、9 节。
+数据库路径可用环境变量 `AGENT2API_DB` 覆盖；持久化目录用 `AGENT2API_DATA_DIR`（容器内指向 `/data` 卷）。会话密钥用 `AGENT2API_SECRET`（不设则首次启动自动生成并持久化到库里，重启不掉线）。详见第 8、9 节。
 
 ---
 
@@ -185,7 +182,7 @@ hy3api/
 
 上游（WorkBuddy / CodeBuddy）只暴露 `chat/completions` 且只支持流式。本服务在反代层
 把 OpenAI Responses API 翻译过去，因此**任何使用 Responses API 的 SDK / 工具都能直接对接**
-（把 `base_url` 指到 `http://<host>:8787/v1`、API Key 用面板里的 Key 即可）。
+（把 `base_url` 指到 `http://<host>:8530/v1`、API Key 用面板里的 Key 即可）。
 
 **支持的入参翻译**
 
@@ -218,7 +215,7 @@ hy3api/
 调用示例（非流式）：
 
 ```bash
-curl http://127.0.0.1:8787/v1/responses \
+curl http://127.0.0.1:8530/v1/responses \
   -H "Authorization: Bearer Agent2API" \
   -H "Content-Type: application/json" \
   -d '{"model":"hy3","input":"用一句中文介绍你自己","stream":false}'
@@ -229,28 +226,29 @@ curl http://127.0.0.1:8787/v1/responses \
 
 ---
 
-## 6. 实测结果（2026-08-05）
+## 6. 实测结果（2026-09-01）
 
-`python e2e_test.py` —— **27 / 27 全部通过**，使用三个真实账号：
+本地回归测试：`.venv-test/bin/pytest tests/ -q`。真实上游模型、额度和签到结果以当前号池实测为准。
 
 | 组 | 内容 | 结果 |
 |---|---|---|
-| T1 | 健康检查、面板首页 | PASS |
-| T2 | 未登录 401、错误密码 401、`admin` 登录、登录后放行 | PASS |
-| T3 | 三平台账号导入 + 额度拉取（2400 / 2400 / 250 credits） | PASS |
-| T4 | 三账号刷新令牌 + 额度 | PASS |
-| T5 | 无 Key 401、错误 Key 401、默认 Key 放行、自定义 Key 创建 | PASS |
-| T6 | 非流式聚合（返回标准 `chat.completion`，中文正常） | PASS |
-| T7 | 流式 SSE（19 帧增量，内容完整） | PASS |
-| T8 | Key 绑定平台后只命中该平台账号，日志归属正确 | PASS |
-| T9 | 三平台逐一真实对话：workbuddy / codebuddy_cn / codebuddy 全部返回 | PASS |
-| T10 | 调用统计累计、设置读写 | PASS |
+| T1 | 本机 `/health`、Tailscale `100.126.43.55:8530/health` | PASS |
+| T2 | 管理员登录、未登录拦截、登录后管理 API 放行 | PASS |
+| T3 | 现有数据库 16 个账号：WorkBuddy 7 / TraeWork 6 / CodeBuddy 国际 3 | PASS |
+| T4 | SQLite `integrity_check=ok`、同渠道 UID 重复 0、旧渠道记录/日志 0 | PASS |
+| T5 | `/v1/models` 当前对外 13 个模型，渠道开关与 Key 绑定共同生效 | PASS |
+| T6 | `hy3` 非流式真实对话返回 `OK` | PASS |
+| T7 | TraeWork `glm-5.2` Responses 流返回文本增量与 `response.completed` | PASS |
+| T8 | 全部签到命中 13 个可签到账号：WorkBuddy 7 / TraeWork 6，失败 0 | PASS |
+| T9 | 模型调用优先级保存后回读 JSON 一致 | PASS |
+| T10 | 容器重建后健康、账号、模型、设置与历史数据保持 | PASS |
+| T11 | 114 项 Python 回归、TypeScript 类型检查、Vite 构建、容器健康检查 | PASS |
 
 ---
 
 ## 7. 安全提醒
 
-- 默认密码 `admin` 与默认 Key `hy3api` 仅为开箱即用，**首次登录后立刻修改**
+- Docker Compose 要求在 `.env` 显式设置管理员密码和默认 Key；只有直接裸跑且未提供环境变量时才会用 `admin` / `Agent2API` 初始化。现有数据库始终以库内值为准。
 - 面板与 API 无 TLS，公网部署请放在 Nginx/Caddy 反代之后并启用 HTTPS
 - 数据库明文存储 access/refresh token，注意文件权限
 - 号池账号额度有限，建议给不同调用方分配独立 Key 以便追踪与吊销
@@ -259,26 +257,26 @@ curl http://127.0.0.1:8787/v1/responses \
 
 ## 8. 环境变量
 
-所有配置项均可通过环境变量注入，容器化与裸跑通用。优先级：**命令行参数 `--port` / `--host` > 环境变量 > 内置默认值**。
+所有配置项均可通过环境变量注入，容器化与裸跑通用。 `HY3API_*` 旧变量名仍兼容。优先级：**命令行参数 `--port` / `--host` > 环境变量 > 内置默认值**。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `HY3API_HOST` | `0.0.0.0` | 监听地址 |
-| `HY3API_PORT` | `8787` | 监听端口 |
-| `HY3API_THREADS` | `16` | waitress 工作线程数 |
-| `HY3API_DB` | 代码目录 `hy3api.db` | 直接指定 SQLite 文件路径（最高优先级） |
-| `HY3API_DATA_DIR` | 空 | 数据库目录，文件为 `<dir>/hy3api.db`（容器持久化用） |
-| `HY3API_SECRET` | 自动生成并持久化 | 会话签名密钥；不设则首次启动生成并存入库，重启不掉线 |
-| `HY3API_ADMIN_PASSWORD` | `admin` | 首次初始化管理员密码；库已存在时不生效 |
-| `HY3API_DEFAULT_KEY` | `hy3api` | 首次初始化默认调用 Key；库已存在时不生效 |
+| `AGENT2API_HOST` | `0.0.0.0` | 监听地址 |
+| `AGENT2API_PORT` | `8530` | 监听端口 |
+| `AGENT2API_THREADS` | `16` | waitress 工作线程数 |
+| `AGENT2API_DB` | 代码目录 `agent2api.db` | 直接指定 SQLite 文件路径（最高优先级） |
+| `AGENT2API_DATA_DIR` | 空 | 数据库目录，文件为 `<dir>/agent2api.db`（容器持久化用） |
+| `AGENT2API_SECRET` | 自动生成并持久化 | 会话签名密钥；不设则首次启动生成并存入库，重启不掉线 |
+| `AGENT2API_ADMIN_PASSWORD` | `admin` | 首次初始化管理员密码；库已存在时不生效 |
+| `AGENT2API_DEFAULT_KEY` | `Agent2API` | 首次初始化默认调用 Key；库已存在时不生效 |
 
-> `HY3API_ADMIN_PASSWORD` 与 `HY3API_DEFAULT_KEY` **只在数据库尚不存在（全新 volume）时用于初始化**。一旦已在面板里改过密码 / Key，环境变量不再覆盖，避免把正在运行的实例凭据冲掉。
+> `AGENT2API_ADMIN_PASSWORD` 与 `AGENT2API_DEFAULT_KEY` **只在数据库尚不存在（全新 volume）时用于初始化**。一旦已在面板里改过密码 / Key，环境变量不再覆盖，避免把正在运行的实例凭据冲掉。
 
 ---
 
 ## 9. Docker 部署
 
-镜像基于 `python:3.12-slim`，以非 root 用户（`hy3api`）运行，SQLite 数据通过卷挂载持久化，内置纯标准库的健康检查（`HEALTHCHECK` 探活 `/health`，无需额外依赖）。
+镜像基于 `python:3.12-slim`，以非 root 用户（`agent2api`）运行，SQLite 数据通过卷挂载持久化，内置纯标准库的健康检查（`HEALTHCHECK` 探活 `/health`，无需额外依赖）。
 
 ### 9.1 前置条件
 
@@ -303,6 +301,10 @@ npm install
 npm run build
 cd ..
 
+# 首次部署：创建本地环境文件并填写三个值
+cp .env.example .env
+# 编辑 .env：管理员密码、调用 Key、会话密钥均不可留空
+
 # 构建并启动
 docker compose up -d --build
 ```
@@ -324,48 +326,48 @@ docker compose up -d --build
 
 启动后：
 
-- 账号贡献页：http://\<host\>:8787/
-- 管理后台登录：http://\<host\>:8787/login
-- API Base URL：http://\<host\>:8787/v1
-- 健康检查：http://\<host\>:8787/health
+- 账号贡献页：http://\<host\>:8530/
+- 管理后台登录：http://\<host\>:8530/login
+- API Base URL：http://\<host\>:8530/v1
+- 健康检查：http://\<host\>:8530/health
 
 ### 9.3 自定义凭据与端口
 
-编辑 `docker-compose.yml` 的 `environment`：
+编辑本地 `.env`（该文件已被 Git 忽略）：
 
-```yaml
-environment:
-  HY3API_ADMIN_PASSWORD: "改成你自己的强密码"
-  HY3API_DEFAULT_KEY: "sk-your-own-key"
-  HY3API_PORT: "8787"
-  HY3API_THREADS: "16"
-  # HY3API_SECRET: "固定随机长字符串（可选，重启更稳）"
+```dotenv
+AGENT2API_ADMIN_PASSWORD=改成你自己的强密码
+AGENT2API_DEFAULT_KEY=sk-your-own-key
+AGENT2API_SECRET=固定随机长字符串
 ```
 
-> 凭据只在**首次启动（volume 为空）**时生效。改完 `docker-compose.yml` 后需重建容器：`docker compose down && docker compose up -d`。
+> 管理员密码和默认 Key 只在**首次启动（volume 为空）**时用于初始化；已有数据库以面板和数据库中的值为准。
 
 ### 9.4 数据持久化
 
-`docker-compose.yml` 已声明命名卷 `hy3api-data` 挂载到容器 `/data`（即 `HY3API_DATA_DIR=/data`）。号池账号、API Key、调用日志、设置、会话密钥全部落在此卷，**容器重建 / 升级不丢数据**。
+`docker-compose.yml` 已声明命名卷 `agent2api-data` 挂载到容器 `/data`（即 `AGENT2API_DATA_DIR=/data`）。号池账号、API Key、调用日志、设置、会话密钥全部落在此卷，**容器重建 / 升级不丢数据**。
 
 ```bash
-docker volume inspect hy3api_hy3api-data     # 查看数据卷在宿主机的真实路径
+docker volume inspect hy3api_agent2api-data     # 查看数据卷在宿主机的真实路径
+
+# 如果主机已安装 Tailscale，直接使用 Tailscale IP 访问
+curl http://$(tailscale ip -4):8530/health
 ```
 
 ### 9.5 自行构建镜像
 
 ```bash
 # 默认：打包现成的 frontend/dist
-docker build -t hy3api:latest .
+docker build -t agent2api:latest .
 
 # 备选：在镜像的 Node 阶段自动构建前端
-# docker build -f Dockerfile.fullbuild -t hy3api:latest .
+# docker build -f Dockerfile.fullbuild -t agent2api:latest .
 
-docker run -d --name hy3api -p 8787:8787 -v hy3api-data:/data \
-  -e HY3API_DATA_DIR=/data \
-  -e HY3API_ADMIN_PASSWORD=你的密码 \
-  -e HY3API_DEFAULT_KEY=sk-your-own-key \
-  hy3api:latest
+docker run -d --name agent2api -p 8530:8530 -v agent2api-data:/data \
+  -e AGENT2API_DATA_DIR=/data \
+  -e AGENT2API_ADMIN_PASSWORD=你的密码 \
+  -e AGENT2API_DEFAULT_KEY=sk-your-own-key \
+  agent2api:latest
 ```
 
 ### 9.6 运维
@@ -380,10 +382,10 @@ docker compose down          # 停止并移除容器（数据卷保留）
 ### 9.7 启动后验证
 
 ```bash
-curl -fsS http://127.0.0.1:8787/health
+curl -fsS http://127.0.0.1:8530/health
 ```
 
-进入面板用 `HY3API_ADMIN_PASSWORD` 登录；首次加号请在面板内走 SSO 或粘贴 token / Cockpit JSON（真实 token 不会进入镜像，`.dockerignore` 已排除数据库与测试脚本）。
+进入面板用 `AGENT2API_ADMIN_PASSWORD` 登录；首次加号请在面板内走 SSO 或粘贴 token / Cockpit JSON（真实 token 不会进入镜像，`.dockerignore` 已排除数据库与凭证文件）。
 
 ### 9.8 安全
 
@@ -393,13 +395,14 @@ curl -fsS http://127.0.0.1:8787/health
 
 ### 9.9 容器化适配验证
 
-本机未安装 Docker，已用 `docker_env_test.py` 完整模拟 `Dockerfile` / `docker-compose.yml` 注入的环境变量做等价验证：**13 / 13 通过**（原始输出见 `docker_env_out.txt`）：
+容器化验证以当前 `docker compose` 实例为准：构建后检查健康状态、`/health`、`/api/health`、登录态与 `/v1/models`；本地开发也可用同一组命令复跑：
 
-- **全新 volume 首次启动**：端口、`HY3API_DATA_DIR`、管理员密码、默认 Key 全部来自环境变量；默认 `admin` / `hy3api` 失效；内部密钥不通过 API 泄露；HEALTHCHECK 探活代码可用。
-- **模拟 `docker restart`（volume 保留）**：登录态保持（session 密钥已持久化）、密码仍为持久化值。
-- **面板内改密后再次重启**：环境变量不覆盖已有密码（仅首次初始化生效）。
-- **启动横幅**：打印数据库真实路径。
+- **容器启动**：端口、数据目录和健康检查均使用 `AGENT2API_*` 配置。
+- **数据持久化**：命名卷保留账号、Key、设置、日志和会话密钥。
+- **升级重建**：重建镜像不替换已有数据库。
 
 ```bash
-python docker_env_test.py        # 复跑容器化适配验证
+docker compose ps
+curl -fsS http://127.0.0.1:8530/health
+curl -fsS http://127.0.0.1:8530/api/health
 ```

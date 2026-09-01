@@ -63,7 +63,7 @@ export function LoginPage() {
               OpenAI 兼容中转
             </h2>
             <p className="mt-4 max-w-xs text-xs leading-6 text-muted-foreground">
-              统一管理 WorkBuddy / CodeBuddy CN / CodeBuddy 国际 的账号，
+              统一管理 WorkBuddy / TraeWork / CodeBuddy 国际 的账号，
               对外提供 OpenAI 兼容接口（含 Responses API）与共享号池调度。
             </p>
             <a
@@ -98,7 +98,7 @@ export function LoginPage() {
                       value={pw}
                       onChange={(e) => setPw(e.target.value)}
                       className="h-9 bg-background"
-                      placeholder="默认 admin"
+                      placeholder="请输入管理员密码"
                     />
                   </div>
                   <Button

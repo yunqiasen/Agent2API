@@ -29,6 +29,7 @@ DB_PATH = _resolve_db_path()
 
 _local = threading.local()
 _write_lock = threading.RLock()
+_model_registry_lock = threading.RLock()
 
 # 首次初始化用的默认凭据，可用环境变量覆盖（仅在数据库为空时生效）
 DEFAULT_ADMIN_PASSWORD = os.environ.get("AGENT2API_ADMIN_PASSWORD") or os.environ.get("HY3API_ADMIN_PASSWORD") or "admin"
@@ -199,6 +200,59 @@ def init_db():
         add_api_key("默认密钥", DEFAULT_API_KEY)
 
 
+def _dedupe_account_uids(c: sqlite3.Connection) -> None:
+    """合并同渠道同 uid 的重复账号，保留最早 id 与最新凭证快照。"""
+    groups = c.execute(
+        "SELECT platform,uid FROM accounts WHERE uid<>'' "
+        "GROUP BY platform,uid HAVING COUNT(*)>1"
+    ).fetchall()
+    for group in groups:
+        rows = c.execute(
+            "SELECT * FROM accounts WHERE platform=? AND uid=? ORDER BY id ASC",
+            (group["platform"], group["uid"]),
+        ).fetchall()
+        canonical = rows[0]
+        latest = max(rows, key=lambda r: (int(r["updated_at"] or 0), int(r["id"])))
+        fields = {}
+        for key in latest.keys():
+            if key in {"id", "platform", "uid", "created_at",
+                       "req_count", "fail_count"}:
+                continue
+            fields[key] = latest[key]
+        fields["req_count"] = sum(int(r["req_count"] or 0) for r in rows)
+        fields["fail_count"] = sum(int(r["fail_count"] or 0) for r in rows)
+        cols = ", ".join("%s=?" % key for key in fields)
+        c.execute("UPDATE accounts SET %s WHERE id=?" % cols,
+                  list(fields.values()) + [canonical["id"]])
+        duplicate_ids = [r["id"] for r in rows[1:]]
+        # 调用日志没有外键约束；删除重复账号前先改指向保留账号，
+        # 否则迁移后历史统计会留下不存在的 account_id。
+        c.execute("UPDATE logs SET account_id=? WHERE account_id IN (%s)" %
+                  ",".join("?" * len(duplicate_ids)),
+                  [canonical["id"], *duplicate_ids])
+        c.execute("DELETE FROM accounts WHERE id IN (%s)" %
+                  ",".join("?" * len(duplicate_ids)), duplicate_ids)
+
+
+def migrate_legacy_platforms() -> None:
+    """归一旧渠道别名，并合并迁移后重复的真实账号。"""
+    aliases = {"codebuddy_cn": "workbuddy", "ide": "codebuddy"}
+    with _write_lock:
+        c = get_conn()
+        # 旧库可能已建唯一索引；先移除，完成别名归一与去重后再恢复。
+        c.execute("DROP INDEX IF EXISTS ux_accounts_platform_uid")
+        for table in ("accounts", "api_keys", "pending_login", "logs"):
+            for old, new in aliases.items():
+                c.execute("UPDATE %s SET platform=? WHERE platform=?" % table,
+                          (new, old))
+        _dedupe_account_uids(c)
+        c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_accounts_platform_uid "
+            "ON accounts(platform,uid) WHERE uid<>''"
+        )
+        c.commit()
+
+
 def _migrate_accounts_columns():
     """为已存在的 accounts 表补齐签到相关字段（SCHEMA 的 IF NOT EXISTS 不会改已有表）。
 
@@ -317,7 +371,22 @@ def get_model_registry() -> dict:
 
 def set_model_registry(registry: dict) -> None:
     import json as _json
-    set_setting("discovered_models", _json.dumps(registry, ensure_ascii=False))
+    with _model_registry_lock:
+        set_setting("discovered_models", _json.dumps(registry, ensure_ascii=False))
+
+
+def update_model_registry(mutator) -> dict:
+    """在单一进程锁内完成注册表读-改-写，防止并发发现结果互相覆盖。"""
+    import copy
+    with _model_registry_lock:
+        current = copy.deepcopy(get_model_registry())
+        updated = mutator(current)
+        if updated is None:
+            updated = current
+        if not isinstance(updated, dict):
+            raise TypeError("模型注册表更新器必须返回 dict 或 None")
+        set_model_registry(updated)
+        return copy.deepcopy(updated)
 
 
 # --------------------------------------------------------------------------
@@ -350,9 +419,41 @@ def add_account(platform, access_token, refresh_token="", expires_at=0, domain="
                 token_type="Bearer", email="", uid="", nickname="",
                 enterprise_id="", enterprise_name="", state="", label="",
                 source="", machine_id="", device_id="") -> int:
+    """新增账号；同渠道同 uid 已存在时原位更新并返回原 id。"""
     now = int(time.time())
     with _write_lock:
         c = get_conn()
+        existing = None
+        if uid:
+            existing = c.execute(
+                "SELECT * FROM accounts WHERE platform=? AND uid=?",
+                (platform, uid),
+            ).fetchone()
+        if existing is not None:
+            fields = {
+                "access_token": access_token,
+                "refresh_token": refresh_token or existing["refresh_token"] or "",
+                "expires_at": int(expires_at or existing["expires_at"] or 0),
+                "domain": domain or existing["domain"] or "",
+                "token_type": token_type or existing["token_type"] or "Bearer",
+                "email": email or existing["email"] or "",
+                "nickname": nickname or existing["nickname"] or "",
+                "enterprise_id": enterprise_id or existing["enterprise_id"] or "",
+                "enterprise_name": enterprise_name or existing["enterprise_name"] or "",
+                "state": state or existing["state"] or "",
+                "label": label or existing["label"] or "",
+                "source": source or existing["source"] or "",
+                "machine_id": machine_id or existing["machine_id"] or "",
+                "device_id": device_id or existing["device_id"] or "",
+                "status": "active",
+                "status_reason": "",
+                "updated_at": now,
+            }
+            cols = ", ".join("%s=?" % key for key in fields)
+            c.execute("UPDATE accounts SET %s WHERE id=?" % cols,
+                      list(fields.values()) + [existing["id"]])
+            c.commit()
+            return int(existing["id"])
         cur = c.execute(
             """INSERT INTO accounts(platform,label,email,uid,nickname,enterprise_id,
                enterprise_name,access_token,refresh_token,token_type,expires_at,domain,
@@ -413,7 +514,7 @@ def pick_account(platform: str | None = None, strategy: str = "least_used",
     min_quota > 0 时仅选「剩余积分 >= min_quota」的账号；若账号从未刷新过额度
     （quota_updated_at=0，无法判断），一律放行，避免误杀未初始化的账号。
     """
-    sql = "SELECT * FROM accounts WHERE enabled=1 AND status!='banned'"
+    sql = "SELECT * FROM accounts WHERE enabled=1 AND status NOT IN ('banned', 'disabled')"
     args = []
     if platform:
         sql += " AND platform=?"
@@ -492,6 +593,11 @@ def list_api_keys() -> list:
 def get_api_key(key: str):
     return get_conn().execute(
         "SELECT * FROM api_keys WHERE api_key=? AND enabled=1", (key,)).fetchone()
+
+
+def get_api_key_by_id(kid: int):
+    return get_conn().execute(
+        "SELECT * FROM api_keys WHERE id=?", (kid,)).fetchone()
 
 
 def delete_api_key(kid: int):

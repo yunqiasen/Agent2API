@@ -29,7 +29,7 @@ import {
 } from "@/lib/design";
 
 function platformLabel(k: string): string {
-  return PLATFORMS.find((p) => p.key === k)?.label ?? k;
+  return PLATFORMS.find((p) => p.key === k)?.name ?? k;
 }
 
 function kindBadge(kind?: string) {
@@ -191,6 +191,11 @@ export function Models() {
       await apiPost("/api/settings", {
         model_platform_disabled: JSON.stringify(next),
       });
+      // 开关保存后立即回读对外清单，避免顶部 /v1/models 区域继续显示已全关模型。
+      const refreshed = await apiGet<ModelDiscoverResponse>("/api/models/discover/progress");
+      setData(refreshed);
+      setDisabledMap(refreshed.disabled ?? {});
+      setLastFetched(Date.now());
       toast.success(
         `${platformLabel(platform)} 的 ${modelId} 已${enabled ? "开启" : "关闭"}`,
       );
@@ -228,6 +233,19 @@ export function Models() {
     }, 4000);
   }
 
+  async function loadCurrent() {
+    try {
+      const d = await apiGet<ModelDiscoverResponse>("/api/models/discover/progress");
+      setData(d);
+      setDisabledMap(d.disabled ?? {});
+      setLastFetched(Date.now());
+      setImageDiscovering(Boolean(d.image_discovering));
+      if (d.image_discovering) pollImageProgress(60);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "加载模型目录失败");
+    }
+  }
+
   async function discover() {
     setLoading(true);
     try {
@@ -251,7 +269,7 @@ export function Models() {
   }
 
   useEffect(() => {
-    discover();
+    loadCurrent();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -290,7 +308,7 @@ export function Models() {
 
       <SectionCard
         title="对外暴露（/v1/models）"
-        desc="客户端 GET /v1/models 看到的清单，来自对外模型配置与内置目录合并"
+        desc="客户端 GET /v1/models 看到的清单，来自运行时模型注册表与渠道开关"
         icon={Boxes}
         tone="indigo"
         right={<Badge variant="outline" className="font-mono text-[10px]">共 {data?.exposed?.length ?? 0} 个</Badge>}

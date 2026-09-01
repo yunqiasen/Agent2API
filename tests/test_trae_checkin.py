@@ -109,3 +109,128 @@ def test_trae_checkin_streak_is_unknown_when_upstream_omits_field():
         sess.return_value.post.return_value = fake
         st = trae.fetch_checkin_status("token", device_id="uid")
     assert st["streak_days"] is None
+
+
+def test_workbuddy_already_checked_in_response_is_idempotent():
+    """上游把「今日已签」作为 400 返回时，重复点击也应归一为成功跳过。"""
+    import providers as P
+
+    fake = MagicMock()
+    fake.status_code = 400
+    fake.text = '{"code":10001,"msg":"今天已签到，请明天再来"}'
+    fake.json.return_value = {"code": 10001, "msg": "今天已签到，请明天再来"}
+    with patch.object(P, "_session") as sess:
+        sess.return_value.post.return_value = fake
+        res = P.do_checkin("workbuddy", "token", timeout=1)
+
+    assert res["ok"] is True
+    assert res["skipped"] is True
+    assert res["today_checked_in"] is True
+
+
+def test_trae_quota_rejects_http_200_business_error():
+    """Trae 业务错误即使 HTTP 200 也不能落成 total=0 的假额度。"""
+    fake = MagicMock()
+    fake.status_code = 200
+    fake.json.return_value = {"code": 9074, "message": "当前参与用户太多"}
+    with patch.object(trae, "_session") as sess:
+        sess.return_value.post.return_value = fake
+        with pytest.raises(RuntimeError, match="9074"):
+            trae.fetch_quota("token", device_id="uid")
+
+
+def test_trae_aggregator_rejects_error_event():
+    """Trae SSE error 事件不能被 result() 忽略成空成功。"""
+    agg = trae.SSEAggregator()
+    agg.feed_line("event: error")
+    agg.feed_line('data: {"code":9074,"message":"业务失败"}')
+    agg.feed_line("")
+    agg.finish()
+    with pytest.raises(RuntimeError, match="9074"):
+        agg.result("glm-5.2")
+
+
+def test_trae_checkin_non_numeric_business_code_is_reported_cleanly():
+    """异常业务码不能从 int 转换处抛出 ValueError，必须保留签到错误上下文。"""
+    fake = MagicMock()
+    fake.status_code = 200
+    fake.json.return_value = {"code": "RATE_LIMIT", "message": "稍后再试"}
+    with patch.object(trae, "_session") as sess:
+        sess.return_value.post.return_value = fake
+        with pytest.raises(RuntimeError, match="RATE_LIMIT"):
+            trae.do_checkin("token", device_id=AHA_DID, attempts=1)
+
+
+def test_trae_checkin_status_parses_string_booleans():
+    """状态接口返回字符串布尔值时不能把 false 当成 true。"""
+    fake = MagicMock()
+    fake.status_code = 200
+    fake.json.return_value = {
+        "code": 0, "checked_in": "false", "enable": "false", "credits": 200,
+    }
+    with patch.object(trae, "_session") as sess:
+        sess.return_value.post.return_value = fake
+        st = trae.fetch_checkin_status("token", device_id="uid")
+    assert st["today_checked_in"] is False
+    assert st["claimable"] is False
+
+
+def test_workbuddy_checkin_status_parses_string_boolean(monkeypatch):
+    """国内签到状态返回字符串 false 时不能被 Python truthiness 误判成已签。"""
+    import providers as P
+
+    fake = MagicMock()
+    fake.status_code = 200
+    fake.json.return_value = {
+        "code": 0,
+        "data": {"today_checked_in": "false", "today_credit": 200,
+                  "daily_credit": 200, "active": True},
+    }
+    with patch.object(P, "_session") as sess:
+        sess.return_value.post.return_value = fake
+        st = P.fetch_checkin_status("workbuddy", "token")
+    assert st["today_checked_in"] is False
+    assert st["claimable"] is True
+
+
+def test_workbuddy_checkin_preserves_explicit_false_status(monkeypatch):
+    """领取响应明确返回 false 时不得被 `or True` 篡成已签到。"""
+    import providers as P
+
+    class Resp:
+        status_code = 200
+
+        def json(self):
+            return {"code": 0, "data": {
+                "today_checked_in": False,
+                "checked_in": False,
+                "credit": 0,
+            }}
+
+    class Session:
+        def post(self, *args, **kwargs):
+            return Resp()
+
+    monkeypatch.setattr(P, "_session", lambda: Session())
+    out = P.do_checkin("workbuddy", "tok")
+    assert out["today_checked_in"] is False
+
+
+def test_workbuddy_checkin_status_rejects_http_error_without_business_code(monkeypatch):
+    """签到状态 HTTP 500 即使 body 没 code，也不能伪装成“未签到”。"""
+    import providers as P
+
+    class Resp:
+        status_code = 500
+        text = '{"data":{}}'
+
+        def json(self):
+            return {"data": {}}
+
+    class Session:
+        def post(self, *args, **kwargs):
+            return Resp()
+
+    monkeypatch.setattr(P, "_session", lambda: Session())
+    with pytest.raises(P.ProviderError, match="HTTP 500"):
+        P.fetch_checkin_status("workbuddy", "token")

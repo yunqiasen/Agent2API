@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""hy3api - 反代引擎
+"""Agent2API - 反代引擎
 
 核心职责：
   1. 令牌保活：按 expires_at 提前刷新（refresh 走 X-Refresh-Token 头）
@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import math
+import re
 import threading
 import time
 import uuid
@@ -21,10 +23,13 @@ import requests
 import trae
 
 _refresh_locks: dict[int, threading.Lock] = {}
+_checkin_locks: dict[int, threading.Lock] = {}
 _locks_guard = threading.Lock()
 
 # 上游网络抖动时，在同一账号上的重试次数
 NET_RETRY = 2
+# 单次下游请求最多尝试的账号次数；按候选渠道均分，避免坏号池长期占满 Worker。
+DEFAULT_FAILOVER_ATTEMPTS = 9
 
 
 def _lock_for(account_id: int) -> threading.Lock:
@@ -33,6 +38,15 @@ def _lock_for(account_id: int) -> threading.Lock:
         if lk is None:
             lk = threading.Lock()
             _refresh_locks[account_id] = lk
+        return lk
+
+
+def _checkin_lock_for(account_id: int) -> threading.Lock:
+    with _locks_guard:
+        lk = _checkin_locks.get(account_id)
+        if lk is None:
+            lk = threading.Lock()
+            _checkin_locks[account_id] = lk
         return lk
 
 
@@ -113,18 +127,33 @@ def ensure_token(account_row, force: bool = False) -> dict:
 
 
 def refresh_quota(account_row) -> dict:
-    """刷新账号额度并落库。"""
+    """刷新账号额度并落库；失败时标记账号并保留上一份成功快照。"""
     acc = ensure_token(account_row)
-    s = P.collect_quota(acc["platform"], acc["access_token"],
-                        uid=acc.get("uid") or None,
-                        enterprise_id=acc.get("enterprise_id") or None,
-                        domain=acc.get("domain") or None,
-                        device_id=acc.get("device_id") or None)
-    if s.get("errors"):
-        # 拉取失败时保留上一份成功数据，避免把额度覆盖为 0 后仍显示“正常”。
-        raise ProxyError("额度刷新失败：%s" % "; ".join(str(x) for x in s["errors"]),
-                         status=502)
+    try:
+        s = P.collect_quota(acc["platform"], acc["access_token"],
+                            uid=acc.get("uid") or None,
+                            enterprise_id=acc.get("enterprise_id") or None,
+                            domain=acc.get("domain") or None,
+                            # Trae 的 UG 额度接口与签到共用设备头；
+                            # 凭证导入生成的孤立 device_id 会返回错误额度。
+                            device_id=(_checkin_device_id(acc)
+                                       if _is_trae_acc(acc)
+                                       else acc.get("device_id") or None))
+        if s.get("errors"):
+            raise ProxyError("额度刷新失败：%s" % "; ".join(str(x) for x in s["errors"]),
+                             status=502)
+    except ProxyError as e:
+        db.update_account(acc["id"], status="error", status_reason=str(e),
+                          last_error=str(e)[:400])
+        raise
+    except Exception as e:
+        msg = "额度刷新失败：%s" % e
+        db.update_account(acc["id"], status="error", status_reason=msg,
+                          last_error=msg[:400])
+        raise ProxyError(msg, status=502)
+
     db.save_quota(acc["id"], s)
+    db.update_account(acc["id"], status="active", status_reason="", last_error="")
     return s
 
 
@@ -221,10 +250,16 @@ def refresh_checkin_status(account_row) -> dict:
 def checkin_account(account_row) -> dict:
     """核验上游状态后领取；单号、批量、自动签到统一走这条链。
 
-    不信任本地 checkin_today：每次先查上游。上游已签才跳过；上游未签则
-    真正调用 claim，再回读状态与余额。状态查询偶发失败时仍尝试 claim。
+    同一账号的签到请求串行化，避免手动点击与后台自动签到同时通过「未签到」
+    检查后重复领取。锁内每次仍重新查询上游，状态真值不依赖本地缓存。
     """
     acc = ensure_token(account_row)
+    with _checkin_lock_for(acc["id"]):
+        return _checkin_account_locked(acc)
+
+
+def _checkin_account_locked(acc: dict) -> dict:
+    """在账号签到锁内执行一次完整的状态核验、领取与回读。"""
     if not P.supports_checkin(acc["platform"]):
         raise ProxyError("该平台不支持签到", status=400)
 
@@ -261,14 +296,24 @@ def checkin_account(account_row) -> dict:
     except Exception:
         pass
 
+    claim_checked = res.get("today_checked_in")
     try:
         after = _upstream_checkin_status(acc)
         # 部分 Trae claim 响应 claimed_credit=0，但状态接口明确显示今日 +200。
         if not float(res.get("claimed_credit") or 0):
             res["claimed_credit"] = float(after.get("today_credit") or 0)
-        res["today_checked_in"] = bool(after.get("today_checked_in"))
+        # 领取响应或状态回读任一明确确认即可；两边都明确 false 时必须报失败，
+        # 不能仅凭 HTTP/code=0 把本地状态伪造成已签到。
+        confirmed = bool(after.get("today_checked_in")) or claim_checked is True
+        res["today_checked_in"] = confirmed
         res["streak_days"] = int(after.get("streak_days") or res.get("streak_days") or 0)
+        if not confirmed:
+            raise ProxyError("上游领取完成但未确认签到成功", status=502)
+    except ProxyError:
+        raise
     except Exception:
+        if claim_checked is False:
+            raise ProxyError("上游领取完成但未确认签到成功", status=502)
         db.update_account(
             acc["id"], checkin_today=1,
             checkin_streak=int(res.get("streak_days") or 0),
@@ -339,7 +384,10 @@ def retry_failed_checkins():
     db.set_setting("_last_checkin_retry_ts", str(int(now)))
     for row in db.list_accounts():
         a = dict(row)
-        if not a["enabled"] or checkin_marked_today(a):
+        # 不能在这里信任本地标记：上一次状态查询可能失败，但仍留下了
+        # 当天的缓存。统一交给 checkin_account() 再查上游，已签到的账号
+        # 会由上游幂等跳过，未签到的账号才会领取。
+        if not a["enabled"]:
             continue
         if not P.supports_checkin(a["platform"]):
             continue
@@ -397,6 +445,104 @@ def _quota_threshold_for(model: str | None) -> float:
 _PROBE_FAIL_TTL = 3600
 
 
+def normalize_model_registry(registry: dict | None) -> dict:
+    """清理模型注册表中的失效渠道引用。
+
+    旧版本曾保存过 ``codebuddy_cn``。该渠道已经合并进 WorkBuddy，若继续
+    留在注册表里，它会在模型关闭过滤前被当成一个仍可用的平台，形成幽灵
+    路由并让已全关模型继续出现在 ``/v1/models``。
+    """
+    out = {}
+    active = set(P.PLATFORMS)
+    aliases = {"codebuddy_cn": "workbuddy", "ide": "codebuddy"}
+    for mid, rec in (registry or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        platforms = []
+        for platform in rec.get("platforms") or []:
+            platform = aliases.get(str(platform), str(platform))
+            if platform in active and platform not in platforms:
+                platforms.append(platform)
+        if not platforms:
+            continue
+        clean = dict(rec)
+        clean["platforms"] = platforms
+        if clean.get("type") not in ("chat", "image", "audio"):
+            clean["type"] = "chat"
+        out[str(mid)] = clean
+    return out
+
+
+def _priority_token(value) -> str:
+    """用于兼容历史把模型展示名写进优先级配置的情况。"""
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _resolve_priority_model(raw_model, registry: dict) -> str:
+    raw_model = str(raw_model or "").strip()
+    if not raw_model:
+        return ""
+    if raw_model in registry:
+        return raw_model
+    needle = _priority_token(raw_model)
+    matches = []
+    for mid in registry:
+        if needle in (_priority_token(mid), _priority_token(P.model_name(mid))):
+            matches.append(mid)
+    return matches[0] if len(matches) == 1 else raw_model
+
+
+def _normalize_platform_order(order, active=None) -> list[str]:
+    active = list(active or P.PLATFORMS)
+    out = []
+    for platform in order or []:
+        platform = str(platform)
+        if platform in active and platform not in out:
+            out.append(platform)
+    out.extend(platform for platform in active if platform not in out)
+    return out
+
+
+def normalize_route_priority(raw) -> dict:
+    """返回只含当前三渠道、且始终为全排列的优先级配置。"""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw or "")
+        except Exception:
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    active = list(P.PLATFORMS)
+    default = _normalize_platform_order(raw.get("default"), active)
+    registry = normalize_model_registry(db.get_model_registry())
+    overrides = {}
+    raw_overrides = raw.get("overrides")
+    if isinstance(raw_overrides, dict):
+        for raw_model, order in raw_overrides.items():
+            model = _resolve_priority_model(raw_model, registry)
+            if model:
+                overrides[model] = _normalize_platform_order(order, active)
+    return {"default": default, "overrides": overrides}
+
+
+def migrate_runtime_state() -> None:
+    """启动时一次性修复旧注册表/优先级设置，后续读路径仍保持防御性过滤。"""
+    raw_registry = db.get_model_registry()
+    registry = normalize_model_registry(raw_registry)
+    if registry != raw_registry:
+        db.set_model_registry(registry)
+
+    raw_priority = db.get_setting("model_route_priority", "") or ""
+    priority = normalize_route_priority(raw_priority)
+    canonical = json.dumps(priority, ensure_ascii=False, separators=(",", ":"))
+    try:
+        old_obj = json.loads(raw_priority) if raw_priority else None
+    except Exception:
+        old_obj = None
+    if old_obj != priority:
+        db.set_setting("model_route_priority", canonical)
+
+
 def _live_probe_model(mid: str):
     """懒加载 discovery 模块，避免 proxy ↔ discovery 循环导入。"""
     import discovery
@@ -431,25 +577,34 @@ def _apply_route_priority(mid: str, platforms: list[str]) -> list[str]:
     """
     if not platforms:
         return platforms
-    raw = (db.get_setting("model_route_priority") or "").strip()
-    if not raw:
-        return platforms
-    try:
-        cfg = json.loads(raw)
-    except Exception:
-        return platforms
-    order = None
-    if isinstance(cfg, dict):
-        ov = cfg.get("overrides")
-        if isinstance(ov, dict) and isinstance(ov.get(mid), list):
-            order = ov[mid]
-        elif isinstance(cfg.get("default"), list):
-            order = cfg["default"]
+    cfg = normalize_route_priority(db.get_setting("model_route_priority") or "")
+    order = cfg.get("overrides", {}).get(mid) or cfg.get("default")
     if not order:
         return platforms
     rank = {p: i for i, p in enumerate(order)}
     return sorted(platforms, key=lambda x: (rank.get(x, len(rank)),
                                             platforms.index(x)))
+
+
+def normalize_model_disabled_map(raw) -> dict:
+    """归一化渠道×模型开关并迁移旧渠道别名。"""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw or "")
+        except Exception:
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    aliases = {"codebuddy_cn": "workbuddy", "ide": "codebuddy"}
+    active = set(P.PLATFORMS)
+    out = {}
+    for raw_platform, ids in raw.items():
+        platform = aliases.get(str(raw_platform), str(raw_platform))
+        if platform not in active or not isinstance(ids, list):
+            continue
+        bucket = out.setdefault(platform, set())
+        bucket.update(str(model).strip() for model in ids if str(model).strip())
+    return {platform: sorted(ids) for platform, ids in sorted(out.items())}
 
 
 def get_model_disabled_map() -> dict:
@@ -458,20 +613,8 @@ def get_model_disabled_map() -> dict:
     设置 model_platform_disabled 为 JSON {"workbuddy": ["glm-5.3"], ...}；
     开关是全局的：真实调用 / Key 绑定 / 对外清单统一生效，测活与探测不受影响。
     """
-    raw = (db.get_setting("model_platform_disabled") or "").strip()
-    if not raw:
-        return {}
-    try:
-        cfg = json.loads(raw)
-    except Exception:
-        return {}
-    if not isinstance(cfg, dict):
-        return {}
-    out = {}
-    for plat, ids in cfg.items():
-        if isinstance(ids, list):
-            out[str(plat)] = {str(x) for x in ids}
-    return out
+    cfg = normalize_model_disabled_map(db.get_setting("model_platform_disabled") or "")
+    return {platform: set(ids) for platform, ids in cfg.items()}
 
 
 def _filter_disabled_platforms(mid: str, platforms: list[str]) -> list[str]:
@@ -495,7 +638,7 @@ def model_route(model: str | None) -> tuple[str | None, list[str]]:
     mid = str(model or "").strip()
     if not mid:
         return None, []
-    reg = db.get_model_registry()
+    reg = normalize_model_registry(db.get_model_registry())
     rec = reg.get(mid)
     if isinstance(rec, dict) and rec.get("platforms"):
         plats = _apply_route_priority(mid, list(rec["platforms"]))
@@ -533,6 +676,13 @@ def resolve_platform_candidates(model: str | None,
     """
     bound = str(requested_platform or "").strip()
     if bound:
+        if bound not in P.PLATFORMS:
+            return []
+        # 先经过模型注册表/实时探测，再应用 Key 绑定。否则绑定 Key 会把
+        # 未确认的任意模型硬发到该平台，既绕过模型目录，也绕过平台能力边界。
+        _model_type, candidates = model_route(model)
+        if bound not in candidates:
+            return []
         # 模型开关是全局的：绑定的渠道若被管理员关闭该模型，同样拦截。
         return _filter_disabled_platforms(str(model or "").strip(), [bound])
     return model_platform_candidates(model)
@@ -677,6 +827,119 @@ def _sse_lines(resp):
         yield raw
 
 
+def _sse_business_error(obj) -> str:
+    """从 HTTP 200 的 SSE JSON 中提取业务错误，避免空 choices 被当成成功。"""
+    if not isinstance(obj, dict):
+        return ""
+    err = obj.get("error")
+    if isinstance(err, dict):
+        msg = err.get("message") or err.get("msg") or err.get("code")
+        if msg:
+            return str(msg)
+    elif err:
+        return str(err)
+    code = obj.get("code")
+    if code is None:
+        return ""
+    try:
+        ok = int(code) in (0, 200)
+    except (TypeError, ValueError):
+        ok = False
+    if ok:
+        return ""
+    msg = obj.get("message") or obj.get("msg") or obj.get("error_msg") or "业务错误"
+    return "code=%s: %s" % (code, msg)
+
+
+class _PrefetchedSSEResponse:
+    """保留预读 SSE 行的响应包装器，后续流式/聚合读取不会丢首帧。"""
+
+    def __init__(self, resp, prefetched, remaining):
+        self._resp = resp
+        self._prefetched = list(prefetched)
+        self._remaining = remaining
+
+    def __getattr__(self, name):
+        return getattr(self._resp, name)
+
+    def iter_lines(self, decode_unicode=False):
+        for raw in self._prefetched:
+            if decode_unicode and isinstance(raw, bytes):
+                yield raw.decode("utf-8", errors="replace")
+            else:
+                yield raw
+        for raw in self._remaining:
+            if decode_unicode and isinstance(raw, bytes):
+                yield raw.decode("utf-8", errors="replace")
+            else:
+                yield raw
+
+    def iter_content(self, chunk_size=None):
+        # SSE 行重组为标准 LF 分隔字节；空行会形成事件间的双换行。
+        for raw in self.iter_lines(decode_unicode=False):
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8")
+            yield (raw or b"") + b"\n"
+
+    def close(self):
+        return self._resp.close()
+
+
+def _prefetch_sse_evidence(resp, is_trae: bool = False):
+    """预读首个有意义 SSE 事件，返回 (可重放响应, 业务错误)。"""
+    if not hasattr(resp, "iter_lines"):
+        return resp, ""
+    remaining = iter(resp.iter_lines(decode_unicode=False))
+    buffered = []
+    event = ""
+    event_data = []
+
+    def decode(raw):
+        return raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+
+    for raw in remaining:
+        buffered.append(raw)
+        line = decode(raw)
+        if is_trae:
+            if line.startswith("event:"):
+                event = line[6:].strip()
+            elif line.startswith("data:"):
+                event_data.append(line[5:].strip())
+            elif line == "" and (event or event_data):
+                payload = "".join(event_data).strip()
+                try:
+                    obj = json.loads(payload) if payload else {}
+                except Exception:
+                    obj = {}
+                if event == "error":
+                    err = _sse_business_error(obj) or payload or "Trae SSE error"
+                    return _PrefetchedSSEResponse(resp, buffered, remaining), err
+                # 只有 output 才证明模型真正产生了响应；token_usage/done 单独出现
+                # 仍是空流，继续读到结尾后按失败换号。
+                if event == "output":
+                    return _PrefetchedSSEResponse(resp, buffered, remaining), ""
+                event, event_data = "", []
+        elif line.startswith("data:"):
+            payload = line[5:].strip()
+            if not payload:
+                continue
+            if payload == "[DONE]":
+                return (_PrefetchedSSEResponse(resp, buffered, remaining),
+                        "HTTP 200 empty SSE")
+            try:
+                obj = json.loads(payload)
+            except Exception:
+                continue
+            err = _sse_business_error(obj)
+            if err:
+                return _PrefetchedSSEResponse(resp, buffered, remaining), err
+            if isinstance(obj, dict) and ("choices" in obj or "usage" in obj):
+                return _PrefetchedSSEResponse(resp, buffered, remaining), ""
+        if len(buffered) >= 100:
+            break
+    return _PrefetchedSSEResponse(resp, buffered, remaining), "HTTP 200 empty SSE"
+
+
 class SSEUsageTracker:
     """旁路解析原样透传的 SSE 字节，捕获最终帧的上游 usage。
 
@@ -687,6 +950,7 @@ class SSEUsageTracker:
     def __init__(self):
         self._buf = b""
         self.usage = None
+        self.error = ""
 
     def feed(self, chunk) -> None:
         if not chunk:
@@ -713,6 +977,9 @@ class SSEUsageTracker:
             obj = json.loads(payload.decode("utf-8"))
         except Exception:
             return
+        err = _sse_business_error(obj)
+        if err:
+            self.error = err
         usage = obj.get("usage") if isinstance(obj, dict) else None
         if isinstance(usage, dict):
             self.usage = usage
@@ -733,7 +1000,8 @@ def extract_usage(obj) -> dict | None:
     return None
 
 
-def stream_chat(body: dict, platform: str | None = None, max_retry: int = 3):
+def stream_chat(body: dict, platform: str | None = None,
+                max_retry: int = DEFAULT_FAILOVER_ATTEMPTS):
     """按模型路由平台、按号池策略选号，并向上游发起流式请求。
 
     API Key 显式绑定平台时只尝试绑定平台；未绑定时按模型路由矩阵依次尝试。
@@ -744,6 +1012,7 @@ def stream_chat(body: dict, platform: str | None = None, max_retry: int = 3):
     last_err = None
     last_failure_was_route = False
     any_account = False
+    refreshed_401 = set()
     model = body.get("model") or default_model()
 
     # 解析模型类型与候选平台：注册表驱动，未知模型触发实时探测回退。
@@ -759,13 +1028,21 @@ def stream_chat(body: dict, platform: str | None = None, max_retry: int = 3):
     if not candidates:
         raise ProxyError(_route_error_message(model, candidates, []), status=503)
 
-    per_platform_budget = max(1, int(max_retry or 0))
+    attempt_limit = max(1, int(max_retry or 0))
+    per_platform_budget = max(1, math.ceil(attempt_limit / len(candidates)))
+    total_attempts = 0
 
     for candidate in candidates:
         tried_platforms.append(candidate)
+        retry_rows = []
+        platform_attempts = 0
 
-        for _ in range(per_platform_budget):
-            row = choose_account(candidate, model=model, exclude=tried_accounts)
+        while (platform_attempts < per_platform_budget
+               and total_attempts < attempt_limit):
+            row = (retry_rows.pop(0) if retry_rows
+                   else choose_account(candidate, model=model, exclude=tried_accounts))
+            platform_attempts += 1
+            total_attempts += 1
             if row is None:
                 break
             any_account = True
@@ -792,20 +1069,39 @@ def stream_chat(body: dict, platform: str | None = None, max_retry: int = 3):
                 last_failure_was_route = _is_model_route_error(status, text, model)
                 db.bump_account(acc["id"], False, last_err)
 
-                if status == 401:
-                    # token 可能过期，强制刷新一次后让同平台的下一个账号继续尝试。
+                if status == 401 and acc["id"] not in refreshed_401:
+                    # token 可能过期：强制刷新成功后，先重试同一个账号一次；
+                    # 不能把它提前放进排除表后直接跳到其它账号。
+                    refreshed_401.add(acc["id"])
                     try:
-                        ensure_token(db.get_account(acc["id"]), force=True)
+                        fresh = ensure_token(db.get_account(acc["id"]), force=True)
+                        if fresh.get("access_token") != acc.get("access_token"):
+                            retry_rows.append(fresh)
+                            continue
                     except Exception:
                         pass
 
                 if last_failure_was_route:
-                    # 这是平台级能力错误，同平台换账号无意义，直接切换候选平台。
-                    break
+                    # 同一渠道不同账号可能处于不同套餐/灰度，继续尝试该渠道
+                    # 的其它账号；全部账号都未注册时，外层再切换渠道。
+                    continue
                 if _is_retryable(status):
                     continue
                 raise ProxyError(last_err, status=status)
 
+            resp, sse_error = _prefetch_sse_evidence(resp, is_trae=_is_trae_acc(acc))
+            if sse_error:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                last_err = "SSE 业务错误: %s" % sse_error
+                last_failure_was_route = any(marker in sse_error.lower() for marker in (
+                    "11102", "11103", "model not found", "service info not found",
+                    "backend [aiart]",
+                ))
+                db.bump_account(acc["id"], False, last_err)
+                continue
             return acc, resp
 
     if last_failure_was_route:
@@ -827,7 +1123,8 @@ def stream_chat(body: dict, platform: str | None = None, max_retry: int = 3):
     raise ProxyError("模型 %s 的候选平台号池中没有可用账号" % model, status=503)
 
 
-def generate_image(body: dict, platform: str | None = None, max_retry: int = 3):
+def generate_image(body: dict, platform: str | None = None,
+                   max_retry: int = DEFAULT_FAILOVER_ATTEMPTS):
     """按模型路由平台、按号池策略选号，向图像端点发起请求。
 
     与 stream_chat 同构：先按模型路由矩阵选候选平台，平台内按号池策略选号；
@@ -839,13 +1136,15 @@ def generate_image(body: dict, platform: str | None = None, max_retry: int = 3):
     last_err = None
     last_failure_was_route = False
     any_account = False
+    refreshed_401 = set()
     model = body.get("model") or ""
     if not model:
         raise ProxyError("缺少 model 字段", status=400)
     # 解析模型类型：注册表驱动，未知模型触发实时探测回退。
     # 只有确实为图像类型的模型才允许走图像端点；文本/音频模型或探测失败的模型
     # 一律拦截（文本/音频用 chat 网关，探测失败则 503 不盲发）。
-    mtype, candidates = model_route(model)
+    mtype, _ = model_route(model)
+    candidates = resolve_platform_candidates(model, platform)
     if mtype is not None and mtype != "image":
         raise ProxyError(
             "模型 %s 不是图像生成模型（类型=%s），请使用 /v1/chat/completions 或确认模型 id"
@@ -854,12 +1153,20 @@ def generate_image(body: dict, platform: str | None = None, max_retry: int = 3):
     if not candidates:
         raise ProxyError(_route_error_message(model, candidates, tried_platforms), status=503)
 
-    per_platform_budget = max(1, int(max_retry or 0))
+    attempt_limit = max(1, int(max_retry or 0))
+    per_platform_budget = max(1, math.ceil(attempt_limit / len(candidates)))
+    total_attempts = 0
 
     for candidate in candidates:
         tried_platforms.append(candidate)
-        for _ in range(per_platform_budget):
-            row = choose_account(candidate, model=model, exclude=tried_accounts)
+        retry_rows = []
+        platform_attempts = 0
+        while (platform_attempts < per_platform_budget
+               and total_attempts < attempt_limit):
+            row = (retry_rows.pop(0) if retry_rows
+                   else choose_account(candidate, model=model, exclude=tried_accounts))
+            platform_attempts += 1
+            total_attempts += 1
             if row is None:
                 break
             any_account = True
@@ -889,11 +1196,44 @@ def generate_image(body: dict, platform: str | None = None, max_retry: int = 3):
                     continue
                 last_failure_was_route = _is_model_route_error(status, text, model)
                 db.bump_account(acc["id"], False, last_err)
+                if status == 401 and acc["id"] not in refreshed_401:
+                    refreshed_401.add(acc["id"])
+                    try:
+                        fresh = ensure_token(db.get_account(acc["id"]), force=True)
+                        if fresh.get("access_token") != acc.get("access_token"):
+                            retry_rows.append(fresh)
+                            continue
+                    except Exception:
+                        pass
+
                 if last_failure_was_route:
-                    break
+                    # 图像模型权限同样可能按账号不同，继续尝试同渠道其它账号。
+                    continue
                 if _is_retryable(status):
                     continue
                 raise ProxyError(last_err, status=status)
+
+            # 图像网关也可能用 HTTP 200 包装业务错误。JSON 响应必须先验证，
+            # 否则会把 code=11102 等错误当成图片成功并停止故障转移。
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if "text/event-stream" not in ctype:
+                try:
+                    payload = resp.json()
+                except Exception:
+                    payload = None
+                business_error = (_sse_business_error(payload)
+                                  if isinstance(payload, dict)
+                                  else "响应不是 JSON 对象")
+                if business_error:
+                    try:
+                        text = json.dumps(payload, ensure_ascii=False)[:400]
+                    except Exception:
+                        text = str(payload)[:400]
+                    resp.close()
+                    last_err = "HTTP 200 图像业务错误: %s" % business_error
+                    last_failure_was_route = _is_model_route_error(400, text, model)
+                    db.bump_account(acc["id"], False, last_err)
+                    continue
 
             return acc, resp
 
@@ -918,6 +1258,7 @@ def _trae_openai_sse_events(resp, model: str):
     state = {"event": "", "data": []}
     finish = "stop"
     usage = None
+    error = ""
 
     def chunk(delta=None, finish_reason=None, with_usage=False):
         obj = {
@@ -932,7 +1273,7 @@ def _trae_openai_sse_events(resp, model: str):
         return ("data: %s\n\n" % json.dumps(obj, ensure_ascii=False)).encode("utf-8")
 
     def dispatch(event, payload):
-        nonlocal finish, usage
+        nonlocal finish, usage, error
         if not payload:
             return None
         try:
@@ -952,6 +1293,12 @@ def _trae_openai_sse_events(resp, model: str):
         if event == "done":
             finish = obj.get("finish_reason") or finish
             return None
+        if event == "error":
+            error = _sse_business_error(obj) or str(obj)
+            return ("data: %s\n\n" % json.dumps(
+                {"error": {"message": "上游业务错误: %s" % error,
+                           "type": "upstream_error"}},
+                ensure_ascii=False)).encode("utf-8")
         return None
 
     yield chunk({"role": "assistant"})
@@ -972,6 +1319,12 @@ def _trae_openai_sse_events(resp, model: str):
         out = dispatch(state["event"], "".join(state["data"]).strip())
         if out:
             yield out
+    if error:
+        try:
+            resp._hy3_error = error
+        except Exception:
+            pass
+        return
     yield chunk(delta={}, finish_reason=finish, with_usage=True)
     yield b"data: [DONE]\n\n"
 
@@ -1049,6 +1402,9 @@ def aggregate_stream(resp, model: str) -> dict:
         model = j.get("model") or model
         if j.get("usage"):
             usage = j["usage"]
+        err = _sse_business_error(j)
+        if err:
+            raise ProxyError("上游业务错误: %s" % err, status=502)
 
         for ch in (j.get("choices") or []):
             delta = ch.get("delta") or ch.get("message") or {}
@@ -1092,93 +1448,42 @@ def aggregate_trae_stream(resp, model: str) -> dict:
     return agg.result(model)
 
 
-    """把上游 SSE 流聚合成一个标准的 OpenAI 非流式响应体。"""
-    content_parts = []
-    reasoning_parts = []
-    finish_reason = "stop"
-    resp_id = "chatcmpl-" + uuid.uuid4().hex[:24]
-    created = int(time.time())
-    usage = None
-    role = "assistant"
+def default_model(platform: str | None = None) -> str:
+    """返回已探测注册表中的默认 chat 模型；可限定到指定渠道。"""
+    registry = normalize_model_registry(db.get_model_registry())
+    platform = str(platform or "").strip()
 
-    for line in _sse_lines(resp):
-        if not line or not line.startswith("data:"):
-            continue
-        chunk = line[5:].strip()
-        if not chunk or chunk == "[DONE]":
-            continue
-        try:
-            j = json.loads(chunk)
-        except Exception:
-            continue
+    def usable(mid, rec):
+        if not isinstance(rec, dict) or rec.get("type", "chat") != "chat":
+            return False
+        plats = _filter_disabled_platforms(mid, rec.get("platforms") or [])
+        return bool(plats) and (not platform or platform in plats)
 
-        resp_id = j.get("id") or resp_id
-        created = j.get("created") or created
-        model = j.get("model") or model
-        if j.get("usage"):
-            usage = j["usage"]
-
-        for ch in (j.get("choices") or []):
-            delta = ch.get("delta") or ch.get("message") or {}
-            if delta.get("role"):
-                role = delta["role"]
-            if delta.get("content"):
-                content_parts.append(delta["content"])
-            if delta.get("reasoning_content"):
-                reasoning_parts.append(delta["reasoning_content"])
-            if ch.get("finish_reason"):
-                finish_reason = ch["finish_reason"]
-
-    message = {"role": role, "content": "".join(content_parts)}
-    if reasoning_parts:
-        message["reasoning_content"] = "".join(reasoning_parts)
-
-    out = {
-        "id": resp_id,
-        "object": "chat.completion",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-    }
-    if usage:
-        out["usage"] = usage
-    else:
-        # 上游未返回 usage 时只能标记为未知，不能按字符数伪造 token。
-        # 保留 OpenAI 兼容字段，但日志侧会把它视为非真实积分来源。
-        out["usage"] = {"prompt_tokens": 0, "completion_tokens": 0,
-                        "total_tokens": 0}
-    return out
-
-
-def default_model() -> str:
-    """返回已探测注册表中的默认 chat 模型；没有可用项时返回空字符串。
-
-    管理员配置只在模型仍存在于运行时注册表时生效。这样旧数据库里残留的
-    默认模型不会绕过真实探测，也不需要在程序中硬编码任何模型 ID。
-    """
-    registry = db.get_model_registry()
     configured = str(db.get_setting("default_model", "") or "").strip()
     rec = registry.get(configured)
-    if configured and isinstance(rec, dict) and rec.get("platforms") \
-            and rec.get("type", "chat") == "chat":
+    if configured and usable(configured, rec):
         return configured
     for mid in sorted(registry):
         rec = registry.get(mid)
-        if isinstance(rec, dict) and rec.get("platforms") \
-                and rec.get("type", "chat") == "chat":
+        if usable(mid, rec):
             return mid
     return ""
 
 
-def list_models() -> list:
-    """返回真实探测注册表中的模型；三渠道全关的模型对外隐藏。"""
-    reg = db.get_model_registry()
+def list_models(platform: str | None = None) -> list:
+    """返回真实探测注册表中的模型；全关或不属于指定渠道的模型隐藏。"""
+    reg = normalize_model_registry(db.get_model_registry())
     disabled = get_model_disabled_map()
+    platform = str(platform or "").strip()
     out = []
     for mid in sorted(reg.keys()):
         rec = reg.get(mid)
         plats = rec.get("platforms") if isinstance(rec, dict) else None
+        if platform and platform not in (plats or []):
+            continue
         if plats is not None and not [p for p in plats if mid not in disabled.get(p, ())]:
+            continue
+        if platform and mid in disabled.get(platform, ()):
             continue
         out.append(mid)
     return out

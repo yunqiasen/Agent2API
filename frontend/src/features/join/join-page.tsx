@@ -23,6 +23,7 @@ import { PLATFORMS, apiPost, type JoinQuota, type JoinPollResp, type JoinStartRe
 type Step = "form" | "auth" | "done" | "closed";
 
 const TRANSFER_URL = "https://www.akucb.com/";
+const PUBLIC_PLATFORMS = PLATFORMS.filter((p) => p.key !== "trae");
 
 export function JoinPage() {
   const { resolvedTheme, setTheme } = useTheme();
@@ -93,7 +94,15 @@ export function JoinPage() {
           stopTimer();
           setDone({ id: r.account_id!, nickname: r.nickname, email: r.email, quota: r.quota });
           setStep("done");
-          toast.success("已加入共享号池");
+          if (r.quota_error) {
+            toast.warning(`已加入共享号池，但额度同步失败：${r.quota_error}`, { duration: 10000 });
+          } else {
+            toast.success("已加入共享号池");
+          }
+        } else if (r.done) {
+          // 重叠轮询命中已完成终态时立即停下，避免继续跑到 150 次超时。
+          stopTimer();
+          setLog(r.msg || "接入流程已完成");
         } else {
           setLog(`等待授权… (${n}s) ${r.msg || r.error || ""}`);
         }
@@ -212,7 +221,7 @@ export function JoinPage() {
                         <Label>账号类型</Label>
                         <Tabs value={platform} onValueChange={setPlatform}>
                           <TabsList className="grid w-full grid-cols-3">
-                            {PLATFORMS.map((p) => (
+                            {PUBLIC_PLATFORMS.map((p) => (
                               <TabsTrigger key={p.key} value={p.key} className="text-[11px]">
                                 {p.name}
                               </TabsTrigger>

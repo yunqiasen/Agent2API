@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-hy3api - 平台适配层
+Agent2API - 平台适配层
 
 支持三个平台的账号、令牌、额度与模型管理：
   - workbuddy  WorkBuddy      (www.codebuddy.cn, platform=workbuddy)
@@ -81,6 +81,7 @@ UA = (
 )
 
 
+
 class ProviderError(Exception):
     pass
 
@@ -140,13 +141,63 @@ def _session() -> requests.Session:
     return s
 
 
+def _as_bool(value) -> bool:
+    """兼容上游返回 bool、数字或字符串形式的布尔值。"""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 def _ok(body: dict) -> bool:
+    if not isinstance(body, dict):
+        return False
     code = body.get("code")
-    return code in (0, 200, None)
+    if code is None:
+        return True
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return False
+    return code in (0, 200)
 
 
 def _msg(body: dict) -> str:
     return str(body.get("message") or body.get("msg") or body.get("error_msg") or "unknown error")
+
+
+def _require_http_success(resp, action: str) -> None:
+    """HTTP 失败优先于 body 业务码，避免无 code 错误被当成空成功。"""
+    if int(getattr(resp, "status_code", 0) or 0) >= 400:
+        text = str(getattr(resp, "text", "") or "")[:200]
+        raise ProviderError("%s HTTP %s: %s" % (action, resp.status_code, text))
+
+
+def _is_already_checked_in(body: dict) -> bool:
+    """识别上游把“今日已签到”包装成业务错误的幂等响应。"""
+    if not isinstance(body, dict):
+        return False
+    code = str(body.get("code") or "").strip().lower()
+    if code in {"10001", "1001", "already_checked_in", "already-check-in"}:
+        return True
+    text = _msg(body).lower()
+    return any(marker in text for marker in (
+        "今天已签到", "今日已签到", "already checked in", "already check-in",
+    ))
+
+
+def _already_checked_in_result(body: dict) -> dict:
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    return {
+        "ok": True,
+        "skipped": True,
+        "reason": "上游确认今日已签到",
+        "claimed_credit": 0.0,
+        "today_checked_in": True,
+        "streak_days": _to_float(data.get("streak_days")),
+        "today_credit": _to_float(data.get("today_credit") or data.get("credit") or data.get("credits")),
+        "msg": _msg(body),
+        "raw": body,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -222,7 +273,11 @@ def poll_token(platform_key: str, state: str, timeout: int = 20) -> dict | None:
     except Exception as e:
         raise ProviderError("轮询 token 失败: %s" % e)
 
-    code = body.get("code", -1)
+    raw_code = body.get("code", -1)
+    try:
+        code = int(raw_code)
+    except (TypeError, ValueError):
+        code = -1
     if code not in (0, 200):
         # 11217 = 尚在登录中
         return None
@@ -373,6 +428,7 @@ def fetch_user_resource(platform_key, access_token, uid=None, enterprise_id=None
     try:
         r = _session().post(url, headers=_billing_headers(access_token, uid, enterprise_id, domain),
                             json=payload, timeout=timeout)
+        _require_http_success(r, "查询套餐额度失败")
         return r.json()
     except Exception as e:
         raise ProviderError("查询套餐额度失败: %s" % e)
@@ -385,6 +441,7 @@ def fetch_dosage_notify(platform_key, access_token, uid=None, enterprise_id=None
     try:
         r = _session().post(url, headers=_billing_headers(access_token, uid, enterprise_id, domain),
                             json={}, timeout=timeout)
+        _require_http_success(r, "查询用量提醒失败")
         return r.json()
     except Exception as e:
         raise ProviderError("查询用量提醒失败: %s" % e)
@@ -397,6 +454,7 @@ def fetch_payment_type(platform_key, access_token, uid=None, enterprise_id=None,
     try:
         r = _session().post(url, headers=_billing_headers(access_token, uid, enterprise_id, domain),
                             json={}, timeout=timeout)
+        _require_http_success(r, "查询套餐类型失败")
         return r.json()
     except Exception as e:
         raise ProviderError("查询套餐类型失败: %s" % e)
@@ -500,18 +558,24 @@ def collect_quota(platform_key, access_token, uid=None, enterprise_id=None,
                     "unit": "credits", "packages": [], "errors": [str(e)], "raw": {}}
     errors = []
     ur = dn = pt = {}
-    try:
-        ur = fetch_user_resource(platform_key, access_token, uid, enterprise_id, domain)
-    except Exception as e:
-        errors.append("user-resource: %s" % e)
-    try:
-        dn = fetch_dosage_notify(platform_key, access_token, uid, enterprise_id, domain)
-    except Exception as e:
-        errors.append("dosage-notify: %s" % e)
-    try:
-        pt = fetch_payment_type(platform_key, access_token, uid, enterprise_id, domain)
-    except Exception as e:
-        errors.append("payment-type: %s" % e)
+    def call(label, fn):
+        try:
+            body = fn()
+            if not _ok(body):
+                errors.append("%s: code=%s: %s" %
+                              (label, body.get("code"), _msg(body)))
+                return {}
+            return body
+        except Exception as e:
+            errors.append("%s: %s" % (label, e))
+            return {}
+
+    ur = call("user-resource", lambda: fetch_user_resource(
+        platform_key, access_token, uid, enterprise_id, domain))
+    dn = call("dosage-notify", lambda: fetch_dosage_notify(
+        platform_key, access_token, uid, enterprise_id, domain))
+    pt = call("payment-type", lambda: fetch_payment_type(
+        platform_key, access_token, uid, enterprise_id, domain))
 
     s = summarize_quota(ur, dn, pt)
     s["errors"] = errors
@@ -564,7 +628,7 @@ def normalize_body(platform_key: str, body: dict,
       - CodeBuddy 国际站 www.codebuddy.ai：messages[0].role 必须为 system，
         否则一律 400 {"code":11101,"msg":"Parse message failed"}；
         内容可以为空字符串，顺序颠倒（user 在前）同样报错。
-      - copilot.tencent.com（WorkBuddy / CodeBuddy CN）：无此限制，
+      - copilot.tencent.com（WorkBuddy）：无此限制，
         但带 system 同样正常，故补齐不会有副作用。
       - 三平台一致：stream 必须为 true，非流式一律 11101。
     """
@@ -677,39 +741,58 @@ def fetch_upstream_models(platform_key, access_token, timeout=20, uid=None,
             if agent.get("name") == "cli":
                 ids = agent.get("models") or []
                 return [str(x).strip() for x in ids if str(x).strip()]
-        return []
+        return _fetch_config_models(platform_key, access_token, timeout)
     except Exception:
+        # requests 的 Retry 会把持续 500 抛成 RetryError，必须继续走配置接口，
+        # 否则 CodeBuddy 国际目录会退化成空列表。
+        return _fetch_config_models(platform_key, access_token, timeout)
+
+
+def merge_upstream_model_ids(platform_key: str, ids) -> list:
+    """把一个平台上多个账号的官方模型目录并集合并进注册表。"""
+    ids = list(dict.fromkeys(str(x).strip() for x in (ids or []) if str(x).strip()))
+    if not ids:
         return []
+    added = []
+
+    def mutate(reg):
+        current_ids = set(ids)
+        for old_mid, old_rec in list(reg.items()):
+            if not isinstance(old_rec, dict) or old_rec.get("type", "chat") != "chat":
+                continue
+            if platform_key not in (old_rec.get("platforms") or []) or old_mid in current_ids:
+                continue
+            platforms = [p for p in old_rec.get("platforms", []) if p != platform_key]
+            if platforms:
+                old_rec["platforms"] = platforms
+            else:
+                reg.pop(old_mid, None)
+        for mid in ids:
+            existed = mid in reg
+            rec = reg.get(mid)
+            if not isinstance(rec, dict):
+                rec = {"type": "chat", "platforms": []}
+            rec["type"] = "chat"
+            platforms = rec.setdefault("platforms", [])
+            if platform_key not in platforms:
+                platforms.append(platform_key)
+            if not existed:
+                added.append(mid)
+            reg[mid] = rec
+        return reg
+
+    db.update_model_registry(mutate)
+    return added
 
 
 def merge_upstream_models(platform_key, access_token, uid=None,
                            machine_id=None, device_id=None) -> list:
-    """把官方目录里的 CLI 模型合并进运行时注册表，返回新增模型 ID。
-
-    只标记平台与 chat 类型；这些模型来自 CLI 官方白名单，因此不再逐个真实请求。
-    """
-    # 国际站 /console/.../models 常年 500；fetch_upstream_models 内部已回退
-    # /v3/config 的 agents[cli].models。这里直接用它的返回值，空列表才放弃。
+    """读取一个账号的官方目录并合并进运行时注册表。"""
     ids = fetch_upstream_models(platform_key, access_token, uid=uid,
-                                 machine_id=machine_id, device_id=device_id)
+                                machine_id=machine_id, device_id=device_id)
     if not ids:
         ids = _fetch_config_models(platform_key, access_token)
-    if not ids:
-        return []
-    reg = db.get_model_registry()
-    added = []
-    for mid in ids:
-        rec = reg.get(mid)
-        if not isinstance(rec, dict):
-            rec = {"type": model_type(mid), "platforms": []}
-        rec["type"] = rec.get("type") or model_type(mid)
-        if platform_key not in rec.get("platforms", []):
-            rec.setdefault("platforms", []).append(platform_key)
-        if mid not in reg:
-            added.append(mid)
-        reg[mid] = rec
-    db.set_model_registry(reg)
-    return added
+    return merge_upstream_model_ids(platform_key, ids)
 
 
 TRAE_INTERNAL_MODELS = {
@@ -806,13 +889,15 @@ def to_entries(ids) -> list:
 
 
 def catalog_entries(platform_key: str) -> list:
-    """返回注册表中「该平台可用」的模型条目 [{id, name, kind}]。"""
+    """返回注册表中「该平台可用」的模型条目，并兼容旧渠道别名。"""
     reg = db.get_model_registry()
+    aliases = {"codebuddy_cn": "workbuddy", "ide": "codebuddy"}
     out = []
     for mid, rec in reg.items():
         if not isinstance(rec, dict):
             continue
-        if platform_key and platform_key not in rec.get("platforms", []):
+        platforms = {aliases.get(str(p), str(p)) for p in rec.get("platforms", [])}
+        if platform_key and platform_key not in platforms:
             continue
         out.append({"id": mid, "name": model_name(mid),
                     "kind": rec.get("type", "chat")})
@@ -854,6 +939,7 @@ def fetch_checkin_status(platform_key, access_token, uid=None, enterprise_id=Non
     try:
         r = _session().post(url, headers=_billing_headers(access_token, uid, enterprise_id, domain),
                             json={}, timeout=timeout)
+        _require_http_success(r, "查询签到状态失败")
         body = r.json()
     except Exception as e:
         raise ProviderError("查询签到状态失败: %s" % e)
@@ -866,7 +952,7 @@ def fetch_checkin_status(platform_key, access_token, uid=None, enterprise_id=Non
     dates = data.get("checkin_dates") or []
     if not isinstance(dates, list):
         dates = []
-    today_checked_in = bool(data.get("today_checked_in"))
+    today_checked_in = _as_bool(data.get("today_checked_in"))
     today_credit = _to_float(data.get("today_credit"))
     return {
         "supported": True,
@@ -903,6 +989,11 @@ def do_checkin(platform_key, access_token, uid=None, enterprise_id=None,
     except Exception as e:
         raise ProviderError("签到失败: %s" % e)
 
+    if _is_already_checked_in(body):
+        return _already_checked_in_result(body)
+    if r.status_code >= 400:
+        raise ProviderError("签到失败(HTTP %s, code=%s): %s"
+                            % (r.status_code, body.get("code"), _msg(body)))
     if not _ok(body):
         raise ProviderError("签到失败(code=%s): %s"
                             % (body.get("code"), _msg(body)))
@@ -911,11 +1002,17 @@ def do_checkin(platform_key, access_token, uid=None, enterprise_id=None,
     # 领取响应字段名不统一，做多重兜底
     claimed = (_to_float(data.get("credit")) or _to_float(data.get("credits"))
                or _to_float(data.get("amount")) or _to_float(data.get("today_credit")))
+    if "today_checked_in" in data:
+        checked = _as_bool(data.get("today_checked_in"))
+    elif "checked_in" in data:
+        checked = _as_bool(data.get("checked_in"))
+    else:
+        # 成功领取且上游未返回状态字段时，按领取成功处理；明确 false 必须保留。
+        checked = True
     return {
         "ok": True,
         "claimed_credit": claimed,
-        "today_checked_in": bool(data.get("today_checked_in")
-                                 or data.get("checked_in") or True),
+        "today_checked_in": checked,
         "streak_days": _to_float(data.get("streak_days")),
         "msg": str(body.get("msg") or body.get("message") or "OK"),
         "raw": data,

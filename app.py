@@ -2,12 +2,12 @@
 """
 Agent2API - 三平台模型反代 + 号池控制面板
 
-平台支持: WorkBuddy / CodeBuddy CN / CodeBuddy(国际)
+平台支持: WorkBuddy / TraeWork / CodeBuddy(国际)
 对外接口: OpenAI 兼容 /v1/chat/completions, /v1/models
 控制面板: /  (默认管理员密码 admin, 默认 API Key Agent2API)
 
 启动:
-    python app.py                 # 默认 0.0.0.0:8787
+    python app.py                 # 默认 0.0.0.0:8530
     python app.py --port 9000
 """
 from __future__ import annotations
@@ -15,7 +15,9 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import math
 import os
+import queue
 import threading
 import time
 import uuid
@@ -39,9 +41,12 @@ app = Flask(__name__, static_folder=None)
 # 后台异步统计（计数 / 日志落库） —— 完全移出请求热路径
 # ==========================================================================
 # 设计：原本每次反代请求都要同步写 SQLite（bump_api_key / bump_account / add_log），
-# 在并发场景下会阻塞响应、拉高首 token / 收尾延迟。这里改为把每次「统计写」交给一个
-# 轻量守护线程异步执行，请求线程立即返回，响应速度不再受统计影响；同时统计/仪表盘
-# 数据被完整保留（落库只有极短延迟）。统计写之间由 db._write_lock 串行化，安全无冲突。
+# 在并发场景下会阻塞响应、拉高首 token / 收尾延迟。这里改为一个有界统计队列，
+# 由单个守护线程串行落库：请求线程立即返回，统计写不会创建无上限的线程风暴，
+# 同时保持写入顺序，避免同一请求的计数和日志乱序。
+_stats_queue: queue.Queue = queue.Queue(maxsize=10000)
+_stats_worker_started = False
+_stats_worker_guard = threading.Lock()
 
 def _run_stats_job(job):
     """后台统计写任务的执行体：吞掉异常，单条失败不影响主流程与统计准确性。"""
@@ -51,30 +56,45 @@ def _run_stats_job(job):
         pass
 
 
-def _enqueue_stats(job):
-    """异步落库：起一个守护线程执行统计写，彻底不阻塞请求热路径。
+def _stats_worker():
+    while True:
+        job = _stats_queue.get()
+        try:
+            _run_stats_job(job)
+        finally:
+            _stats_queue.task_done()
 
-    每次统计写（add_log / bump_*）单独起一个守护线程，复用 db 的连接与 WAL
-    （写之间由 db._write_lock 串行化）。请求线程立即返回，响应速度不受统计影响。
-    极端情况下（无法起线程）退化为同步执行，保证统计不丢。
+
+def _ensure_stats_worker():
+    global _stats_worker_started
+    with _stats_worker_guard:
+        if _stats_worker_started:
+            return
+        threading.Thread(target=_stats_worker, name="agent2api-stats", daemon=True).start()
+        _stats_worker_started = True
+
+
+def _enqueue_stats(job):
+    """异步落库：投递到有界队列，由单 worker 串行执行。
+
+    队列满时退化为当前线程执行，优先保证统计不丢；正常情况下请求线程
+    只做一次非阻塞入队，不再为每条统计写创建守护线程。
     """
     try:
-        threading.Thread(target=_run_stats_job, args=(job,), daemon=True).start()
+        _ensure_stats_worker()
+        _stats_queue.put_nowait(job)
+    except queue.Full:
+        _run_stats_job(job)
     except Exception:
-        try:
-            job()
-        except Exception:
-            pass
+        _run_stats_job(job)
 
 
 def _flush_stats(timeout: float = 1.0):
-    """测试断言前等待后台统计线程完成（生产环境无需调用）。
-
-    统计线程本身是极轻量的 DB 写入，sleep 一个上限即保证落库完成，
-    无需精确的队列 join 记账。
-    """
-    time.sleep(min(timeout, 1.5))
-    return True
+    """测试断言前等待统计队列清空；生产环境无需调用。"""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while _stats_queue.unfinished_tasks and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return _stats_queue.unfinished_tasks == 0
 
 
 # ==========================================================================
@@ -111,8 +131,15 @@ def _log(kr_id, acc_id, platform, model, status, stream, duration_ms,
         duration_ms, prompt_chars, error,
         pt, ct, tt, cost, credit_actual=credit_actual))
 
+def migrate_legacy_platforms() -> None:
+    """启动时归一旧版本渠道别名，避免未知平台记录让面板/API 失效。"""
+    db.migrate_legacy_platforms()
+
+
 # 建库必须先于取 secret_key（密钥持久化在库里，保证重启后登录态不失效）
 db.init_db()
+migrate_legacy_platforms()
+proxy.migrate_runtime_state()
 app.secret_key = db.get_secret_key()
 app.config["JSON_AS_ASCII"] = False
 app.permanent_session_lifetime = timedelta(days=7)
@@ -157,6 +184,47 @@ def openai_error(msg, status=400, etype="invalid_request_error"):
     return jsonify({"error": {"message": msg, "type": etype, "code": status}}), status
 
 
+@app.before_request
+def reject_non_object_json():
+    """所有 JSON 写入口只接受对象，统一拦截数组/标量，避免视图层 data.get 500。"""
+    if request.method not in {"POST", "PUT", "PATCH"} or not request.is_json:
+        return None
+    try:
+        data = request.get_json(silent=False)
+    except Exception:
+        # 非法 JSON 由各端点沿用原有错误文案处理；这里只处理合法但类型错误。
+        return None
+    if isinstance(data, dict):
+        return None
+    if request.path.startswith(("/v1/", "/chat/", "/images/", "/responses")):
+        return openai_error("请求体必须是 JSON 对象")
+    return jsonify({"ok": False, "error": "请求体必须是 JSON 对象"}), 400
+
+
+def _as_bool(value) -> bool:
+    """兼容管理 API 的 bool、数字和字符串输入。"""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _validate_model_field(body):
+    """拒绝非字符串模型名，避免进入路由/实时探测层后被隐式转型。"""
+    if "model" in body and not isinstance(body["model"], str):
+        return openai_error("model 必须是字符串")
+    return None
+
+
+def _string_field(data: dict, key: str, default: str = "", strip: bool = True) -> str:
+    """读取管理 API 字符串字段；数组/对象直接视为客户端参数错误。"""
+    value = data.get(key, default)
+    if value is None:
+        value = default
+    if not isinstance(value, str):
+        raise ValueError("%s 必须是字符串" % key)
+    return value.strip() if strip else value
+
+
 # ==========================================================================
 # OpenAI 兼容接口
 # ==========================================================================
@@ -167,8 +235,9 @@ def api_models():
     if kr is None:
         return openai_error("无效的 API Key", 401, "invalid_api_key")
     now = int(time.time())
+    platform = (kr["platform"] or "").strip() or None
     data = [{"id": m, "object": "model", "created": now, "owned_by": "agent2api"}
-            for m in proxy.list_models()]
+            for m in proxy.list_models(platform=platform)]
     return jsonify({"object": "list", "data": data})
 
 
@@ -180,23 +249,30 @@ def api_chat():
         return openai_error("无效的 API Key", 401, "invalid_api_key")
 
     try:
-        body = request.get_json(force=True) or {}
+        body = request.get_json(force=True)
     except Exception:
         return openai_error("请求体不是合法 JSON")
+    if not isinstance(body, dict):
+        return openai_error("请求体必须是 JSON 对象")
+    model_error = _validate_model_field(body)
+    if model_error:
+        return model_error
 
-    if not body.get("messages"):
-        return openai_error("缺少 messages 字段")
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return openai_error("messages 必须是非空数组")
+    if any(not isinstance(m, dict) for m in messages):
+        return openai_error("messages 数组中的每一项必须是对象")
 
-    want_stream = bool(body.get("stream"))
-    model = body.get("model") or proxy.default_model()
+    want_stream = _as_bool(body.get("stream"))
+    platform = (kr["platform"] or "").strip() or None
+    model = body.get("model") or proxy.default_model(platform)
     if db.get_setting("allow_model_passthrough", "1") != "1":
-        model = proxy.default_model()
+        model = proxy.default_model(platform)
     if not model:
         return openai_error("暂无已探测可用的对话模型，请先刷新模型目录", 503,
                             "model_registry_empty")
     body["model"] = model
-
-    platform = (kr["platform"] or "").strip() or None
     prompt_chars = sum(len(str(m.get("content") or "")) for m in body["messages"])
     t0 = time.time()
 
@@ -236,6 +312,9 @@ def api_chat():
                     ensure_ascii=False)).encode("utf-8")
             finally:
                 usage_tracker.finish()
+                if usage_tracker.error:
+                    ok = False
+                    err = usage_tracker.error
                 try:
                     resp.close()
                 except Exception:
@@ -323,9 +402,14 @@ def api_images():
         return openai_error("无效的 API Key", 401, "invalid_api_key")
 
     try:
-        body = request.get_json(force=True) or {}
+        body = request.get_json(force=True)
     except Exception:
         return openai_error("请求体不是合法 JSON")
+    if not isinstance(body, dict):
+        return openai_error("请求体必须是 JSON 对象")
+    model_error = _validate_model_field(body)
+    if model_error:
+        return model_error
 
     model = body.get("model") or ""
     if not model:
@@ -363,6 +447,9 @@ def api_images():
                 raise
             finally:
                 usage_tracker.finish()
+                if usage_tracker.error:
+                    ok = False
+                    err = usage_tracker.error
                 try:
                     resp.close()
                 except Exception:
@@ -421,9 +508,14 @@ def api_responses():
         return openai_error("无效的 API Key", 401, "invalid_api_key")
 
     try:
-        body = request.get_json(force=True) or {}
+        body = request.get_json(force=True)
     except Exception:
         return openai_error("请求体不是合法 JSON")
+    if not isinstance(body, dict):
+        return openai_error("请求体必须是 JSON 对象")
+    model_error = _validate_model_field(body)
+    if model_error:
+        return model_error
 
     if not body.get("model"):
         return openai_error("缺少 model 字段")
@@ -431,9 +523,10 @@ def api_responses():
         return openai_error("缺少 input 字段")
 
     # 模型解析 + pass-through 门控（与 chat 一致）
+    platform = (kr["platform"] or "").strip() or None
     model = body.get("model")
     if db.get_setting("allow_model_passthrough", "1") != "1":
-        model = proxy.default_model()
+        model = proxy.default_model(platform)
     if not model:
         return openai_error("暂无已探测可用的对话模型，请先刷新模型目录", 503,
                             "model_registry_empty")
@@ -441,12 +534,11 @@ def api_responses():
 
     # Responses input → chat messages
     try:
-        chat_body = R.responses_to_chat(body, default_model=proxy.default_model())
+        chat_body = R.responses_to_chat(body, default_model=proxy.default_model(platform))
     except ValueError as e:
         return openai_error(str(e), 400, "invalid_request_error")
 
-    want_stream = bool(body.get("stream"))
-    platform = (kr["platform"] or "").strip() or None
+    want_stream = _as_bool(body.get("stream"))
     # 日志用 prompt 字符数：instructions + 所有 input 文本
     prompt_chars = len(str(body.get("instructions") or "")) + \
         sum(len(str(x)) for x in _flatten_input(body.get("input")))
@@ -647,6 +739,8 @@ def panel_accounts():
 @app.route("/api/accounts/<int:aid>", methods=["DELETE"])
 @admin_required
 def panel_account_delete(aid):
+    if db.get_account(aid) is None:
+        return jsonify({"ok": False, "error": "账号不存在"}), 404
     db.delete_account(aid)
     return jsonify({"ok": True})
 
@@ -654,11 +748,27 @@ def panel_account_delete(aid):
 @app.route("/api/accounts/<int:aid>", methods=["PATCH"])
 @admin_required
 def panel_account_patch(aid):
+    if db.get_account(aid) is None:
+        return jsonify({"ok": False, "error": "账号不存在"}), 404
     data = request.get_json(silent=True) or {}
     allowed = {}
-    for k in ("enabled", "weight", "label", "status"):
-        if k in data:
-            allowed[k] = data[k]
+    if "enabled" in data:
+        allowed["enabled"] = 1 if _as_bool(data["enabled"]) else 0
+    if "weight" in data:
+        try:
+            weight = int(data["weight"])
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "weight 必须是整数"}), 400
+        if weight < 1:
+            return jsonify({"ok": False, "error": "weight 必须大于 0"}), 400
+        allowed["weight"] = weight
+    if "label" in data:
+        allowed["label"] = str(data["label"] or "")[:100]
+    if "status" in data:
+        status = str(data["status"] or "").strip()
+        if status not in {"active", "error", "banned", "disabled"}:
+            return jsonify({"ok": False, "error": "未知账号状态"}), 400
+        allowed["status"] = status
     if allowed:
         db.update_account(aid, **allowed)
     return jsonify({"ok": True})
@@ -738,7 +848,10 @@ def panel_account_probe(aid):
     if row is None:
         return jsonify({"ok": False, "error": "账号不存在"}), 404
     data = request.get_json(silent=True) or {}
-    model = (data.get("model") or "").strip()
+    try:
+        model = _string_field(data, "model")
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     if not model:
         return jsonify({"ok": False, "error": "缺少 model"}), 400
     try:
@@ -761,7 +874,10 @@ def panel_platform_models(key):
 @admin_required
 def panel_checkin_all():
     data = request.get_json(silent=True) or {}
-    platform = (data.get("platform") or "").strip()
+    try:
+        platform = _string_field(data, "platform")
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     if platform and platform not in P.PLATFORMS:
         return jsonify({"ok": False, "error": "未知平台"}), 400
     try:
@@ -783,7 +899,10 @@ def panel_checkin_all():
 def panel_import_token():
     """手动导入 access_token(+refresh_token)，或粘贴 Cockpit Tools 导出的 JSON。"""
     data = request.get_json(silent=True) or {}
-    platform = data.get("platform") or "workbuddy"
+    try:
+        platform = _string_field(data, "platform", "workbuddy") or "workbuddy"
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     if platform not in P.PLATFORMS:
         return jsonify({"ok": False, "error": "未知平台"}), 400
 
@@ -796,6 +915,8 @@ def panel_import_token():
             return jsonify({"ok": False, "error": "JSON 解析失败: %s" % e}), 400
         if isinstance(parsed, dict):
             parsed = [parsed]
+        elif not isinstance(parsed, list):
+            return jsonify({"ok": False, "error": "凭证 JSON 必须是对象或数组"}), 400
         for it in parsed:
             if not isinstance(it, dict):
                 continue
@@ -815,15 +936,20 @@ def panel_import_token():
                     "machine_id": a.get("machineId") or "",
                     "device_id": a.get("deviceId") or "",
                 })
-            elif it.get("access_token") or it.get("accessToken"):
+            else:
+                # 保留无 token 项，让统一校验返回具体的项号与字段错误。
                 items.append(it)
     else:
-        at = (data.get("access_token") or "").strip()
+        try:
+            at = _string_field(data, "access_token")
+            refresh_token = _string_field(data, "refresh_token")
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
         if not at:
             return jsonify({"ok": False, "error": "缺少 access_token"}), 400
         items.append({
             "access_token": at,
-            "refresh_token": (data.get("refresh_token") or "").strip(),
+            "refresh_token": refresh_token,
             "email": data.get("email") or "",
             "uid": data.get("uid") or "",
             "domain": data.get("domain") or "",
@@ -832,24 +958,60 @@ def panel_import_token():
             "device_id": data.get("device_id") or "",
         })
 
+    if not items:
+        return jsonify({"ok": False, "error": "没有可导入的凭证"}), 400
+    for idx, it in enumerate(items, 1):
+        raw_access = it.get("access_token") or it.get("accessToken") or ""
+        raw_refresh = it.get("refresh_token") or it.get("refreshToken") or ""
+        if not isinstance(raw_access, str):
+            return jsonify({"ok": False, "error": "第 %d 项 access_token 必须是字符串" % idx}), 400
+        if not isinstance(raw_refresh, str):
+            return jsonify({"ok": False, "error": "第 %d 项 refresh_token 必须是字符串" % idx}), 400
+        if not raw_access.strip():
+            return jsonify({"ok": False, "error": "第 %d 项缺少 access_token" % idx}), 400
+        try:
+            it["_expires_at"] = int(it.get("expires_at") or it.get("expiresAt") or 0)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "第 %d 项 expires_at 必须是整数" % idx}), 400
+
     added, updated = 0, 0
+    refresh_errors = []
     for it in items:
-        at = it.get("access_token") or it.get("accessToken")
+        at = str(it.get("access_token") or it.get("accessToken") or "").strip()
         rt = it.get("refresh_token") or it.get("refreshToken") or ""
-        uid = it.get("uid") or ""
+        uid = str(it.get("uid") or "").strip()
+        # 凭证文件有时只保存 token，不带账号元数据。先向上游补齐 uid，
+        # 这样重复导入可以按真实账号更新，而不是不断产生无身份孤儿记录。
+        upstream_info = {}
+        if not uid:
+            try:
+                upstream_info = P.fetch_account_info(
+                    platform, at, domain=it.get("domain") or None) or {}
+            except Exception:
+                upstream_info = {}
+            uid = str(upstream_info.get("uid") or "").strip()
         exist = db.find_account_by_uid(platform, uid) if uid else None
         fields = dict(
             access_token=at, refresh_token=rt,
-            expires_at=int(it.get("expires_at") or it.get("expiresAt") or 0),
-            domain=it.get("domain") or "", email=it.get("email") or "",
-            uid=uid, nickname=it.get("nickname") or "",
-            enterprise_id=it.get("enterprise_id") or "",
-            enterprise_name=it.get("enterprise_name") or "",
-            machine_id=it.get("machine_id") or "",
-            device_id=it.get("device_id") or "",
+            expires_at=it.get("_expires_at", 0),
+            domain=it.get("domain") or "", email=it.get("email") or upstream_info.get("email") or "",
+            uid=uid, nickname=it.get("nickname") or upstream_info.get("nickname") or "",
+            enterprise_id=(it.get("enterprise_id") or it.get("enterpriseId") or
+                           upstream_info.get("enterprise_id") or ""),
+            enterprise_name=(it.get("enterprise_name") or it.get("enterpriseName") or
+                             upstream_info.get("enterprise_name") or ""),
+            machine_id=it.get("machine_id") or it.get("machineId") or "",
+            device_id=it.get("device_id") or it.get("deviceId") or "",
         )
         if exist:
-            db.update_account(exist["id"], status="active", status_reason="", **fields)
+            # Token-only 重新导入时，缺省字段代表“未提供”，不要清空已有
+            # Trae 设备/账号元数据；真正的 token 字段仍按本次输入更新。
+            update_fields = dict(fields)
+            for key in ("email", "uid", "nickname", "enterprise_id", "enterprise_name",
+                        "domain", "machine_id", "device_id"):
+                if not update_fields.get(key):
+                    update_fields.pop(key, None)
+            db.update_account(exist["id"], status="active", status_reason="", **update_fields)
             aid = exist["id"]
             updated += 1
         else:
@@ -863,10 +1025,11 @@ def panel_import_token():
                 pass
         try:
             proxy.refresh_quota(db.get_account(aid))
-        except Exception:
-            pass
+        except Exception as e:
+            refresh_errors.append({"id": aid, "error": str(e)})
 
-    return jsonify({"ok": True, "added": added, "updated": updated})
+    return jsonify({"ok": True, "added": added, "updated": updated,
+                    "refresh_errors": refresh_errors})
 
 
 # ==========================================================================
@@ -880,10 +1043,16 @@ def public_join_start():
     if db.get_setting("public_join_enabled", "1") != "1":
         return jsonify({"ok": False, "error": "公共接入已关闭"}), 403
     data = request.get_json(silent=True) or {}
-    platform = data.get("platform") or "workbuddy"
+    try:
+        platform = _string_field(data, "platform", "workbuddy") or "workbuddy"
+        label = _string_field(data, "label", "用户贡献")[:40] or "用户贡献"
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     if platform not in P.PLATFORMS:
         return jsonify({"ok": False, "error": "未知平台"}), 400
-    label = (data.get("label") or "用户贡献").strip()[:40]
+    if platform == "trae":
+        return jsonify({"ok": False,
+                        "error": "TraeWork 需要粘贴登录回调 URL，请在管理后台添加"}), 400
     try:
         info = P.start_login(platform)
     except Exception as e:
@@ -902,6 +1071,9 @@ def public_join_poll():
     pend = db.get_pending(state)
     if pend is None:
         return jsonify({"ok": False, "pending": True, "error": "state 不存在"}), 404
+    if pend["done"]:
+        return jsonify({"ok": False, "pending": False, "done": True,
+                        "msg": "接入流程已完成"})
 
     try:
         tok = P.poll_token(pend["platform"], state)
@@ -917,6 +1089,10 @@ def public_join_poll():
     except Exception:
         info = {"uid": "", "email": "", "nickname": "",
                 "enterprise_id": "", "enterprise_name": ""}
+
+    if not info.get("uid"):
+        return jsonify({"ok": False, "pending": True,
+                        "error": "获取账号信息失败：上游未返回 uid，账号未入库"})
 
     exist = db.find_account_by_uid(pend["platform"], info.get("uid"))
     fields = dict(
@@ -939,14 +1115,15 @@ def public_join_poll():
 
     db.finish_pending(state)
     quota = None
+    quota_error = ""
     try:
         quota = proxy.refresh_quota(db.get_account(aid))
-    except Exception:
-        quota = None
+    except Exception as e:
+        quota_error = str(e)
 
     return jsonify({"ok": True, "account_id": aid,
                     "email": info.get("email"), "nickname": info.get("nickname"),
-                    "quota": quota})
+                    "quota": quota, "quota_error": quota_error})
 
 
 # ==========================================================================
@@ -964,7 +1141,12 @@ def panel_login_trae_callback():
     from urllib.parse import urlparse, parse_qs, unquote
 
     data = request.get_json(silent=True) or {}
-    callback = (data.get("callback_url") or data.get("url") or "").strip()
+    raw_callback = data.get("callback_url") if "callback_url" in data else data.get("url", "")
+    if raw_callback is None:
+        raw_callback = ""
+    if not isinstance(raw_callback, str):
+        return jsonify({"ok": False, "error": "callback_url 必须是字符串"}), 400
+    callback = raw_callback.strip()
     if not callback:
         return jsonify({"ok": False, "error": "缺少 callback_url"}), 400
     try:
@@ -1020,10 +1202,13 @@ def panel_login_trae_callback():
     if not uid:
         return jsonify({"ok": False, "error": "无法获取 uid，token 可能已失效"}), 400
 
-    # machine/device 若前端传回则保存；否则由导入字段/默认值兜底
+    # machine/device 若前端传回则保存；回调未携带时保留已有账号元数据。
     machine_id = data.get("machine_id") or ""
     device_id = data.get("device_id") or ""
     exist = db.find_account_by_uid("trae", uid)
+    if exist:
+        machine_id = machine_id or exist["machine_id"] or ""
+        device_id = device_id or exist["device_id"] or ""
     fields = dict(
         access_token=token, refresh_token=refresh,
         expires_at=expires_at, domain="trae.cn",
@@ -1036,12 +1221,13 @@ def panel_login_trae_callback():
         aid = exist["id"]
     else:
         aid = db.add_account("trae", label=data.get("label") or "", **fields)
+    quota_error = ""
     try:
         proxy.refresh_quota(db.get_account(aid))
-    except Exception:
-        pass
+    except Exception as e:
+        quota_error = str(e)
     return jsonify({"ok": True, "account_id": aid, "uid": uid,
-                    "nickname": nickname})
+                    "nickname": nickname, "quota_error": quota_error})
 
 
 @app.route("/api/login/start", methods=["POST"])
@@ -1049,6 +1235,8 @@ def panel_login_trae_callback():
 def panel_login_start():
     data = request.get_json(silent=True) or {}
     platform = data.get("platform") or "workbuddy"
+    if platform not in P.PLATFORMS:
+        return jsonify({"ok": False, "error": "未知平台"}), 400
     try:
         info = P.start_login(platform)
     except Exception as e:
@@ -1065,6 +1253,9 @@ def panel_login_poll():
     pend = db.get_pending(state)
     if pend is None:
         return jsonify({"ok": False, "error": "state 不存在"}), 404
+    if pend["done"]:
+        return jsonify({"ok": False, "pending": False, "done": True,
+                        "msg": "登录流程已完成"})
     platform = pend["platform"]
 
     try:
@@ -1081,6 +1272,10 @@ def panel_login_poll():
     except Exception:
         info = {"uid": "", "email": "", "nickname": "",
                 "enterprise_id": "", "enterprise_name": ""}
+
+    if not info.get("uid"):
+        return jsonify({"ok": False, "pending": True,
+                        "error": "获取账号信息失败：上游未返回 uid，账号未入库"})
 
     exist = db.find_account_by_uid(platform, info.get("uid"))
     fields = dict(
@@ -1102,13 +1297,15 @@ def panel_login_poll():
         aid = db.add_account(platform, label=pend["label"] or "", **fields)
 
     db.finish_pending(state)
+    quota_error = ""
     try:
         proxy.refresh_quota(db.get_account(aid))
-    except Exception:
-        pass
+    except Exception as e:
+        quota_error = str(e)
 
     return jsonify({"ok": True, "account_id": aid,
-                    "email": info.get("email"), "nickname": info.get("nickname")})
+                    "email": info.get("email"), "nickname": info.get("nickname"),
+                    "quota_error": quota_error})
 
 
 # ==========================================================================
@@ -1125,15 +1322,23 @@ def panel_keys():
 @admin_required
 def panel_key_add():
     data = request.get_json(silent=True) or {}
-    key = db.add_api_key(data.get("name") or "未命名",
-                         (data.get("api_key") or "").strip() or None,
-                         data.get("platform") or "")
+    try:
+        platform = _string_field(data, "platform")
+        name = _string_field(data, "name", "未命名", strip=False) or "未命名"
+        requested_key = _string_field(data, "api_key") or None
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    if platform and platform not in P.PLATFORMS:
+        return jsonify({"ok": False, "error": "未知平台"}), 400
+    key = db.add_api_key(name[:100], requested_key, platform)
     return jsonify({"ok": True, "api_key": key})
 
 
 @app.route("/api/keys/<int:kid>", methods=["DELETE"])
 @admin_required
 def panel_key_delete(kid):
+    if db.get_api_key_by_id(kid) is None:
+        return jsonify({"ok": False, "error": "API Key 不存在"}), 404
     db.delete_api_key(kid)
     return jsonify({"ok": True})
 
@@ -1141,9 +1346,11 @@ def panel_key_delete(kid):
 @app.route("/api/keys/<int:kid>", methods=["PATCH"])
 @admin_required
 def panel_key_patch(kid):
+    if db.get_api_key_by_id(kid) is None:
+        return jsonify({"ok": False, "error": "API Key 不存在"}), 404
     data = request.get_json(silent=True) or {}
     if "enabled" in data:
-        db.toggle_api_key(kid, int(bool(data["enabled"])))
+        db.toggle_api_key(kid, 1 if _as_bool(data["enabled"]) else 0)
     return jsonify({"ok": True})
 
 
@@ -1151,20 +1358,97 @@ def panel_key_patch(kid):
 # 控制面板 - 设置 / 日志
 # ==========================================================================
 
+def _normalize_setting_value(key: str, value):
+    """校验并归一化设置，避免坏值在实际请求线程才触发 500。"""
+    binary = {"auto_refresh", "allow_model_passthrough", "auto_checkin",
+              "public_join_enabled"}
+    if key in binary:
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        text = str(value).strip().lower()
+        if text not in {"0", "1", "true", "false", "yes", "no", "on", "off"}:
+            raise ValueError("%s 必须是 0/1" % key)
+        return "1" if text in {"1", "true", "yes", "on"} else "0"
+    if key == "strategy":
+        text = str(value or "").strip()
+        if text not in {"least_used", "round_robin", "random"}:
+            raise ValueError("strategy 必须是 least_used、round_robin 或 random")
+        return text
+    if key == "refresh_ahead":
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("refresh_ahead 必须是整数")
+        if n < 0 or n > 7 * 24 * 3600:
+            raise ValueError("refresh_ahead 范围必须是 0 到 604800 秒")
+        return str(n)
+    if key == "log_retention":
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            raise ValueError("log_retention 必须是整数")
+        if n < 0 or n > 1_000_000:
+            raise ValueError("log_retention 范围必须是 0 到 1000000")
+        return str(n)
+    if key == "credit_threshold":
+        try:
+            n = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("credit_threshold 必须是数字")
+        if not math.isfinite(n) or n < 0:
+            raise ValueError("credit_threshold 必须是非负数字")
+        return str(value).strip()
+    if key == "checkin_time":
+        text = str(value or "").strip()
+        try:
+            hh, mm = (int(x) for x in text.split(":", 1))
+        except (TypeError, ValueError):
+            raise ValueError("checkin_time 必须是 HH:MM")
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise ValueError("checkin_time 必须是 HH:MM")
+        return "%02d:%02d" % (hh, mm)
+    if key == "model_route_priority":
+        return json.dumps(proxy.normalize_route_priority(value),
+                          ensure_ascii=False, separators=(",", ":"))
+    if key == "model_platform_disabled":
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value or "{}")
+            except Exception as e:
+                raise ValueError("model_platform_disabled JSON 解析失败: %s" % e)
+            if not isinstance(parsed, dict):
+                raise ValueError("model_platform_disabled 必须是 JSON 对象")
+            value = parsed
+        elif not isinstance(value, dict):
+            raise ValueError("model_platform_disabled 必须是 JSON 对象")
+        return json.dumps(proxy.normalize_model_disabled_map(value),
+                          ensure_ascii=False, separators=(",", ":"))
+    return "" if value is None else str(value)
+
+
 @app.route("/api/settings", methods=["GET", "POST"])
 @admin_required
 def panel_settings():
     if request.method == "GET":
         return jsonify(public_settings())
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "请求体必须是 JSON 对象"}), 400
     allowed = ("default_model", "strategy", "auto_refresh", "refresh_ahead",
                "model_base_override", "allow_model_passthrough",
                "log_retention", "system_prompt", "auto_checkin", "checkin_time",
                "credit_threshold", "free_models", "public_join_enabled",
                "model_route_priority", "model_platform_disabled")
+    pending = {}
     for k in allowed:
-        if k in data:
-            db.set_setting(k, data[k])
+        if k not in data:
+            continue
+        try:
+            pending[k] = _normalize_setting_value(k, data[k])
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+    for k, value in pending.items():
+        db.set_setting(k, value)
     return jsonify({"ok": True})
 
 
@@ -1215,7 +1499,7 @@ def panel_models_discover_progress():
     「刷新模型目录」同步只返回文本/音频模型；图像模型由后台线程探测，
     确认后实时写入注册表。前端定时轮询本接口即可把生图模型逐步展示出来。
     """
-    registry = db.get_model_registry()
+    registry = proxy.normalize_model_registry(db.get_model_registry())
     platforms_out = []
     for p in P.PLATFORMS.values():
         key = p["key"]
@@ -1239,7 +1523,11 @@ def panel_models_discover_progress():
 @app.route("/api/logs")
 @admin_required
 def panel_logs():
-    limit = min(int(request.args.get("limit", 100)), 500)
+    try:
+        limit = int(request.args.get("limit", 100))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "limit 必须是整数"}), 400
+    limit = max(1, min(limit, 500))
     return jsonify([dict(r) for r in db.list_logs(limit)])
 
 
@@ -1256,7 +1544,7 @@ def panel_test():
     """面板内一键连通性测试（走完整反代链路，非流式聚合）。"""
     data = request.get_json(silent=True) or {}
     platform = data.get("platform") or None
-    model = data.get("model") or db.get_setting("default_model", "hy3")
+    model = data.get("model") or proxy.default_model(platform)
     prompt = data.get("prompt") or "用一句话介绍你自己"
     body = {"model": model, "messages": [{"role": "user", "content": prompt}]}
     t0 = time.time()
@@ -1310,8 +1598,14 @@ def web_assets(fn):
 
 
 @app.route("/health")
+@app.route("/api/health")
 def health():
     return jsonify({"ok": True, "service": "agent2api", "ts": int(time.time())})
+
+
+@app.route("/favicon.ico")
+def favicon():
+    return ("", 204)
 
 
 @app.route("/<path:p>")
@@ -1357,7 +1651,7 @@ def main():
     ap = argparse.ArgumentParser(description="Agent2API - 三平台模型反代与号池面板")
     ap.add_argument("--host", default=os.environ.get("AGENT2API_HOST") or os.environ.get("HY3API_HOST", "0.0.0.0"))
     ap.add_argument("--port", type=int,
-                    default=int(os.environ.get("AGENT2API_PORT") or os.environ.get("HY3API_PORT", "8787")))
+                    default=int(os.environ.get("AGENT2API_PORT") or os.environ.get("HY3API_PORT", "8530")))
     ap.add_argument("--threads", type=int,
                     default=int(os.environ.get("AGENT2API_THREADS") or os.environ.get("HY3API_THREADS", "16")))
     ap.add_argument("--debug", action="store_true")

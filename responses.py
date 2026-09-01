@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-hy3api - OpenAI Responses API 翻译层
+Agent2API - OpenAI Responses API 翻译层
 
 上游（WorkBuddy / CodeBuddy）只暴露 /v1/chat/completions，且只支持流式。
 本模块把 OpenAI Responses API（/v1/responses）翻译成 chat/completions：
@@ -359,6 +359,18 @@ def chat_to_response(chat: dict, response_id: str | None = None,
 # 输出：流式（上游 chat SSE → Responses SSE）
 # --------------------------------------------------------------------------
 
+def _chat_sse_lines(resp, model: str):
+    """统一上游 SSE：Trae SOLO 先转成 OpenAI chat chunk，其它渠道原样读取。"""
+    if getattr(resp, "_hy3_platform", "") == "trae":
+        for chunk in proxy._trae_openai_sse_events(resp, model):
+            if isinstance(chunk, bytes):
+                chunk = chunk.decode("utf-8", errors="replace")
+            for line in str(chunk).splitlines():
+                yield line
+        return
+    yield from proxy._sse_lines(resp)
+
+
 def stream_chat_to_responses(resp, model: str, response_id: str | None = None,
                              instructions=None):
     """生成器：读取上游 chat 流式响应，逐块 yield Responses SSE 字节。"""
@@ -414,7 +426,7 @@ def stream_chat_to_responses(resp, model: str, response_id: str | None = None,
     saw_content = False
     saw_tool = False
 
-    for line in proxy._sse_lines(resp):
+    for line in _chat_sse_lines(resp, model):
         if not line or not line.startswith("data:"):
             continue
         chunk = line[5:].strip()
@@ -427,6 +439,9 @@ def stream_chat_to_responses(resp, model: str, response_id: str | None = None,
 
         if j.get("usage"):
             usage = j["usage"]
+        err = proxy._sse_business_error(j)
+        if err:
+            raise proxy.ProxyError("上游业务错误: %s" % err, status=502)
         if not j.get("choices"):
             continue
         ch = j["choices"][0]
