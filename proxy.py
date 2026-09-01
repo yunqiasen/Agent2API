@@ -120,6 +120,10 @@ def refresh_quota(account_row) -> dict:
                         enterprise_id=acc.get("enterprise_id") or None,
                         domain=acc.get("domain") or None,
                         device_id=acc.get("device_id") or None)
+    if s.get("errors"):
+        # 拉取失败时保留上一份成功数据，避免把额度覆盖为 0 后仍显示“正常”。
+        raise ProxyError("额度刷新失败：%s" % "; ".join(str(x) for x in s["errors"]),
+                         status=502)
     db.save_quota(acc["id"], s)
     return s
 
@@ -182,7 +186,9 @@ def _persist_checkin_status(acc: dict, st: dict) -> None:
     db.update_account(
         acc["id"],
         checkin_today=1 if checked else 0,
-        checkin_streak=int(st.get("streak_days") or 0),
+        # -1 表示上游未提供连签字段；前端隐藏，不伪造“连续 0 天”。
+        checkin_streak=(-1 if st.get("streak_days") is None
+                        else int(st.get("streak_days") or 0)),
         checkin_last_date=(st.get("last_checkin_date")
                            or (today if checked else "")),
         checkin_credit=int(st.get("today_credit") or 0),

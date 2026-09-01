@@ -627,7 +627,9 @@ def _acc_public(row) -> dict:
     d["supports_checkin"] = P.supports_checkin(d.get("platform"))
     # checkin_today 是持久化字段，跨天后必须按日期归零，避免页面假显示“已签到”。
     d["checkin_today"] = 1 if proxy.checkin_marked_today(d) else 0
-    d["checkin_streak"] = int(d.get("checkin_streak") or 0)
+    raw_streak = int(d.get("checkin_streak") if d.get("checkin_streak") is not None else -1)
+    d["checkin_streak_known"] = raw_streak >= 0
+    d["checkin_streak"] = max(0, raw_streak)
     d["checkin_last_date"] = d.get("checkin_last_date") or ""
     d["checkin_credit"] = int(d.get("checkin_credit") or 0)
     d["checkin_updated_at"] = int(d.get("checkin_updated_at") or 0)

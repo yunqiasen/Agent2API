@@ -56,22 +56,23 @@ import {
 
 function QuotaCell({ a }: { a: Account }) {
   const t = a.quota_total || 0;
+  const u = a.quota_used || 0;
   const r = a.quota_remain || 0;
-  if (!t) return <span className="text-xs text-muted-foreground">未获取</span>;
+  if (!t) return <span className="text-xs text-muted-foreground">额度尚未同步</span>;
   const pct = Math.max(0, Math.min(100, (r / t) * 100));
   const tone: Tone = pct < 10 ? "rose" : pct < 30 ? "amber" : "emerald";
   return (
     <div className="space-y-1.5">
       <div className="flex items-center justify-between text-xs">
-        <span className="text-muted-foreground">额度</span>
+        <span className="text-muted-foreground">可用 / 总额</span>
         <span className="font-mono tabular-nums">
           {num(r)} / {num(t)} {a.quota_unit || ""}
         </span>
       </div>
       <Progress value={r} max={t} tone={tone} />
-      <div className="text-[11px] text-muted-foreground">
-        {(a.quota_packages?.length || 0) > 0 ? `${a.quota_packages!.length} 个套餐 · ` : ""}
-        {ago(a.quota_updated_at)}
+      <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+        <span>已消耗 {num(u)} · {a.quota_packages?.length || 0} 个上游套餐</span>
+        <span>同步于 {ago(a.quota_updated_at)}</span>
       </div>
     </div>
   );
@@ -79,7 +80,7 @@ function QuotaCell({ a }: { a: Account }) {
 
 function StatusBadge({ a }: { a: Account }) {
   if (a.status === "active")
-    return <Chip tone="emerald">正常</Chip>;
+    return <Chip tone="emerald">已接入</Chip>;
   if (a.status === "banned")
     return <Chip tone="rose">封禁</Chip>;
   return <Chip tone="slate">{a.status}</Chip>;
@@ -88,10 +89,10 @@ function StatusBadge({ a }: { a: Account }) {
 function TokenBadge({ a }: { a: Account }) {
   const exp = a.expires_at_sec || 0;
   const now = Math.floor(Date.now() / 1000);
-  if (!exp) return <Chip tone="slate">无有效期</Chip>;
+  if (!exp) return <Chip tone="slate">有效期未知</Chip>;
   if (exp <= now) return <Chip tone="rose">已过期</Chip>;
   if (exp - now < 900) return <Chip tone="amber">即将过期</Chip>;
-  return <Chip tone="emerald">有效</Chip>;
+  return <Chip tone="emerald">未过期</Chip>;
 }
 
 function CheckinBadge({ a }: { a: Account }) {
@@ -100,7 +101,9 @@ function CheckinBadge({ a }: { a: Account }) {
     return (
       <span className="inline-flex items-center gap-1">
         <Chip tone="emerald">已签到</Chip>
-        <span className="text-[11px] text-muted-foreground">连续 {a.checkin_streak || 0} 天</span>
+        {a.checkin_streak_known ? (
+          <span className="text-[11px] text-muted-foreground">连续 {a.checkin_streak || 0} 天</span>
+        ) : null}
       </span>
     );
   return (
@@ -679,8 +682,12 @@ export function Accounts() {
                 </div>
 
                 <div className="mt-3">
-                  <div className="truncate text-sm font-medium">{a.email || a.nickname || a.label || "-"}</div>
-                  <div className="font-mono text-[11px] text-muted-foreground">{(a.uid || "").slice(0, 22)}</div>
+                  <div className="truncate text-sm font-medium" title="凭证导入时记录的账号名称">
+                    {a.email || a.nickname || a.label || "-"}
+                  </div>
+                  <div className="font-mono text-[11px] text-muted-foreground" title="凭证中的账号 UID">
+                    UID {(a.uid || "").slice(0, 22)}
+                  </div>
                 </div>
 
                 <div className="my-3 h-px bg-border" />
@@ -691,7 +698,7 @@ export function Accounts() {
                     <span className="text-muted-foreground">令牌</span>
                     <span className="flex items-center gap-1.5">
                       <TokenBadge a={a} />
-                      <span className="font-mono text-[11px] text-muted-foreground">{a.has_refresh ? "有刷新" : "无刷新"}</span>
+                      <span className="font-mono text-[11px] text-muted-foreground">{a.has_refresh ? "有刷新凭证" : "无刷新凭证"}</span>
                     </span>
                   </div>
                   <div className="flex items-center justify-between text-xs">
@@ -699,7 +706,7 @@ export function Accounts() {
                     <CheckinBadge a={a} />
                   </div>
                   <div className="flex items-center justify-between text-xs">
-                    <span className="text-muted-foreground">调用</span>
+                    <span className="text-muted-foreground">本站调用</span>
                     <span className="tabular-nums">
                       {a.req_count || 0} 次 · 失败 {a.fail_count || 0} · {ago(a.last_used)}
                     </span>

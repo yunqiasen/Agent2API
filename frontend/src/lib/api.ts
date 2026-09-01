@@ -123,6 +123,7 @@ export interface Account {
   label?: string;
   uid?: string;
   quota_total?: number;
+  quota_used?: number;
   quota_remain?: number;
   quota_unit?: string;
   quota_packages?: any[];
@@ -132,6 +133,7 @@ export interface Account {
   supports_checkin?: boolean;
   checkin_today?: number;
   checkin_streak?: number;
+  checkin_streak_known?: boolean;
   checkin_last_date?: string;
   checkin_credit?: number;
   status?: string;

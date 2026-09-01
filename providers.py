@@ -494,9 +494,7 @@ def collect_quota(platform_key, access_token, uid=None, enterprise_id=None,
     """一次性抓取额度并汇总；Trae 走独立积分接口。"""
     if _is_trae(platform_key):
         try:
-            remain = trae.fetch_credit(access_token, device_id=device_id)
-            return {"plan_type": "", "total": remain, "used": 0, "remain": remain,
-                    "unit": "credits", "packages": [], "errors": [], "raw": {}}
+            return trae.fetch_quota(access_token, device_id=device_id)
         except Exception as e:
             return {"plan_type": "", "total": 0, "used": 0, "remain": 0,
                     "unit": "credits", "packages": [], "errors": [str(e)], "raw": {}}

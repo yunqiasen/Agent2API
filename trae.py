@@ -352,16 +352,64 @@ class SSEAggregator:
 # 积分 / 签到
 # --------------------------------------------------------------------------
 
-def fetch_credit(access_token, device_id=None, timeout: int = DEFAULT_TIMEOUT) -> float:
-    """ide_user_ent_usage 聚合 credits_limit。"""
-    r = _session().post(UG_HOST + EP_ENT_USAGE, headers=ug_headers(access_token, device_id),
+def fetch_quota(access_token, device_id=None, timeout: int = DEFAULT_TIMEOUT) -> dict:
+    """读取 Trae 实时积分汇总与套餐。
+
+    真实口径来自 usage_summary：total_amount=总积分，consumed_amount=已消耗，
+    可用积分=total-consumed。套餐保留名称、额度、过期时间，供管理台展示。
+    """
+    r = _session().post(UG_HOST + EP_ENT_USAGE,
+                        headers=ug_headers(access_token, device_id),
                         json={}, timeout=timeout)
     if r.status_code >= 400:
         raise RuntimeError("积分 HTTP %s: %s" % (r.status_code, r.text[:200]))
     d = r.json() or {}
-    packs = d.get("user_entitlement_pack_list") or []
-    return float(sum(float(((p.get("entitlement_base_info") or {}).get("quota") or {}).get("credits_limit") or 0)
-                     for p in packs))
+    usage = d.get("usage_summary") or {}
+
+    def num(v):
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    total = num(usage.get("total_amount"))
+    used = num(usage.get("consumed_amount"))
+    # 旧响应缺 usage_summary 时，才回退套餐 credits_limit 汇总。
+    raw_packs = d.get("user_entitlement_pack_list") or []
+    if total <= 0 and raw_packs:
+        total = sum(num(((p.get("entitlement_base_info") or {}).get("quota") or {})
+                        .get("credits_limit")) for p in raw_packs)
+    remain = max(0.0, total - used)
+
+    packages = []
+    for p in raw_packs:
+        if not isinstance(p, dict):
+            continue
+        base = p.get("entitlement_base_info") or {}
+        quota = base.get("quota") or {}
+        packages.append({
+            "name": str(p.get("display_desc") or p.get("group_name") or "积分套餐"),
+            "group": str(p.get("group_name") or ""),
+            "credits": num(quota.get("credits_limit")),
+            "expire_at": int(p.get("expire_time") or base.get("end_time") or 0),
+            "status": int(p.get("status") or 0),
+            "entitlement_id": str(base.get("entitlement_id") or ""),
+        })
+    return {
+        "plan_type": "credits",
+        "total": total,
+        "used": used,
+        "remain": remain,
+        "unit": "credits",
+        "packages": packages,
+        "errors": [],
+        "raw": d,
+    }
+
+
+def fetch_credit(access_token, device_id=None, timeout: int = DEFAULT_TIMEOUT) -> float:
+    """兼容旧调用：返回实时可用积分。"""
+    return float(fetch_quota(access_token, device_id=device_id, timeout=timeout)["remain"])
 
 
 def fetch_checkin_status(access_token, device_id=None, timeout: int = DEFAULT_TIMEOUT) -> dict:
@@ -373,7 +421,9 @@ def fetch_checkin_status(access_token, device_id=None, timeout: int = DEFAULT_TI
     return {
         "supported": True,
         "today_checked_in": bool(d.get("checked_in")),
-        "streak_days": int(d.get("streak_days") or 0),
+        # 当前 Trae 响应通常不提供 streak_days；缺失必须保持未知，不能伪造 0 天。
+        "streak_days": (int(d["streak_days"])
+                        if d.get("streak_days") is not None else None),
         "daily_credit": float(d.get("daily_credit") or 0),
         "today_credit": float(d.get("credits") or 0),
         "claimable": (not bool(d.get("checked_in"))) and bool(d.get("enable")),
