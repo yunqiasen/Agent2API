@@ -115,16 +115,80 @@ def test_stale_checkin_flag_does_not_skip_new_day(isolated_db, monkeypatch):
     assert out["results"][0].get("skipped") is not True
 
 
-def test_current_day_checkin_flag_is_skipped(isolated_db, monkeypatch):
-    """今天刚签到的账号仍应跳过，避免重复领取。"""
+def test_current_day_local_flag_still_verifies_upstream(isolated_db, monkeypatch):
+    """今天本地已签也必须进入上游核验；由上游结果决定是否跳过。"""
     db = isolated_db
     aid = db.add_account("workbuddy", "w1", uid="u1")
     db.update_account(aid, checkin_today=1, checkin_last_date="2026-09-01",
                       checkin_updated_at=1788220800)
-    monkeypatch.setattr(proxy, "_today_str", lambda: "2026-09-01")
     monkeypatch.setattr(proxy.P, "supports_checkin", lambda p: True)
-    monkeypatch.setattr(proxy, "checkin_account",
-                        lambda row: (_ for _ in ()).throw(AssertionError("不应重复签到")))
+    called = []
+    monkeypatch.setattr(proxy, "checkin_account", lambda row: (
+        called.append(row["id"]) or {"skipped": True,
+                                      "reason": "上游确认今日已签到"}
+    ))
     out = proxy.checkin_all(platform="workbuddy")
-    assert out["results"] == [{"id": aid, "ok": True, "skipped": True,
-                               "reason": "今日已签到"}]
+    assert called == [aid]
+    assert out["results"] == [{"id": aid, "ok": True,
+                               "claimed_credit": 0, "streak_days": 0,
+                               "skipped": True, "reason": "上游确认今日已签到"}]
+
+
+def test_checkin_all_verifies_upstream_even_when_local_says_checked(isolated_db, monkeypatch):
+    """批量签到不得信任本地 checkin_today；每个账号必须进入上游状态核验链。"""
+    db = isolated_db
+    aid = db.add_account("trae", "t1", uid="u1")
+    db.update_account(aid, checkin_today=1, checkin_last_date="2026-09-01")
+    called = []
+    monkeypatch.setattr(proxy.P, "supports_checkin", lambda p: True)
+    monkeypatch.setattr(proxy, "checkin_account", lambda row: (
+        called.append(row["id"]) or {"claimed_credit": 200, "streak_days": 1}
+    ))
+    out = proxy.checkin_all(platform="trae")
+    assert called == [aid]
+    assert out["results"][0]["claimed_credit"] == 200
+
+
+def test_checkin_account_skips_only_after_upstream_confirms_today(isolated_db, monkeypatch):
+    """单号签到先查上游；上游确认已签才跳过，且回写本地状态。"""
+    db = isolated_db
+    aid = db.add_account("trae", "t1", uid="u1", device_id="bad-dev")
+    monkeypatch.setattr(proxy, "ensure_token", lambda row: dict(db.get_account(aid)))
+    monkeypatch.setattr(proxy.P, "supports_checkin", lambda p: True)
+    monkeypatch.setattr(proxy.P, "fetch_checkin_status", lambda *a, **k: {
+        "supported": True, "today_checked_in": True, "today_credit": 200,
+        "streak_days": 4, "last_checkin_date": "2026-09-01",
+    })
+    monkeypatch.setattr(proxy.P, "do_checkin",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("已签不应重复领取")))
+    monkeypatch.setattr(proxy, "refresh_quota", lambda row: 0)
+    res = proxy.checkin_account(db.get_account(aid))
+    assert res["skipped"] is True
+    assert res["reason"] == "上游确认今日已签到"
+    row = db.get_account(aid)
+    assert row["checkin_today"] == 1
+    assert row["checkin_credit"] == 200
+
+
+def test_checkin_account_claims_when_upstream_says_not_checked(isolated_db, monkeypatch):
+    """即使本地标记已签，只要上游说未签，单号签到必须真正领取。"""
+    db = isolated_db
+    aid = db.add_account("trae", "t1", uid="u1")
+    db.update_account(aid, checkin_today=1, checkin_last_date="2026-09-01")
+    monkeypatch.setattr(proxy, "ensure_token", lambda row: dict(db.get_account(aid)))
+    monkeypatch.setattr(proxy.P, "supports_checkin", lambda p: True)
+    statuses = iter([
+        {"today_checked_in": False, "today_credit": 200, "streak_days": 0},
+        {"today_checked_in": True, "today_credit": 200, "streak_days": 1,
+         "last_checkin_date": "2026-09-01"},
+    ])
+    monkeypatch.setattr(proxy.P, "fetch_checkin_status", lambda *a, **k: next(statuses))
+    claimed = []
+    monkeypatch.setattr(proxy.P, "do_checkin", lambda *a, **k: (
+        claimed.append(True) or {"claimed_credit": 200, "streak_days": 1}
+    ))
+    monkeypatch.setattr(proxy, "refresh_quota", lambda row: 0)
+    res = proxy.checkin_account(db.get_account(aid))
+    assert claimed == [True]
+    assert res["claimed_credit"] == 200
+    assert db.get_account(aid)["checkin_today"] == 1

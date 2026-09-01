@@ -718,8 +718,13 @@ def panel_account_checkin(aid):
         return jsonify({"ok": False, "error": "该平台不支持签到"}), 400
     try:
         res = proxy.checkin_account(db.get_account(aid))
+        app.logger.warning("checkin account_id=%s platform=%s skipped=%s credit=%s",
+                        aid, row["platform"], bool(res.get("skipped")),
+                        res.get("claimed_credit", 0))
         return jsonify({"ok": True, **res})
     except Exception as e:
+        app.logger.error("checkin account_id=%s platform=%s failed: %s",
+                         aid, row["platform"], e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -759,8 +764,15 @@ def panel_checkin_all():
         return jsonify({"ok": False, "error": "未知平台"}), 400
     try:
         d = proxy.checkin_all(silent=False, platform=platform or None)
+        ok_count = sum(1 for x in d.get("results", []) if x.get("ok") and not x.get("skipped"))
+        skip_count = sum(1 for x in d.get("results", []) if x.get("skipped"))
+        fail_count = sum(1 for x in d.get("results", []) if not x.get("ok"))
+        app.logger.warning("checkin_all platform=%s success=%s skipped=%s failed=%s results=%s",
+                        platform or "all", ok_count, skip_count, fail_count,
+                        d.get("results", []))
         return jsonify(d)
     except Exception as e:
+        app.logger.error("checkin_all platform=%s failed: %s", platform or "all", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 

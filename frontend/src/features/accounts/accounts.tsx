@@ -535,9 +535,14 @@ export function Accounts() {
   async function checkin(id: number) {
     toast("签到中…");
     try {
-      const d = await apiPost<{ ok: boolean; claimed_credit?: number; error?: string }>(`/api/accounts/${id}/checkin`, {});
-      if (d.ok) toast.success(d.claimed_credit ? `已签到，获得 ${d.claimed_credit} 积分` : "已签到");
-      else toast.error("签到失败：" + (d.error || ""));
+      const d = await apiPost<{
+        ok: boolean; claimed_credit?: number; skipped?: boolean;
+        reason?: string; error?: string;
+      }>(`/api/accounts/${id}/checkin`, {});
+      if (d.ok) {
+        if (d.skipped) toast.success(d.reason || "上游确认今日已签到");
+        else toast.success(d.claimed_credit ? `签到成功，获得 ${d.claimed_credit} 积分` : "签到成功");
+      } else toast.error("签到失败：" + (d.error || ""));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "签到失败");
     }

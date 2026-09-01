@@ -175,53 +175,101 @@ def checkin_marked_today(acc) -> bool:
     return False
 
 
+def _persist_checkin_status(acc: dict, st: dict) -> None:
+    """把一次上游签到状态响应落库；所有签到入口共用，避免各自写出矛盾状态。"""
+    today = _today_str()
+    checked = bool(st.get("today_checked_in"))
+    db.update_account(
+        acc["id"],
+        checkin_today=1 if checked else 0,
+        checkin_streak=int(st.get("streak_days") or 0),
+        checkin_last_date=(st.get("last_checkin_date")
+                           or (today if checked else "")),
+        checkin_credit=int(st.get("today_credit") or 0),
+        checkin_updated_at=int(time.time()),
+    )
+
+
+def _upstream_checkin_status(acc: dict) -> dict:
+    """查询该账号上游签到真值并落库。"""
+    st = P.fetch_checkin_status(
+        acc["platform"], acc["access_token"],
+        uid=acc.get("uid") or None,
+        enterprise_id=acc.get("enterprise_id") or None,
+        domain=acc.get("domain") or None,
+        device_id=_checkin_device_id(acc),
+    )
+    _persist_checkin_status(acc, st)
+    return st
+
+
 def refresh_checkin_status(account_row) -> dict:
     """查询签到状态并落库。返回归一化状态字典。"""
     acc = ensure_token(account_row)
     if not P.supports_checkin(acc["platform"]):
         return {"supported": False, "today_checked_in": False,
                 "streak_days": 0, "claimable": False}
-    st = P.fetch_checkin_status(acc["platform"], acc["access_token"],
-                                uid=acc.get("uid") or None,
-                                enterprise_id=acc.get("enterprise_id") or None,
-                                domain=acc.get("domain") or None,
-                                device_id=_checkin_device_id(acc))
-    today = _dt.datetime.now().strftime("%Y-%m-%d")
-    db.update_account(acc["id"],
-                      checkin_today=1 if st.get("today_checked_in") else 0,
-                      checkin_streak=int(st.get("streak_days") or 0),
-                      checkin_last_date=st.get("last_checkin_date")
-                                        or (today if st.get("today_checked_in") else ""),
-                      checkin_credit=int(st.get("today_credit") or 0),
-                      checkin_updated_at=int(time.time()))
-    return st
+    return _upstream_checkin_status(acc)
 
 
 def checkin_account(account_row) -> dict:
-    """手动领取今日签到积分。领取后刷新状态确保字段与上游一致。"""
+    """核验上游状态后领取；单号、批量、自动签到统一走这条链。
+
+    不信任本地 checkin_today：每次先查上游。上游已签才跳过；上游未签则
+    真正调用 claim，再回读状态与余额。状态查询偶发失败时仍尝试 claim。
+    """
     acc = ensure_token(account_row)
     if not P.supports_checkin(acc["platform"]):
         raise ProxyError("该平台不支持签到", status=400)
-    res = P.do_checkin(acc["platform"], acc["access_token"],
-                       uid=acc.get("uid") or None,
-                       enterprise_id=acc.get("enterprise_id") or None,
-                       domain=acc.get("domain") or None,
-                       device_id=_checkin_device_id(acc))
-    # 领取成功后刷新额度：Trae 签到直接加 credits，立即回读号池余额
+
+    try:
+        before = _upstream_checkin_status(acc)
+    except Exception:
+        before = None
+
+    if before and before.get("today_checked_in"):
+        try:
+            refresh_quota(db.get_account(acc["id"]))
+        except Exception:
+            pass
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "上游确认今日已签到",
+            "claimed_credit": 0,
+            "today_checked_in": True,
+            "streak_days": int(before.get("streak_days") or 0),
+            "today_credit": float(before.get("today_credit") or 0),
+        }
+
+    res = P.do_checkin(
+        acc["platform"], acc["access_token"],
+        uid=acc.get("uid") or None,
+        enterprise_id=acc.get("enterprise_id") or None,
+        domain=acc.get("domain") or None,
+        device_id=_checkin_device_id(acc),
+    )
+
     try:
         refresh_quota(db.get_account(acc["id"]))
     except Exception:
         pass
-    # 领取成功后用状态接口回写 today/streak/last_date，保证与上游一致
+
     try:
-        refresh_checkin_status(db.get_account(acc["id"]))
+        after = _upstream_checkin_status(acc)
+        # 部分 Trae claim 响应 claimed_credit=0，但状态接口明确显示今日 +200。
+        if not float(res.get("claimed_credit") or 0):
+            res["claimed_credit"] = float(after.get("today_credit") or 0)
+        res["today_checked_in"] = bool(after.get("today_checked_in"))
+        res["streak_days"] = int(after.get("streak_days") or res.get("streak_days") or 0)
     except Exception:
-        # 领取本身已成功，回写失败不影响结果，直接兜底标记今日已签到
-        db.update_account(acc["id"],
-                          checkin_today=1,
-                          checkin_streak=int(res.get("streak_days") or 0),
-                          checkin_last_date=_dt.datetime.now().strftime("%Y-%m-%d"),
-                          checkin_updated_at=int(time.time()))
+        db.update_account(
+            acc["id"], checkin_today=1,
+            checkin_streak=int(res.get("streak_days") or 0),
+            checkin_last_date=_today_str(),
+            checkin_credit=int(res.get("claimed_credit") or 0),
+            checkin_updated_at=int(time.time()),
+        )
     return res
 
 
@@ -237,15 +285,15 @@ def checkin_all(silent: bool = False, platform: str | None = None) -> dict:
             continue
         if not P.supports_checkin(a["platform"]):
             continue
-        if checkin_marked_today(a):
-            results.append({"id": a["id"], "ok": True,
-                            "skipped": True, "reason": "今日已签到"})
-            continue
         try:
             res = checkin_account(db.get_account(a["id"]))
-            results.append({"id": a["id"], "ok": True,
-                            "claimed_credit": res.get("claimed_credit", 0),
-                            "streak_days": res.get("streak_days", 0)})
+            item = {"id": a["id"], "ok": True,
+                    "claimed_credit": res.get("claimed_credit", 0),
+                    "streak_days": res.get("streak_days", 0)}
+            if res.get("skipped"):
+                item["skipped"] = True
+                item["reason"] = res.get("reason") or "上游确认今日已签到"
+            results.append(item)
         except Exception as e:
             results.append({"id": a["id"], "ok": False, "error": str(e)})
     return {"ok": True, "results": results}
