@@ -144,6 +144,37 @@ def _checkin_device_id(acc):
     return g("device_id") or None
 
 
+def _today_str() -> str:
+    return _dt.datetime.now().strftime("%Y-%m-%d")
+
+
+def checkin_marked_today(acc) -> bool:
+    """判断本地签到标记是否属于今天，防止 checkin_today 跨日永久为 1。
+
+    上游部分平台的 last_checkin_date 偶尔滞后，因此同时接受：
+    - checkin_last_date == 今天；或
+    - 最近一次状态刷新 checkin_updated_at 发生在今天。
+    两者都不是今天时，旧的 checkin_today 必须视为 False。
+    """
+    def g(k, default=None):
+        if hasattr(acc, "keys") and k in acc.keys():
+            return acc[k]
+        return acc.get(k, default)
+
+    if not int(g("checkin_today", 0) or 0):
+        return False
+    today = _today_str()
+    if str(g("checkin_last_date", "") or "") == today:
+        return True
+    ts = int(g("checkin_updated_at", 0) or 0)
+    if ts:
+        try:
+            return _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d") == today
+        except Exception:
+            pass
+    return False
+
+
 def refresh_checkin_status(account_row) -> dict:
     """查询签到状态并落库。返回归一化状态字典。"""
     acc = ensure_token(account_row)
@@ -206,7 +237,7 @@ def checkin_all(silent: bool = False, platform: str | None = None) -> dict:
             continue
         if not P.supports_checkin(a["platform"]):
             continue
-        if a.get("checkin_today"):
+        if checkin_marked_today(a):
             results.append({"id": a["id"], "ok": True,
                             "skipped": True, "reason": "今日已签到"})
             continue
@@ -254,7 +285,7 @@ def retry_failed_checkins():
     db.set_setting("_last_checkin_retry_ts", str(int(now)))
     for row in db.list_accounts():
         a = dict(row)
-        if not a["enabled"] or a.get("checkin_today"):
+        if not a["enabled"] or checkin_marked_today(a):
             continue
         if not P.supports_checkin(a["platform"]):
             continue

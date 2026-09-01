@@ -553,9 +553,27 @@ export function Accounts() {
   async function checkinAll() {
     const scope = platformFilter === "all" ? "全部渠道" : platName(platformFilter);
     toast(`正在签到${scope}账号…`);
-    await apiPost("/api/accounts/checkin_all",
-      platformFilter === "all" ? {} : { platform: platformFilter });
-    toast.success(`签到完成（${scope}）`);
+    try {
+      const d = await apiPost<{
+        ok: boolean;
+        results: { id: number; ok: boolean; skipped?: boolean; reason?: string; error?: string }[];
+      }>("/api/accounts/checkin_all",
+        platformFilter === "all" ? {} : { platform: platformFilter });
+      const success = d.results.filter((x) => x.ok && !x.skipped).length;
+      const skipped = d.results.filter((x) => x.skipped).length;
+      const failed = d.results.filter((x) => !x.ok);
+      if (failed.length > 0) {
+        toast.error(
+          `签到结束（${scope}）：成功 ${success}，已签 ${skipped}，失败 ${failed.length}。` +
+          `首个错误：#${failed[0].id} ${failed[0].error || "未知错误"}`,
+          { duration: 10000 },
+        );
+      } else {
+        toast.success(`签到结束（${scope}）：成功 ${success}，已签跳过 ${skipped}`);
+      }
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "批量签到失败");
+    }
     load();
   }
 

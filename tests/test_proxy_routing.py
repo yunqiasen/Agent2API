@@ -94,3 +94,37 @@ def test_checkin_device_id_accepts_sqlite_row(isolated_db):
     aid = db.add_account("trae", "t1", uid="u-123", device_id="hex")
     row = db.get_account(aid)
     assert proxy._checkin_device_id(row) == "u-123"
+
+
+# ---------------- 签到跨日状态 ----------------
+
+def test_stale_checkin_flag_does_not_skip_new_day(isolated_db, monkeypatch):
+    """昨日 checkin_today=1 到今天必须失效，全部签到仍应命中该账号。"""
+    db = isolated_db
+    aid = db.add_account("workbuddy", "w1", uid="u1")
+    db.update_account(aid, checkin_today=1, checkin_last_date="2026-08-31",
+                      checkin_updated_at=1788134400)
+    called = []
+    monkeypatch.setattr(proxy, "_today_str", lambda: "2026-09-01")
+    monkeypatch.setattr(proxy.P, "supports_checkin", lambda p: True)
+    monkeypatch.setattr(proxy, "checkin_account",
+                        lambda row: called.append(row["id"]) or {"claimed_credit": 100})
+    out = proxy.checkin_all(platform="workbuddy")
+    assert called == [aid]
+    assert out["results"][0]["ok"] is True
+    assert out["results"][0].get("skipped") is not True
+
+
+def test_current_day_checkin_flag_is_skipped(isolated_db, monkeypatch):
+    """今天刚签到的账号仍应跳过，避免重复领取。"""
+    db = isolated_db
+    aid = db.add_account("workbuddy", "w1", uid="u1")
+    db.update_account(aid, checkin_today=1, checkin_last_date="2026-09-01",
+                      checkin_updated_at=1788220800)
+    monkeypatch.setattr(proxy, "_today_str", lambda: "2026-09-01")
+    monkeypatch.setattr(proxy.P, "supports_checkin", lambda p: True)
+    monkeypatch.setattr(proxy, "checkin_account",
+                        lambda row: (_ for _ in ()).throw(AssertionError("不应重复签到")))
+    out = proxy.checkin_all(platform="workbuddy")
+    assert out["results"] == [{"id": aid, "ok": True, "skipped": True,
+                               "reason": "今日已签到"}]

@@ -625,7 +625,8 @@ def _acc_public(row) -> dict:
     d.pop("quota_raw", None)
     d["expires_at_sec"] = proxy._norm_ts(d.get("expires_at"))
     d["supports_checkin"] = P.supports_checkin(d.get("platform"))
-    d["checkin_today"] = int(d.get("checkin_today") or 0)
+    # checkin_today 是持久化字段，跨天后必须按日期归零，避免页面假显示“已签到”。
+    d["checkin_today"] = 1 if proxy.checkin_marked_today(d) else 0
     d["checkin_streak"] = int(d.get("checkin_streak") or 0)
     d["checkin_last_date"] = d.get("checkin_last_date") or ""
     d["checkin_credit"] = int(d.get("checkin_credit") or 0)
