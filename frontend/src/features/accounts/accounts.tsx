@@ -598,12 +598,12 @@ export function Accounts() {
       const failed = d.results.filter((x) => !x.ok);
       if (failed.length > 0) {
         toast.error(
-          `签到结束（${scope}）：成功 ${success}，已签 ${skipped}，失败 ${failed.length}。` +
+          `签到结束（${scope}）：新签到 ${success}，已签跳过 ${skipped}，失败 ${failed.length}。` +
           `首个错误：#${failed[0].id} ${failed[0].error || "未知错误"}`,
           { duration: 10000 },
         );
       } else {
-        toast.success(`签到结束（${scope}）：成功 ${success}，已签跳过 ${skipped}`);
+        toast.success(`签到结束（${scope}）：新签到 ${success}，已签跳过 ${skipped}，失败 0`);
       }
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "批量签到失败");

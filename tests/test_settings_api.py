@@ -508,3 +508,10 @@ def test_models_page_loads_registry_without_auto_discovery():
     effect = source.split("useEffect(() => {", 1)[1].split("}, []);", 1)[0]
     assert "loadCurrent();" in effect
     assert "discover();" not in effect
+
+
+def test_checkin_summary_distinguishes_new_claims_from_skips():
+    """签到汇总要把“本次新签到”和“上游已签到跳过”分开显示，避免把 0 新签到误读为全失败。"""
+    from pathlib import Path
+    source = Path("frontend/src/features/accounts/accounts.tsx").read_text()
+    assert "新签到 ${success}" in source

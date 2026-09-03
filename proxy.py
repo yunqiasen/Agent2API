@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import logging
 import math
 import re
 import threading
@@ -25,6 +26,32 @@ import trae
 _refresh_locks: dict[int, threading.Lock] = {}
 _checkin_locks: dict[int, threading.Lock] = {}
 _locks_guard = threading.Lock()
+
+_CHECKIN_LOG = logging.getLogger("agent2api.checkin")
+
+
+def _checkin_log(acc, stage: str, result: dict | None = None, error=None) -> None:
+    """记录逐账号签到链路，不记录 access/refresh token。"""
+    result = result if isinstance(result, dict) else {}
+    raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
+    code = raw.get("code", result.get("code", ""))
+    message = (result.get("msg") or raw.get("message") or raw.get("msg") or
+               raw.get("error_msg") or "")
+    message = str(message).replace("\n", " ")[:180]
+    fields = {
+        "account_id": acc.get("id"),
+        "platform": acc.get("platform"),
+        "stage": stage,
+        "checked": result.get("today_checked_in"),
+        "credit": result.get("today_credit", result.get("claimed_credit", "")),
+        "code": code,
+        "message": message,
+    }
+    if error is not None:
+        fields["error"] = str(error).replace("\n", " ")[:240]
+        _CHECKIN_LOG.error("checkin_trace %s", fields)
+    else:
+        _CHECKIN_LOG.warning("checkin_trace %s", fields)
 
 # 上游网络抖动时，在同一账号上的重试次数
 NET_RETRY = 2
@@ -227,13 +254,18 @@ def _persist_checkin_status(acc: dict, st: dict) -> None:
 
 def _upstream_checkin_status(acc: dict) -> dict:
     """查询该账号上游签到真值并落库。"""
-    st = P.fetch_checkin_status(
-        acc["platform"], acc["access_token"],
-        uid=acc.get("uid") or None,
-        enterprise_id=acc.get("enterprise_id") or None,
-        domain=acc.get("domain") or None,
-        device_id=_checkin_device_id(acc),
-    )
+    try:
+        st = P.fetch_checkin_status(
+            acc["platform"], acc["access_token"],
+            uid=acc.get("uid") or None,
+            enterprise_id=acc.get("enterprise_id") or None,
+            domain=acc.get("domain") or None,
+            device_id=_checkin_device_id(acc),
+        )
+    except Exception as e:
+        _checkin_log(acc, "status", error=e)
+        raise
+    _checkin_log(acc, "status", result=st)
     _persist_checkin_status(acc, st)
     return st
 
@@ -265,8 +297,9 @@ def _checkin_account_locked(acc: dict) -> dict:
 
     try:
         before = _upstream_checkin_status(acc)
-    except Exception:
-        before = None
+    except Exception as e:
+        # 状态查询失败时停止本次流程，避免跳过核验后把结果误报成成功。
+        raise ProxyError("签到状态查询失败：%s" % e, status=502)
 
     if before and before.get("today_checked_in"):
         try:
@@ -283,13 +316,18 @@ def _checkin_account_locked(acc: dict) -> dict:
             "today_credit": float(before.get("today_credit") or 0),
         }
 
-    res = P.do_checkin(
-        acc["platform"], acc["access_token"],
-        uid=acc.get("uid") or None,
-        enterprise_id=acc.get("enterprise_id") or None,
-        domain=acc.get("domain") or None,
-        device_id=_checkin_device_id(acc),
-    )
+    try:
+        res = P.do_checkin(
+            acc["platform"], acc["access_token"],
+            uid=acc.get("uid") or None,
+            enterprise_id=acc.get("enterprise_id") or None,
+            domain=acc.get("domain") or None,
+            device_id=_checkin_device_id(acc),
+        )
+    except Exception as e:
+        _checkin_log(acc, "claim", error=e)
+        raise
+    _checkin_log(acc, "claim", result=res)
 
     try:
         refresh_quota(db.get_account(acc["id"]))
@@ -311,16 +349,11 @@ def _checkin_account_locked(acc: dict) -> dict:
             raise ProxyError("上游领取完成但未确认签到成功", status=502)
     except ProxyError:
         raise
-    except Exception:
-        if claim_checked is False:
-            raise ProxyError("上游领取完成但未确认签到成功", status=502)
-        db.update_account(
-            acc["id"], checkin_today=1,
-            checkin_streak=int(res.get("streak_days") or 0),
-            checkin_last_date=_today_str(),
-            checkin_credit=int(res.get("claimed_credit") or 0),
-            checkin_updated_at=int(time.time()),
-        )
+    except Exception as e:
+        _checkin_log(acc, "status_after_claim", error=e)
+        # 领取请求已经发出，但回读失败时保留本地旧状态，交给用户重试，
+        # 避免卡片出现“已签到”的假状态。
+        raise ProxyError("签到请求已发送，但状态回读失败：%s" % e, status=502)
     return res
 
 

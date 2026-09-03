@@ -954,6 +954,10 @@ def fetch_checkin_status(platform_key, access_token, uid=None, enterprise_id=Non
         dates = []
     today_checked_in = _as_bool(data.get("today_checked_in"))
     today_credit = _to_float(data.get("today_credit"))
+    # 官方接口当前按“最新日期 -> 最旧日期”返回，历史版本取 dates[-1]
+    # 会把卡片上的最近签到日期写成最旧的一天。
+    valid_dates = [str(v).strip() for v in dates if str(v).strip()]
+    latest_date = max(valid_dates) if valid_dates else ""
     return {
         "supported": True,
         "active": bool(data.get("active")),
@@ -964,7 +968,7 @@ def fetch_checkin_status(platform_key, access_token, uid=None, enterprise_id=Non
         "week_checkin_days": _to_float(data.get("week_checkin_days")),
         "total_credits": _to_float(data.get("total_credits")),
         "checkin_dates": dates,
-        "last_checkin_date": dates[-1] if dates else "",
+        "last_checkin_date": latest_date,
         "theme_name": str(data.get("theme_name") or ""),
         "season": data.get("season"),
         # 今日可领：有额度且尚未签到
