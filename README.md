@@ -5,6 +5,27 @@ WorkBuddy / TraeWork / CodeBuddy（国际）三平台 **hy3 模型反向代理 +
 
 > 接口契约以仓库内 `tests/` 的回归测试和当前容器实测为准；上游模型、额度与签到结果会随账号和服务端状态变化。
 
+## 上游参考与开源致谢
+
+本项目是在独立实现和重组的基础上，参考了以下开源项目的代码结构、协议分析与实现思路。这里明确列出来源，便于使用者追溯实现依据，也感谢原作者和贡献者。
+
+| 上游项目 | 地址 | Agent2API 参考内容 | 对应代码 |
+|---|---|---|---|
+| **ai-multi-platform-proxy** | [github.com/itamzxm/ai-multi-platform-proxy](https://github.com/itamzxm/ai-multi-platform-proxy) | TraeWork / Trae SOLO 的登录、Token 交换、请求头、请求体、SSE 解析、额度与签到接口适配 | [`trae.py`](trae.py) |
+| **cockpit-tools** | [github.com/jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools) | WorkBuddy / CodeBuddy 的 OAuth 流程、平台常量、账号信息、Token 刷新、额度和签到接口结构 | [`providers.py`](providers.py) |
+
+### 本项目在上游基础上的独立部分
+
+Agent2API 并不是上述项目的简单打包，而是围绕统一反代服务重新组织了以下能力：
+
+- WorkBuddy、TraeWork、CodeBuddy 国际三渠道号池；
+- 账号导入、Token 自动刷新、额度同步、签到和单账号测活；
+- 模型动态发现、渠道×模型开关、模型调用优先级；
+- OpenAI Chat Completions / Responses / Images 兼容接口；
+- 管理后台、调用鉴权、请求日志和 Docker 持久化部署。
+
+上游项目的版权、许可证和原有声明以各自仓库为准；如果继续分发包含上游参考或移植内容的版本，请同时保留对应项目的来源说明和许可证要求。
+
 ---
 
 ## 1. 快速开始
