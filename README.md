@@ -5,18 +5,29 @@ WorkBuddy / TraeWork / CodeBuddy（国际）三平台 **hy3 模型反向代理 +
 
 > 接口契约以仓库内 `tests/` 的回归测试和当前容器实测为准；上游模型、额度与签到结果会随账号和服务端状态变化。
 
-## 上游参考与开源致谢
+## 代码来源、协议参考与致谢
 
-本项目是在独立实现和重组的基础上，参考了以下开源项目的代码结构、协议分析与实现思路。这里明确列出来源，便于使用者追溯实现依据，也感谢原作者和贡献者。
+本项目基于 **DearLicy/hy3api** 二次开发。下面将直接代码上游、平台适配移植来源和协议参考分开列出，便于追溯实现依据。
 
-| 上游项目 | 地址 | Agent2API 参考内容 | 对应代码 |
+| 关系 | 项目 | Agent2API 参考内容 | 对应代码 |
 |---|---|---|---|
-| **ai-multi-platform-proxy** | [github.com/itamzxm/ai-multi-platform-proxy](https://github.com/itamzxm/ai-multi-platform-proxy) | TraeWork / Trae SOLO 的登录、Token 交换、请求头、请求体、SSE 解析、额度与签到接口适配 | [`trae.py`](trae.py) |
-| **cockpit-tools** | [github.com/jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools) | WorkBuddy / CodeBuddy 的 OAuth 流程、平台常量、账号信息、Token 刷新、额度和签到接口结构 | [`providers.py`](providers.py) |
+| **直接代码上游** | [DearLicy/hy3api](https://github.com/DearLicy/hy3api) | 最初的 Python 反代、号池、管理后台、模型发现与 Docker 部署基线 | `app.py`、`db.py`、`proxy.py`、`discovery.py`、`frontend/` |
+| **Trae 适配移植来源** | [itamzxm/ai-multi-platform-proxy](https://github.com/itamzxm/ai-multi-platform-proxy) | TraeWork / Trae SOLO 的登录、Token 交换、请求头、请求体、SSE 解析、额度与签到接口适配 | [`trae.py`](trae.py) |
+| **间接协议参考，非直接代码上游** | [jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools) | hy3api 原实现注明的 WorkBuddy / CodeBuddy OAuth、平台常量、账号信息、Token 刷新及额度接口参考 | [`providers.py`](providers.py) |
 
-### 本项目在上游基础上的独立部分
+**cockpit-tools 的定位**：Agent2API 不是从它 fork 的，它也不是本服务的运行依赖。
+[hy3api 最初提交的 providers.py](https://github.com/DearLicy/hy3api/blob/2d9784a2cd6ae7fb5cc587ecd2acdcaedc4bde2e/providers.py#L10)
+已经注明「流程与常量来自 cockpit-tools 源码」，这项来源说明由本项目继承，而非本次新增的依赖。
+其仓库确实包含 [WorkBuddy OAuth](https://github.com/jlcodes99/cockpit-tools/blob/cc4a3f4a1573143f8551fa27825aec443e2df09f/crates/cockpit-core/src/modules/workbuddy_oauth.rs)、
+[CodeBuddy OAuth](https://github.com/jlcodes99/cockpit-tools/blob/cc4a3f4a1573143f8551fa27825aec443e2df09f/crates/cockpit-core/src/modules/codebuddy_oauth.rs)
+和 [Trae OAuth](https://github.com/jlcodes99/cockpit-tools/blob/cc4a3f4a1573143f8551fa27825aec443e2df09f/src-tauri/src/modules/trae_oauth.rs) 模块；
+**本项目的 Trae 适配仍以 ai-multi-platform-proxy 为移植来源**，不因参考仓库也支持 Trae 而混同来源。
 
-Agent2API 并不是上述项目的简单打包，而是围绕统一反代服务重新组织了以下能力：
+最近一次代码上游、参考项目与三渠道模型目录核对：**2026-09-13**，详见 [更新核对报告与完整模型清单](docs/upstream-review-2026-09-13.md)。
+
+### 本项目的扩展与维护
+
+Agent2API 在原有服务上整合、扩展并维护以下能力：
 
 - WorkBuddy、TraeWork、CodeBuddy 国际三渠道号池；
 - 账号导入、Token 自动刷新、额度同步、签到和单账号测活；
@@ -24,7 +35,7 @@ Agent2API 并不是上述项目的简单打包，而是围绕统一反代服务�
 - OpenAI Chat Completions / Responses / Images 兼容接口；
 - 管理后台、调用鉴权、请求日志和 Docker 持久化部署。
 
-上游项目的版权、许可证和原有声明以各自仓库为准；如果继续分发包含上游参考或移植内容的版本，请同时保留对应项目的来源说明和许可证要求。
+上述来源项目的版权、许可证和原有声明以各自仓库为准；分发包含参考或移植内容的版本时，请保留对应项目的来源说明和许可证要求。
 
 ---
 
@@ -106,7 +117,7 @@ curl http://127.0.0.1:8530/v1/chat/completions \
    上游 SSE 流实时转写成 Responses 事件（或聚合成 `response` 对象返回非流式）。
    详见第 5 节。
 
-8. **程序不内置对外模型目录，模型列表来自官方 CLI 目录与运行时真实探测。** WorkBuddy / CodeBuddy 可读取 CLI 白名单，TraeWork 读取 `get_detail_param`；官方目录不可用或未覆盖的模型再用最小请求验证。探测逻辑集中在 `discovery.py`：
+8. **程序不内置对外模型目录，模型列表来自官方 CLI 目录与运行时真实探测。** WorkBuddy / CodeBuddy 合并控制台 `/console/enterprises/personal/models` 与 `/v3/config` 的 CLI 白名单（两者独立更新，任一失败仍保留另一来源），TraeWork 读取 `get_detail_param`；官方目录不可用或未覆盖的模型再用最小请求验证。探测逻辑集中在 `discovery.py`：
    - `PROBE_SEED` 只是一份「要尝试探测的候选 ID 清单」（文本/图像/音频都涵盖），**绝不是对外目录**；探测不到的候选会被自动丢弃，探测到的才进入注册表；
    - 每次「刷新模型目录」或首次部署启动，会合并各平台所有启用账号能读取到的官方 CLI 目录，再对候选做最小请求，把确认结果写入 **数据库注册表**（`db.get_model_registry()` / `discovered_models` 设置），并记录其 `type`（chat / image / audio）与可用 `platforms`；
    - 客户端请求一个注册表外的模型时，请求链路会触发 `live_probe_model` 实时探测回退，命中即写入注册表；探测不到则记入负面缓存并在限定 TTL 内直接返回 503，避免反复盲打上游；

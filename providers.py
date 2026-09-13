@@ -678,7 +678,7 @@ def config_url(platform_key: str, model_base: str | None = None) -> str:
 
 
 def _fetch_config_models(platform_key, access_token, timeout=20) -> list:
-    """读取 /v3/config 的 agents[cli].models（国际站可用）。"""
+    """读取 /v3/config 的 CLI 模型目录（国内、国际站各自返回）。"""
     p = get_platform(platform_key)
     headers = {
         "Authorization": "Bearer %s" % access_token,
@@ -706,13 +706,11 @@ def _fetch_config_models(platform_key, access_token, timeout=20) -> list:
 
 def fetch_upstream_models(platform_key, access_token, timeout=20, uid=None,
                            machine_id=None, device_id=None) -> list:
-    """读取上游官方模型目录（CLI agent 白名单）。
+    """合并控制台与运行时配置的官方 CLI 模型白名单。
 
-    实测（2026-08-29）：
-      - GET {model_base}/console/enterprises/personal/models 可用；
-      - data.agents[].name == "cli" 的 models 是 CLI 客户端可用模型白名单；
-      - data.models[] 只是模型元数据全集，包含非 CLI 可用项，不能直接当目录；
-      - www.codebuddy.ai 当前返回 500，保留探测回退即可。
+    两个接口独立更新：控制台成功也可能缺少 /v3/config 新增的模型。
+    仅收录 agents[cli].models，不把 data.models 元数据全集当作白名单；
+    任一接口失败仍保留另一个接口的结果。
     """
     p = get_platform(platform_key)
     if _is_trae(platform_key):
@@ -726,26 +724,22 @@ def fetch_upstream_models(platform_key, access_token, timeout=20, uid=None,
         "Referer": p["api_base"] + "/",
         "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2",
     }
+    ids = []
     try:
         r = _session().get(base + "/console/enterprises/personal/models",
                            headers=headers, timeout=timeout)
-        if r.status_code != 200:
-            # 国际站该路径当前 500；/v3/config 有同样的 agents[cli].models 目录
-            return _fetch_config_models(platform_key, access_token, timeout)
-        body = r.json() or {}
-        if not _ok(body):
-            return _fetch_config_models(platform_key, access_token, timeout)
-        data = body.get("data") or {}
-        agents = data.get("agents") or []
-        for agent in agents:
-            if agent.get("name") == "cli":
-                ids = agent.get("models") or []
-                return [str(x).strip() for x in ids if str(x).strip()]
-        return _fetch_config_models(platform_key, access_token, timeout)
+        if r.status_code == 200:
+            body = r.json() or {}
+            if _ok(body):
+                for agent in (body.get("data") or {}).get("agents") or []:
+                    if agent.get("name") == "cli":
+                        ids.extend(str(x).strip() for x in agent.get("models") or []
+                                   if str(x).strip())
     except Exception:
-        # requests 的 Retry 会把持续 500 抛成 RetryError，必须继续走配置接口，
-        # 否则 CodeBuddy 国际目录会退化成空列表。
-        return _fetch_config_models(platform_key, access_token, timeout)
+        # 国际站控制台持续 500 时 Retry 会抛异常；运行时目录仍应继续读取。
+        pass
+    ids.extend(_fetch_config_models(platform_key, access_token, timeout))
+    return list(dict.fromkeys(ids))
 
 
 def merge_upstream_model_ids(platform_key: str, ids) -> list:

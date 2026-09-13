@@ -162,3 +162,29 @@ def test_concurrent_catalog_and_image_registry_updates_do_not_lose_models(isolat
         t1.start(); t2.start(); t1.join(3); t2.join(3)
         assert not t1.is_alive() and not t2.is_alive()
         assert set(db.get_model_registry()) == {"chat-model", "image-model"}, i
+
+
+def test_catalog_refresh_preserves_model_switches_and_priority(isolated_db, monkeypatch):
+    """Fresh models use the default enabled state; saved switches and routes survive."""
+    import json
+    import discovery
+    import providers as P
+    import proxy
+
+    db = isolated_db
+    db.add_account("workbuddy", "tok", uid="test-user")
+    db.set_model_registry({"shared": {"type": "chat", "platforms": ["workbuddy"]}})
+    disabled = json.dumps({"workbuddy": ["shared"]})
+    priority = json.dumps({"default": ["trae", "workbuddy", "codebuddy"],
+                           "overrides": {"shared": ["codebuddy", "workbuddy", "trae"]}})
+    db.set_setting("model_platform_disabled", disabled)
+    db.set_setting("model_route_priority", priority)
+    monkeypatch.setattr(proxy, "ensure_token", lambda row: dict(row))
+    monkeypatch.setattr(P, "fetch_upstream_models", lambda *a, **kw: ["shared", "new-chat"])
+
+    discovery.sync_upstream_catalogs()
+
+    assert db.get_setting("model_platform_disabled") == disabled
+    assert db.get_setting("model_route_priority") == priority
+    assert "new-chat" in proxy.list_models()
+    assert "shared" not in proxy.list_models()

@@ -96,6 +96,60 @@ def test_fetch_upstream_models_falls_back_after_console_retry_error(monkeypatch)
     assert P.fetch_upstream_models("codebuddy", "tok") == ["glm-5.3"]
 
 
+def test_fetch_upstream_models_unions_console_and_config_catalogs(monkeypatch):
+    """One successful catalog must not hide models advertised by the other endpoint."""
+    import providers as P
+
+    class Resp:
+        status_code = 200
+
+        def __init__(self, ids):
+            self.ids = ids
+
+        def json(self):
+            return {"code": 0, "data": {
+                "agents": [{"name": "cli", "models": self.ids},
+                           {"name": "internal-agent", "models": ["internal-only"]}],
+                "models": [{"id": "metadata-only"}],
+            }}
+
+    class Session:
+        def get(self, url, **kwargs):
+            assert kwargs["headers"]["Authorization"] == "Bearer tok"
+            if url.endswith("/console/enterprises/personal/models"):
+                return Resp(["shared", "console-only"])
+            assert url.endswith("/v3/config")
+            return Resp(["shared", "config-only"])
+
+    monkeypatch.setattr(P, "_session", lambda: Session())
+    assert P.fetch_upstream_models("workbuddy", "tok") == [
+        "shared", "console-only", "config-only",
+    ]
+
+
+def test_fetch_upstream_models_keeps_console_models_when_config_fails(monkeypatch):
+    """A transient runtime-config failure must not erase the working console catalog."""
+    import requests
+    import providers as P
+
+    class Resp:
+        status_code = 200
+
+        def json(self):
+            return {"code": 0, "data": {"agents": [
+                {"name": "cli", "models": ["console-only"]},
+            ]}}
+
+    class Session:
+        def get(self, url, **kwargs):
+            if url.endswith("/v3/config"):
+                raise requests.exceptions.Timeout("config unavailable")
+            return Resp()
+
+    monkeypatch.setattr(P, "_session", lambda: Session())
+    assert P.fetch_upstream_models("workbuddy", "tok") == ["console-only"]
+
+
 def test_poll_token_makes_one_request_per_poll(monkeypatch):
     """登录轮询一次只发一个请求，避免重复消耗上游轮询配额。"""
     import providers as P
