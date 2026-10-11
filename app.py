@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Agent2API - 三平台模型反代 + 号池控制面板
+Agent2API - 四平台模型反代 + 号池控制面板
 
-平台支持: WorkBuddy / TraeWork / CodeBuddy(国际)
+平台支持: WorkBuddy / TraeWork / CodeBuddy(国际) / WorkBuddy(国际)
 对外接口: OpenAI 兼容 /v1/chat/completions, /v1/models
 控制面板: /  (默认管理员密码 admin, 默认 API Key Agent2API)
 
@@ -21,9 +21,12 @@ import queue
 import threading
 import time
 import uuid
+import weakref
 from datetime import timedelta
 
 import db
+import credentials
+import key_permissions
 import providers as P
 import proxy
 import discovery
@@ -184,6 +187,11 @@ def openai_error(msg, status=400, etype="invalid_request_error"):
     return jsonify({"error": {"message": msg, "type": etype, "code": status}}), status
 
 
+def _model_permission_error(key_row, model):
+    reason = key_permissions.denial(key_row, model)
+    return openai_error(reason, 403, "model_not_allowed") if reason else None
+
+
 @app.before_request
 def reject_non_object_json():
     """所有 JSON 写入口只接受对象，统一拦截数组/标量，避免视图层 data.get 500。"""
@@ -235,9 +243,8 @@ def api_models():
     if kr is None:
         return openai_error("无效的 API Key", 401, "invalid_api_key")
     now = int(time.time())
-    platform = (kr["platform"] or "").strip() or None
     data = [{"id": m, "object": "model", "created": now, "owned_by": "agent2api"}
-            for m in proxy.list_models(platform=platform)]
+            for m in key_permissions.visible_models(kr)]
     return jsonify({"object": "list", "data": data})
 
 
@@ -266,12 +273,18 @@ def api_chat():
 
     want_stream = _as_bool(body.get("stream"))
     platform = (kr["platform"] or "").strip() or None
+    permission_error = _model_permission_error(kr, body.get("model"))
+    if permission_error:
+        return permission_error
     model = body.get("model") or proxy.default_model(platform)
     if db.get_setting("allow_model_passthrough", "1") != "1":
         model = proxy.default_model(platform)
     if not model:
         return openai_error("暂无已探测可用的对话模型，请先刷新模型目录", 503,
                             "model_registry_empty")
+    permission_error = _model_permission_error(kr, model)
+    if permission_error:
+        return permission_error
     body["model"] = model
     prompt_chars = sum(len(str(m.get("content") or "")) for m in body["messages"])
     t0 = time.time()
@@ -414,6 +427,9 @@ def api_images():
     model = body.get("model") or ""
     if not model:
         return openai_error("缺少 model 字段")
+    permission_error = _model_permission_error(kr, model)
+    if permission_error:
+        return permission_error
     # 类型判定与平台路由由 proxy.generate_image 统一处理（注册表驱动 + 实时探测回退），
     # 这里不再做静态 is_image_model 预检，避免拦截尚未写入注册表的图像模型。
 
@@ -525,11 +541,17 @@ def api_responses():
     # 模型解析 + pass-through 门控（与 chat 一致）
     platform = (kr["platform"] or "").strip() or None
     model = body.get("model")
+    permission_error = _model_permission_error(kr, model)
+    if permission_error:
+        return permission_error
     if db.get_setting("allow_model_passthrough", "1") != "1":
         model = proxy.default_model(platform)
     if not model:
         return openai_error("暂无已探测可用的对话模型，请先刷新模型目录", 503,
                             "model_registry_empty")
+    permission_error = _model_permission_error(kr, model)
+    if permission_error:
+        return permission_error
     body["model"] = model
 
     # Responses input → chat messages
@@ -538,6 +560,9 @@ def api_responses():
     except ValueError as e:
         return openai_error(str(e), 400, "invalid_request_error")
 
+    permission_error = _model_permission_error(kr, chat_body.get("model"))
+    if permission_error:
+        return permission_error
     want_stream = _as_bool(body.get("stream"))
     # 日志用 prompt 字符数：instructions + 所有 input 文本
     prompt_chars = len(str(body.get("instructions") or "")) + \
@@ -715,7 +740,7 @@ def _acc_public(row) -> dict:
     except Exception:
         d["quota_packages"] = []
     d.pop("quota_raw", None)
-    d["expires_at_sec"] = proxy._norm_ts(d.get("expires_at"))
+    d["expires_at_sec"] = credentials.expiry(at, d.get("expires_at"))
     d["supports_checkin"] = P.supports_checkin(d.get("platform"))
     # checkin_today 是持久化字段，跨天后必须按日期归零，避免页面假显示“已签到”。
     d["checkin_today"] = 1 if proxy.checkin_marked_today(d) else 0
@@ -726,6 +751,9 @@ def _acc_public(row) -> dict:
     d["checkin_credit"] = int(d.get("checkin_credit") or 0)
     d["checkin_updated_at"] = int(d.get("checkin_updated_at") or 0)
     d["source"] = d.get("source") or ""
+    d["shared_quota"] = bool(d.get("uid") and d["platform"] in db.INTERNATIONAL_CHANNELS and any(
+        r["id"] != d["id"] and db.quota_identity(dict(r)) == db.quota_identity(d)
+        for r in db.list_accounts()))
     return d
 
 
@@ -864,10 +892,20 @@ def panel_account_probe(aid):
 @app.route("/api/platforms/<key>/models")
 @admin_required
 def panel_platform_models(key):
-    """轻量目录：注册表中该平台已探测确认的模型（卡片测活下拉用）。"""
+    """轻量目录：该渠道已登记模型（官方目录/探测；卡片测活下拉用）。"""
     if key not in P.PLATFORMS:
         return jsonify({"ok": False, "error": "未知平台"}), 404
     return jsonify({"ok": True, "models": P.catalog_entries(key)})
+
+
+@app.route("/api/accounts/<int:aid>/models/sync", methods=["POST"])
+@admin_required
+def panel_account_models_sync(aid):
+    row = db.get_account(aid)
+    if row is None:
+        return jsonify({"ok": False, "error": "账号不存在"}), 404
+    result = discovery.sync_account_catalog(row)
+    return jsonify({**result, "models": P.catalog_entries(row["platform"])})
 
 
 @app.route("/api/accounts/checkin_all", methods=["POST"])
@@ -976,6 +1014,7 @@ def panel_import_token():
 
     added, updated = 0, 0
     refresh_errors = []
+    model_sync_results = []
     for it in items:
         at = str(it.get("access_token") or it.get("accessToken") or "").strip()
         rt = it.get("refresh_token") or it.get("refreshToken") or ""
@@ -991,9 +1030,15 @@ def panel_import_token():
                 upstream_info = {}
             uid = str(upstream_info.get("uid") or "").strip()
         exist = db.find_account_by_uid(platform, uid) if uid else None
+        if exist and not rt and exist["refresh_token"]:
+            old_claims = credentials.claims(exist["access_token"])
+            new_claims = credentials.claims(at)
+            if any(old_claims.get(k) and new_claims.get(k) and old_claims[k] != new_claims[k]
+                   for k in ("sub", "iss", "sid", "session_state")):
+                return jsonify({"ok": False, "error": "凭证身份或登录会话已变化，请同时导入对应 refresh_token"}), 400
         fields = dict(
             access_token=at, refresh_token=rt,
-            expires_at=it.get("_expires_at", 0),
+            expires_at=credentials.expiry(at, it.get("_expires_at", 0)),
             domain=it.get("domain") or "", email=it.get("email") or upstream_info.get("email") or "",
             uid=uid, nickname=it.get("nickname") or upstream_info.get("nickname") or "",
             enterprise_id=(it.get("enterprise_id") or it.get("enterpriseId") or
@@ -1007,6 +1052,9 @@ def panel_import_token():
             # Token-only 重新导入时，缺省字段代表“未提供”，不要清空已有
             # Trae 设备/账号元数据；真正的 token 字段仍按本次输入更新。
             update_fields = dict(fields)
+            if not rt:
+                update_fields.pop("refresh_token", None)
+            update_fields.update(refresh_error="", refresh_failures=0, refresh_retry_at=0)
             for key in ("email", "uid", "nickname", "enterprise_id", "enterprise_name",
                         "domain", "machine_id", "device_id"):
                 if not update_fields.get(key):
@@ -1021,15 +1069,17 @@ def panel_import_token():
         if fields["refresh_token"] and not fields["expires_at"]:
             try:
                 proxy.ensure_token(db.get_account(aid), force=True)
-            except Exception:
-                pass
+            except Exception as e:
+                refresh_errors.append({"id": aid, "error": str(e), "stage": "token"})
         try:
             proxy.refresh_quota(db.get_account(aid))
         except Exception as e:
             refresh_errors.append({"id": aid, "error": str(e)})
 
+        model_sync_results.append(discovery.sync_account_catalog(db.get_account(aid)))
+
     return jsonify({"ok": True, "added": added, "updated": updated,
-                    "refresh_errors": refresh_errors})
+                    "refresh_errors": refresh_errors, "model_sync_results": model_sync_results})
 
 
 # ==========================================================================
@@ -1062,68 +1112,80 @@ def public_join_start():
                     "auth_url": info["auth_url"], "login_id": info.get("login_id")})
 
 
+# 同一个登录 state 串行交换/入库；弱引用锁在请求结束后回收。
+_login_locks = weakref.WeakValueDictionary()
+_login_guard = threading.Lock()
+_LOGIN_TTL = 300
+
+
+def _poll_account_login(public=False):
+    data = request.get_json(silent=True) or {}
+    try:
+        state = _string_field(data, "state")
+    except ValueError as e:
+        return jsonify({"ok": False, "pending": False, "error": str(e)}), 400
+    if not state:
+        return jsonify({"ok": False, "pending": False, "error": "缺少 state"}), 400
+    with _login_guard:
+        lock = _login_locks.setdefault(state, threading.Lock())
+    with lock:
+        pend = db.get_pending(state)
+        if pend is None:
+            return jsonify({"ok": False, "pending": False, "error": "state 不存在"}), 404
+        if pend["done"]:
+            return jsonify({"ok": False, "pending": False, "done": True,
+                            "msg": "接入流程已完成" if public else "登录流程已完成"})
+        if time.time() - pend["created_at"] >= _LOGIN_TTL:
+            return jsonify({"ok": False, "pending": False, "expired": True,
+                            "error": "授权链接已过期，请重新获取"})
+        platform = pend["platform"]
+        try:
+            tok = P.poll_token(platform, state)
+        except P.LoginError as e:
+            return jsonify({"ok": False, "pending": False, "error": str(e)})
+        except Exception as e:
+            return jsonify({"ok": False, "pending": True, "error": credentials.redact(e)})
+        if not tok:
+            return jsonify({"ok": False, "pending": True, "msg": "等待网页端完成授权"})
+        try:
+            info = P.fetch_account_info(platform, tok["access_token"], state=state, domain=tok.get("domain"))
+        except Exception as e:
+            return jsonify({"ok": False, "pending": False, "error": "读取账号资料失败: " +
+                            credentials.redact(e, tok.get("access_token"), tok.get("refresh_token"))})
+        if not info.get("uid"):
+            return jsonify({"ok": False, "pending": False,
+                            "error": "上游未返回 uid，账号未入库，请重新获取授权链接"})
+        fields = dict(access_token=tok["access_token"], refresh_token=tok.get("refresh_token") or "",
+                      expires_at=credentials.expiry(tok["access_token"], tok.get("expires_at")),
+                      domain=tok.get("domain") or "", token_type=tok.get("token_type") or "Bearer",
+                      email=info.get("email") or "", uid=info["uid"], nickname=info.get("nickname") or "",
+                      enterprise_id=info.get("enterprise_id") or "",
+                      enterprise_name=info.get("enterprise_name") or "", state=state)
+        exist = db.find_account_by_uid(platform, info["uid"])
+        if exist:
+            aid = exist["id"]
+            db.update_account(aid, status="active", status_reason="",
+                              refresh_error="", refresh_failures=0, refresh_retry_at=0, **fields)
+        else:
+            aid = db.add_account(platform, label=pend["label"] or ("用户贡献" if public else ""),
+                                 source="user_join" if public else "admin", **fields)
+        db.finish_pending(state)
+        quota, quota_error = None, ""
+        try:
+            quota = proxy.refresh_quota(db.get_account(aid))
+        except Exception as e:
+            quota_error = credentials.redact(e, tok["access_token"], tok.get("refresh_token"))
+        return jsonify({"ok": True, "account_id": aid,
+                        "email": info.get("email"), "nickname": info.get("nickname"),
+                        "quota": quota, "quota_error": quota_error,
+                        "model_sync": discovery.sync_account_catalog(db.get_account(aid))})
+
+
 @app.route("/api/join/poll", methods=["POST"])
 def public_join_poll():
     if db.get_setting("public_join_enabled", "1") != "1":
         return jsonify({"ok": False, "error": "公共接入已关闭"}), 403
-    data = request.get_json(silent=True) or {}
-    state = data.get("state") or ""
-    pend = db.get_pending(state)
-    if pend is None:
-        return jsonify({"ok": False, "pending": True, "error": "state 不存在"}), 404
-    if pend["done"]:
-        return jsonify({"ok": False, "pending": False, "done": True,
-                        "msg": "接入流程已完成"})
-
-    try:
-        tok = P.poll_token(pend["platform"], state)
-    except Exception as e:
-        return jsonify({"ok": False, "pending": True, "error": str(e)})
-
-    if not tok:
-        return jsonify({"ok": False, "pending": True, "msg": "等待网页端完成授权"})
-
-    try:
-        info = P.fetch_account_info(pend["platform"], tok["access_token"], state=state,
-                                    domain=tok.get("domain"))
-    except Exception:
-        info = {"uid": "", "email": "", "nickname": "",
-                "enterprise_id": "", "enterprise_name": ""}
-
-    if not info.get("uid"):
-        return jsonify({"ok": False, "pending": True,
-                        "error": "获取账号信息失败：上游未返回 uid，账号未入库"})
-
-    exist = db.find_account_by_uid(pend["platform"], info.get("uid"))
-    fields = dict(
-        access_token=tok["access_token"],
-        refresh_token=tok.get("refresh_token") or "",
-        expires_at=int(tok.get("expires_at") or 0),
-        domain=tok.get("domain") or "",
-        email=info.get("email") or "", uid=info.get("uid") or "",
-        nickname=info.get("nickname") or "",
-        enterprise_id=info.get("enterprise_id") or "",
-        enterprise_name=info.get("enterprise_name") or "",
-        state=state,
-    )
-    if exist:
-        db.update_account(exist["id"], status="active", status_reason="", **fields)
-        aid = exist["id"]
-    else:
-        aid = db.add_account(pend["platform"], label=pend["label"] or "用户贡献",
-                             source="user_join", **fields)
-
-    db.finish_pending(state)
-    quota = None
-    quota_error = ""
-    try:
-        quota = proxy.refresh_quota(db.get_account(aid))
-    except Exception as e:
-        quota_error = str(e)
-
-    return jsonify({"ok": True, "account_id": aid,
-                    "email": info.get("email"), "nickname": info.get("nickname"),
-                    "quota": quota, "quota_error": quota_error})
+    return _poll_account_login(public=True)
 
 
 # ==========================================================================
@@ -1217,7 +1279,8 @@ def panel_login_trae_callback():
         machine_id=machine_id, device_id=device_id,
     )
     if exist:
-        db.update_account(exist["id"], status="active", status_reason="", **fields)
+        db.update_account(exist["id"], status="active", status_reason="",
+                          refresh_error="", refresh_failures=0, refresh_retry_at=0, **fields)
         aid = exist["id"]
     else:
         aid = db.add_account("trae", label=data.get("label") or "", **fields)
@@ -1227,7 +1290,8 @@ def panel_login_trae_callback():
     except Exception as e:
         quota_error = str(e)
     return jsonify({"ok": True, "account_id": aid, "uid": uid,
-                    "nickname": nickname, "quota_error": quota_error})
+                    "nickname": nickname, "quota_error": quota_error,
+                    "model_sync": discovery.sync_account_catalog(db.get_account(aid))})
 
 
 @app.route("/api/login/start", methods=["POST"])
@@ -1248,64 +1312,7 @@ def panel_login_start():
 @app.route("/api/login/poll", methods=["POST"])
 @admin_required
 def panel_login_poll():
-    data = request.get_json(silent=True) or {}
-    state = data.get("state") or ""
-    pend = db.get_pending(state)
-    if pend is None:
-        return jsonify({"ok": False, "error": "state 不存在"}), 404
-    if pend["done"]:
-        return jsonify({"ok": False, "pending": False, "done": True,
-                        "msg": "登录流程已完成"})
-    platform = pend["platform"]
-
-    try:
-        tok = P.poll_token(platform, state)
-    except Exception as e:
-        return jsonify({"ok": False, "pending": True, "error": str(e)})
-
-    if not tok:
-        return jsonify({"ok": False, "pending": True, "msg": "等待网页端完成授权"})
-
-    try:
-        info = P.fetch_account_info(platform, tok["access_token"], state=state,
-                                    domain=tok.get("domain"))
-    except Exception:
-        info = {"uid": "", "email": "", "nickname": "",
-                "enterprise_id": "", "enterprise_name": ""}
-
-    if not info.get("uid"):
-        return jsonify({"ok": False, "pending": True,
-                        "error": "获取账号信息失败：上游未返回 uid，账号未入库"})
-
-    exist = db.find_account_by_uid(platform, info.get("uid"))
-    fields = dict(
-        access_token=tok["access_token"],
-        refresh_token=tok.get("refresh_token") or "",
-        expires_at=int(tok.get("expires_at") or 0),
-        domain=tok.get("domain") or "",
-        token_type=tok.get("token_type") or "Bearer",
-        email=info.get("email") or "", uid=info.get("uid") or "",
-        nickname=info.get("nickname") or "",
-        enterprise_id=info.get("enterprise_id") or "",
-        enterprise_name=info.get("enterprise_name") or "",
-        state=state,
-    )
-    if exist:
-        db.update_account(exist["id"], status="active", status_reason="", **fields)
-        aid = exist["id"]
-    else:
-        aid = db.add_account(platform, label=pend["label"] or "", **fields)
-
-    db.finish_pending(state)
-    quota_error = ""
-    try:
-        proxy.refresh_quota(db.get_account(aid))
-    except Exception as e:
-        quota_error = str(e)
-
-    return jsonify({"ok": True, "account_id": aid,
-                    "email": info.get("email"), "nickname": info.get("nickname"),
-                    "quota_error": quota_error})
+    return _poll_account_login()
 
 
 # ==========================================================================
@@ -1315,7 +1322,7 @@ def panel_login_poll():
 @app.route("/api/keys")
 @admin_required
 def panel_keys():
-    return jsonify([dict(r) for r in db.list_api_keys()])
+    return jsonify([key_permissions.serialize(r) for r in db.list_api_keys()])
 
 
 @app.route("/api/keys", methods=["POST"])
@@ -1330,7 +1337,16 @@ def panel_key_add():
         return jsonify({"ok": False, "error": str(e)}), 400
     if platform and platform not in P.PLATFORMS:
         return jsonify({"ok": False, "error": "未知平台"}), 400
-    key = db.add_api_key(name[:100], requested_key, platform)
+    try:
+        scope, models = key_permissions.validate(
+            data.get("model_scope", "all"), data.get("allowed_models", []), platform)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    try:
+        key = db.add_api_key(name[:100], requested_key, platform,
+                            model_scope=scope, allowed_models=models)
+    except db.DuplicateApiKey as e:
+        return jsonify({"ok": False, "error": str(e)}), 409
     return jsonify({"ok": True, "api_key": key})
 
 
@@ -1346,11 +1362,19 @@ def panel_key_delete(kid):
 @app.route("/api/keys/<int:kid>", methods=["PATCH"])
 @admin_required
 def panel_key_patch(kid):
-    if db.get_api_key_by_id(kid) is None:
-        return jsonify({"ok": False, "error": "API Key 不存在"}), 404
     data = request.get_json(silent=True) or {}
-    if "enabled" in data:
-        db.toggle_api_key(kid, 1 if _as_bool(data["enabled"]) else 0)
+
+    def prepare(current):
+        fields = key_permissions.prepare_edit(data, current)
+        if "enabled" in data:
+            fields["enabled"] = 1 if _as_bool(data["enabled"]) else 0
+        return fields
+
+    try:
+        if not db.edit_api_key(kid, prepare):
+            return jsonify({"ok": False, "error": "API Key 不存在"}), 404
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
     return jsonify({"ok": True})
 
 
@@ -1455,16 +1479,11 @@ def panel_settings():
 @app.route("/api/models/discover", methods=["GET"])
 @admin_required
 def panel_models_discover():
-    """跨三平台真实探测模型（上游无枚举接口，只能逐项请求），刷新运行时注册表。
-
-    返回注册表驱动的目录：每个平台的模型条目 + 对外暴露清单。探测结果持久化在
-    DB（discovered_models），下游 /v1/models 与请求调度全部读这张注册表。
-    """
+    """刷新官方目录，不执行聊天、生图或音频探测。"""
     try:
-        # 先拉官方 CLI 目录，零成本收录新模型；再跑真实探测补齐官方目录未覆盖的
-        # 平台（如国际站）与图像 / 音频模型。
-        discovery.sync_upstream_catalogs()
-        registry = discovery.run_discovery()
+        catalog_status = {}
+        discovery.sync_upstream_catalogs(statuses=catalog_status)
+        registry = db.get_model_registry()
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -1485,9 +1504,8 @@ def panel_models_discover():
         "discovered_at": int(time.time()),
         # 渠道×模型开关状态：{platform: [model_id]}，卡片据此渲染禁用态
         "disabled": {p: sorted(ids) for p, ids in proxy.get_model_disabled_map().items()},
-        # 文本/音频已同步返回；图像探测在后台进行，前端轮询本接口的 progress 版本
-        # 即可看到生图模型陆续出现，无需阻塞本次响应。
-        "image_discovering": discovery.image_discovery_running(),
+        "image_discovering": False,
+        "catalog_status": catalog_status,
     })
 
 
@@ -1496,8 +1514,7 @@ def panel_models_discover():
 def panel_models_discover_progress():
     """轮询用：返回当前注册表 + 后台图像探测是否仍在进行。
 
-    「刷新模型目录」同步只返回文本/音频模型；图像模型由后台线程探测，
-    确认后实时写入注册表。前端定时轮询本接口即可把生图模型逐步展示出来。
+    仅读取当前目录。保留图像任务状态字段用于兼容旧客户端，刷新不启动探测。
     """
     registry = proxy.normalize_model_registry(db.get_model_registry())
     platforms_out = []
@@ -1628,11 +1645,11 @@ def _maintenance_loop():
         try:
             time.sleep(300)
             for row in db.list_accounts():
-                if row["enabled"]:
-                    try:
-                        proxy.ensure_token(row)
-                    except Exception:
-                        pass
+                # enabled 只控制模型调度；停用账号仍维护登录凭证。
+                try:
+                    proxy.ensure_token(row)
+                except Exception:
+                    pass
             try:
                 proxy.run_auto_checkin_if_due()
             except Exception:
@@ -1648,7 +1665,7 @@ def _maintenance_loop():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Agent2API - 三平台模型反代与号池面板")
+    ap = argparse.ArgumentParser(description="Agent2API - 四平台模型反代与号池面板")
     ap.add_argument("--host", default=os.environ.get("AGENT2API_HOST") or os.environ.get("HY3API_HOST", "0.0.0.0"))
     ap.add_argument("--port", type=int,
                     default=int(os.environ.get("AGENT2API_PORT") or os.environ.get("HY3API_PORT", "8530")))
@@ -1672,17 +1689,15 @@ def main():
               % (db.DEFAULT_ADMIN_PASSWORD, db.DEFAULT_API_KEY), flush=True)
     print("=" * 62, flush=True)
 
-    # 启动阶段：若运行期模型注册表为空（首次部署），后台跑一次真实探测，
-    # 避免 /v1/models 返回空目录。探测需要启用账号，无账号时跳过（返回空）。
+    # 首次部署仅同步官方目录，不用聊天或生图探针消耗账号额度。
     if not db.get_model_registry():
         def _bootstrap_discover():
             try:
                 discovery.sync_upstream_catalogs()
-                discovery.run_discovery()
                 reg = db.get_model_registry()
-                print("  自动模型探测完成，已收录 %d 个模型" % len(reg), flush=True)
+                print("  自动模型目录同步完成，已收录 %d 个模型" % len(reg), flush=True)
             except Exception as e:
-                print("  自动模型探测跳过（%s）" % e, flush=True)
+                print("  自动模型目录同步跳过（%s）" % e, flush=True)
         threading.Thread(target=_bootstrap_discover, daemon=True).start()
 
     if args.debug:

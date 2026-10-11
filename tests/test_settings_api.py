@@ -25,8 +25,8 @@ def test_settings_roundtrip_new_fields(client):
     # 读回
     out = c.get("/api/settings").get_json()
     saved = json.loads(out["model_route_priority"])
-    assert saved["default"] == prio["default"]
-    assert saved["overrides"]["glm-5"] == ["codebuddy", "workbuddy", "trae"]
+    assert saved["default"] == prio["default"] + ["workbuddy_intl"]
+    assert saved["overrides"]["glm-5"] == ["codebuddy", "workbuddy", "trae", "workbuddy_intl"]
 
 
 def test_settings_rejects_unknown_keys_implicitly(client):

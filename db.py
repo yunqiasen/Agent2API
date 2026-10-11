@@ -10,6 +10,8 @@ import sqlite3
 import threading
 import time
 
+import credentials
+
 def _resolve_db_path() -> str:
     """数据库位置优先级：AGENT2API_DB > AGENT2API_DATA_DIR/agent2api.db > 代码目录。
 
@@ -127,6 +129,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     api_key     TEXT NOT NULL UNIQUE,
     enabled     INTEGER DEFAULT 1,
     platform    TEXT DEFAULT '',
+    model_scope TEXT NOT NULL DEFAULT 'all',
+    allowed_models TEXT NOT NULL DEFAULT '[]',
     req_count   INTEGER DEFAULT 0,
     last_used   INTEGER DEFAULT 0,
     created_at  INTEGER
@@ -188,6 +192,7 @@ def init_db():
 
     _migrate_accounts_columns()
     _migrate_logs_columns()
+    _migrate_api_keys_columns()
 
     if get_setting("admin_password") is None:
         set_setting("admin_password", hash_pw(DEFAULT_ADMIN_PASSWORD))
@@ -267,6 +272,11 @@ def _migrate_accounts_columns():
         "source": "TEXT DEFAULT ''",
         "machine_id": "TEXT DEFAULT ''",
         "device_id": "TEXT DEFAULT ''",
+        "last_refresh_at": "INTEGER DEFAULT 0",
+        "last_refresh_attempt": "INTEGER DEFAULT 0",
+        "refresh_error": "TEXT DEFAULT ''",
+        "refresh_failures": "INTEGER DEFAULT 0",
+        "refresh_retry_at": "INTEGER DEFAULT 0",
     }
     with _write_lock:
         c = get_conn()
@@ -274,6 +284,20 @@ def _migrate_accounts_columns():
         for col, typ in needed.items():
             if col not in existing:
                 c.execute("ALTER TABLE accounts ADD COLUMN %s %s" % (col, typ))
+        c.commit()
+
+
+def _migrate_api_keys_columns():
+    """旧Key增量升级为不限模型；已有模型权限及统计原样保留。"""
+    with _write_lock:
+        c = get_conn()
+        existing = {r[1] for r in c.execute("PRAGMA table_info(api_keys)")}
+        for col, typ in {
+            "model_scope": "TEXT NOT NULL DEFAULT 'all'",
+            "allowed_models": "TEXT NOT NULL DEFAULT '[]'",
+        }.items():
+            if col not in existing:
+                c.execute("ALTER TABLE api_keys ADD COLUMN %s %s" % (col, typ))
         c.commit()
 
 
@@ -420,6 +444,7 @@ def add_account(platform, access_token, refresh_token="", expires_at=0, domain="
                 enterprise_id="", enterprise_name="", state="", label="",
                 source="", machine_id="", device_id="") -> int:
     """新增账号；同渠道同 uid 已存在时原位更新并返回原 id。"""
+    expires_at = credentials.expiry(access_token, expires_at)
     now = int(time.time())
     with _write_lock:
         c = get_conn()
@@ -433,7 +458,7 @@ def add_account(platform, access_token, refresh_token="", expires_at=0, domain="
             fields = {
                 "access_token": access_token,
                 "refresh_token": refresh_token or existing["refresh_token"] or "",
-                "expires_at": int(expires_at or existing["expires_at"] or 0),
+                "expires_at": int(expires_at or 0),
                 "domain": domain or existing["domain"] or "",
                 "token_type": token_type or existing["token_type"] or "Bearer",
                 "email": email or existing["email"] or "",
@@ -484,6 +509,54 @@ def update_account(account_id: int, **fields):
         c = get_conn()
         c.execute("UPDATE accounts SET %s WHERE id=?" % cols, vals)
         c.commit()
+
+
+INTERNATIONAL_CHANNELS = ("codebuddy", "workbuddy_intl")
+
+
+def credential_scope(acc) -> tuple:
+    """同国际身份串行续期；不同会话只串行，不相互覆盖凭证。"""
+    if acc["platform"] in INTERNATIONAL_CHANNELS and acc.get("uid"):
+        return ("intl", acc["uid"], acc.get("enterprise_id") or "")
+    return ("account", acc["id"])
+
+
+def save_refresh_result(acc, fields) -> dict:
+    """原子保存同一份会话的轮换结果；并发重新导入的新凭证不被旧请求覆盖。"""
+    fields = dict(fields, updated_at=int(time.time()))
+    with _write_lock:
+        with get_conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            current = c.execute("SELECT * FROM accounts WHERE id=?", (acc["id"],)).fetchone()
+            if current is None:
+                return {}
+            if (current["access_token"] != acc["access_token"] or
+                    current["refresh_token"] != acc["refresh_token"]):
+                return dict(current)
+            where = "id=?"
+            args = [acc["id"]]
+            if credential_scope(acc)[0] == "intl" and acc.get("refresh_token"):
+                where = "platform IN (?,?) AND uid=? AND COALESCE(enterprise_id,'')=? AND refresh_token=?"
+                args = [*INTERNATIONAL_CHANNELS, acc["uid"], acc.get("enterprise_id") or "", acc["refresh_token"]]
+            cols = ", ".join(k + "=?" for k in fields)
+            c.execute("UPDATE accounts SET %s WHERE %s" % (cols, where), [*fields.values(), *args])
+            return dict(c.execute("SELECT * FROM accounts WHERE id=?", (acc["id"],)).fetchone())
+
+
+def quota_identity(acc) -> tuple:
+    """额度账本身份与凭证会话身份不同；只对已知国际 UID/租户去重。"""
+    return credential_scope(acc)
+
+
+def pool_quota_remain() -> float:
+    snapshots = {}
+    for row in list_accounts():
+        acc = dict(row)
+        key = quota_identity(acc)
+        previous = snapshots.get(key)
+        if previous is None or (acc.get("quota_updated_at") or 0, acc["id"]) > (previous.get("quota_updated_at") or 0, previous["id"]):
+            snapshots[key] = acc
+    return sum(float(a.get("quota_remain") or 0) for a in snapshots.values())
 
 
 def delete_account(account_id: int):
@@ -576,12 +649,23 @@ def save_quota(account_id: int, summary: dict):
 
 # ------------------------------ api keys ------------------------------
 
-def add_api_key(name: str, key: str | None = None, platform: str = "") -> str:
+class DuplicateApiKey(ValueError):
+    """调用密钥已存在，创建请求应明确报冲突。"""
+
+
+def add_api_key(name: str, key: str | None = None, platform: str = "", *,
+                model_scope: str = "all", allowed_models: list[str] | None = None) -> str:
     key = key or ("sk-agent2api-" + secrets.token_urlsafe(24))
     with _write_lock:
         c = get_conn()
-        c.execute("INSERT OR IGNORE INTO api_keys(name,api_key,platform,created_at) "
-                  "VALUES(?,?,?,?)", (name, key, platform, int(time.time())))
+        try:
+            c.execute("INSERT INTO api_keys(name,api_key,platform,model_scope,allowed_models,created_at) "
+                      "VALUES(?,?,?,?,?,?)", (name, key, platform, model_scope,
+                                             json.dumps(allowed_models or []), int(time.time())))
+        except sqlite3.IntegrityError:
+            if c.execute("SELECT id FROM api_keys WHERE api_key=?", (key,)).fetchone():
+                raise DuplicateApiKey("该 API Key 已存在，请编辑原密钥或使用其他 Key") from None
+            raise
         c.commit()
     return key
 
@@ -605,6 +689,25 @@ def delete_api_key(kid: int):
         c = get_conn()
         c.execute("DELETE FROM api_keys WHERE id=?", (kid,))
         c.commit()
+
+
+def edit_api_key(kid: int, prepare) -> bool:
+    """在同一事务内读取、校验、更新权限，失败整体回滚且保留Key身份。"""
+    with _write_lock:
+        with get_conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT * FROM api_keys WHERE id=?", (kid,)).fetchone()
+            if row is None:
+                return False
+            fields = prepare(dict(row))
+            if fields.keys() - {"platform", "model_scope", "allowed_models", "enabled"}:
+                raise ValueError("不支持的密钥更新字段")
+            if "allowed_models" in fields:
+                fields["allowed_models"] = json.dumps(fields["allowed_models"], ensure_ascii=False)
+            if fields:
+                c.execute("UPDATE api_keys SET %s WHERE id=?" %
+                          ",".join(k + "=?" for k in fields), [*fields.values(), kid])
+    return True
 
 
 def toggle_api_key(kid: int, enabled: int):
@@ -656,7 +759,7 @@ def overview_usage(days: int = 7) -> dict:
         "       SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) enabled "
         "FROM accounts"
     ).fetchone()
-    pool_credits = float(pool_row["credits"] or 0)
+    pool_credits = pool_quota_remain()
 
     # 今日调用
     today = c.execute(
@@ -794,7 +897,7 @@ def stats() -> dict:
         "ok_24h": row["ok"] or 0,
         "accounts": acc["total"] or 0,
         "accounts_active": acc["active"] or 0,
-        "quota_remain": round(acc["remain"] or 0, 2),
+        "quota_remain": round(pool_quota_remain(), 2),
         "keys": keys["total"] or 0,
     }
 

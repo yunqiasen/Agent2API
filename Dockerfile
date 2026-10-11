@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="Agent2API" \
-      org.opencontainers.image.description="WorkBuddy / TraeWork / CodeBuddy 三平台 hy3 模型反代与号池面板"
+      org.opencontainers.image.description="WorkBuddy / TraeWork / CodeBuddy 国际 / WorkBuddy 国际 四渠道模型反代与号池面板"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -18,7 +18,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 后端源码
-COPY app.py db.py providers.py proxy.py responses.py discovery.py trae.py ./
+COPY app.py db.py providers.py proxy.py responses.py discovery.py trae.py credentials.py model_pricing.py key_permissions.py ./
 
 # 前端构建产物（app.py 的 WEB_DIR = <BASE_DIR>/frontend/dist）
 # ⚠️ 构建镜像前必须先在本地执行：cd frontend && npm run build

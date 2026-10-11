@@ -1,3 +1,4 @@
+import { startLoginPoll } from "@/lib/login-poll";
 import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
@@ -36,6 +37,10 @@ import {
 } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
+  ApiError,
+  type JoinPollResp,
+  type ModelEntry,
+  type ModelSyncResult,
   apiDelete,
   apiGet,
   apiPatch,
@@ -125,23 +130,58 @@ function CheckinBadge({ a }: { a: Account }) {
 
 type ProbeResult = { ok: boolean; ms?: number; error?: string; reply?: string; model?: string };
 
-function ProbeCell({ a }: { a: Account }) {
+function ProbeCell({ a, revision, onSynced }: { a: Account; revision: number; onSynced: () => void }) {
   const [models, setModels] = useState<{ id: string; name: string }[]>([]);
   const [model, setModel] = useState("");
   const [busy, setBusy] = useState(false);
   const [res, setRes] = useState<ProbeResult | null>(null);
 
+  const [catalogError, setCatalogError] = useState("");
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [syncingModels, setSyncingModels] = useState(false);
+
+  function applyModels(entries: ModelEntry[]) {
+    const list = entries.filter(m => m.id && (!m.kind || m.kind === "chat"));
+    setModels(list);
+    setModel(current => list.some(m => m.id === current) ? current : list[0]?.id || "");
+  }
+
   useEffect(() => {
-    apiGet<{ ok: boolean; models: { id: string; name: string; kind?: string }[] }>(`/api/platforms/${a.platform}/models`)
-      .then((d) => {
-        // 测活走 chat 端点，只列对话模型
-        const list = (d.models || []).filter((m) => m.id && (!m.kind || m.kind === "chat"));
-        setModels(list);
-        if (list.length && !model) setModel(list[0].id);
+    const controller = new AbortController();
+    setLoadingModels(true);
+    setCatalogError("");
+    apiGet<{ ok: boolean; models: ModelEntry[]; error?: string }>(`/api/platforms/${a.platform}/models`, { signal: controller.signal })
+      .then(d => {
+        if (controller.signal.aborted) return;
+        if (!d.ok) throw new Error(d.error || "读取模型目录失败");
+        applyModels(d.models || []);
       })
-      .catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [a.platform]);
+      .catch(e => {
+        if (!controller.signal.aborted) setCatalogError(e instanceof Error ? e.message : "读取模型目录失败");
+      })
+      .finally(() => { if (!controller.signal.aborted) setLoadingModels(false); });
+    return () => controller.abort();
+  }, [a.id, a.platform, revision]);
+
+  useEffect(() => { setRes(null); }, [model]);
+
+  async function syncModels() {
+    setSyncingModels(true);
+    setCatalogError("");
+    try {
+      const result = await apiPost<ModelSyncResult>(`/api/accounts/${a.id}/models/sync`);
+      if (result.models) applyModels(result.models);
+      if (!result.ok) setCatalogError(result.error || "同步模型目录失败，原目录已保留");
+      else {
+        toast.success(`已同步 ${result.count} 个目录模型`);
+        onSynced();
+      }
+    } catch (e) {
+      setCatalogError(e instanceof Error ? e.message : "同步模型目录失败");
+    } finally {
+      setSyncingModels(false);
+    }
+  }
 
   async function probe() {
     if (!model) {
@@ -167,15 +207,21 @@ function ProbeCell({ a }: { a: Account }) {
       <div className="flex items-center gap-1.5">
         <span className="text-xs text-muted-foreground">测活</span>
         <select
+          aria-label="测活模型"
+          disabled={busy}
           value={model}
           onChange={(e) => setModel(e.target.value)}
           className="h-7 min-w-0 flex-1 rounded-md border border-input bg-background px-1.5 font-mono text-[11px]"
         >
-          {models.length === 0 && <option value="">无已探测模型</option>}
+          {models.length === 0 && <option value="">{loadingModels ? "读取模型中…" : "目录为空，请刷新模型"}</option>}
           {models.map((m) => (
             <option key={m.id} value={m.id}>{m.id}</option>
           ))}
         </select>
+        <Button variant="ghost" size="sm" className="h-7 px-1.5" aria-label="刷新模型" title="从此账号同步模型目录，不发送测活请求"
+          disabled={syncingModels || loadingModels} onClick={syncModels}>
+          <RefreshCw className={`size-3.5 ${syncingModels ? "animate-spin" : ""}`} />
+        </Button>
         <Button variant="ghost" size="sm" className="h-7 gap-1 px-2" disabled={busy || !model} onClick={probe}>
           <Zap className="size-3.5" /> {busy ? "测中…" : "测活"}
         </Button>
@@ -186,6 +232,11 @@ function ProbeCell({ a }: { a: Account }) {
           />
         )}
       </div>
+      {catalogError && (
+        <div role="alert" className="rounded-md bg-amber-500/10 px-2 py-1 text-[11px] text-amber-700 dark:text-amber-400 break-all">
+          模型目录同步失败：{catalogError}
+        </div>
+      )}
       {res && !res.ok && res.error && (
         <div className="rounded-md bg-rose-500/10 px-2 py-1 font-mono text-[11px] text-rose-600 dark:text-rose-400 break-all">
           {res.error}
@@ -198,6 +249,14 @@ function ProbeCell({ a }: { a: Account }) {
       )}
     </div>
   );
+}
+
+function notifyAccountAdded(result: JoinPollResp, message = "账号已加入号池") {
+  const warnings = [];
+  if (result.quota_error) warnings.push(`额度同步失败：${result.quota_error}`);
+  if (result.model_sync && !result.model_sync.ok) warnings.push(`模型目录同步失败：${result.model_sync.error || "请在卡片点击刷新模型"}`);
+  if (warnings.length) toast.warning(message, { description: warnings.join("；"), duration: 10000 });
+  else toast.success(message);
 }
 
 function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOpenChange: (v: boolean) => void; onAdded: () => void }) {
@@ -213,19 +272,17 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOp
   const [traeMachineId, setTraeMachineId] = useState("");
   const [traeDeviceId, setTraeDeviceId] = useState("");
   const isTrae = platform === "trae";
-  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  useEffect(() => {
-    return () => {
-      if (timer.current) clearInterval(timer.current);
-    };
-  }, []);
+  const cancelPoll = useRef<(() => void) | null>(null);
+  const activeRequest = useRef<AbortController | null>(null);
+  const generation = useRef(0);
+  const [loginFailed, setLoginFailed] = useState(false);
 
   function stop() {
-    if (timer.current) {
-      clearInterval(timer.current);
-      timer.current = null;
-    }
+    generation.current += 1;
+    cancelPoll.current?.();
+    cancelPoll.current = null;
+    activeRequest.current?.abort();
+    activeRequest.current = null;
   }
 
   function reset() {
@@ -235,71 +292,70 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOp
     setStarted(false);
     setLog("等待授权…");
     setBusy(false);
+    setCallbackBusy(false);
+    setLoginFailed(false);
     setCallbackUrl("");
     setTraeMachineId("");
     setTraeDeviceId("");
   }
 
+  useEffect(() => () => stop(), []);
+  useEffect(() => { if (!open) reset(); }, [open]);
+
   async function start() {
+    stop();
+    const run = generation.current;
+    const controller = new AbortController();
+    activeRequest.current = controller;
     setBusy(true);
+    setLoginFailed(false);
     setLog("等待授权…");
     try {
       const d = await apiPost<{ ok: boolean; state: string; auth_url: string; trae_machine_id?: string; trae_device_id?: string }>("/api/login/start", {
-        platform,
-        label: label || "后台添加",
-      });
+        platform, label: label || "后台添加",
+      }, { signal: controller.signal });
+      if (run !== generation.current) return;
       setTraeMachineId(d.trae_machine_id || "");
       setTraeDeviceId(d.trae_device_id || "");
       setAuthUrl(d.auth_url);
       setState(d.state);
       setStarted(true);
       if (isTrae) {
-        // Trae 没有 token 轮询端点：网页授权后复制回调 URL 到下方导入即可
-        setLog("在浏览器完成授权后，页面会跳到 127.0.0.1（显示无法访问属正常），复制地址栏完整 URL 粘贴到下方导入。");
+        setLog("在浏览器完成授权后，页面会跳到 127.0.0.1（显示连接错误属正常），复制地址栏完整 URL 粘贴到下方导入。");
         return;
       }
-      let n = 0;
-      stop();
-      timer.current = setInterval(async () => {
-        n += 1;
-        if (n > 150) {
-          stop();
-          setLog("超时，请重试");
-          return;
-        }
-        try {
-          const r = await apiPost<{ ok: boolean; account_id?: number; pending?: boolean; done?: boolean; msg?: string; error?: string; quota_error?: string }>(
-            "/api/login/poll",
-            { state: d.state }
-          );
-          if (r.ok) {
-            stop();
-            if (r.quota_error) {
-              toast.warning(`账号已加入号池，但额度同步失败：${r.quota_error}`, { duration: 10000 });
-            } else {
-              toast.success("账号已加入号池");
-            }
+      cancelPoll.current = startLoginPoll({
+        request: signal => apiPost<JoinPollResp>("/api/login/poll", { state: d.state }, { signal }),
+        onResult: (r, elapsed) => {
+          if (run !== generation.current) return;
+          if (r.ok || r.done) {
+            notifyAccountAdded(r, r.done ? r.msg || "登录流程已完成" : "账号已加入号池");
             reset();
             onOpenChange(false);
             onAdded();
-          } else if (r.done) {
-            // 可能是上一次慢轮询已完成导入；终态应立即停止，不能继续轮询到超时。
-            stop();
-            toast.success(r.msg || "登录流程已完成");
-            reset();
-            onOpenChange(false);
-            onAdded();
+          } else if (r.pending === false) {
+            setLog(r.error || r.msg || "授权已结束，请重新获取链接");
+            setLoginFailed(true);
           } else {
-            setLog(`等待授权… (${n}s) ${r.msg || r.error || ""}`);
+            setLog(`等待授权… (${elapsed}s) ${r.msg || r.error || ""}`);
           }
-        } catch (e) {
-          setLog("轮询出错：" + (e instanceof Error ? e.message : ""));
-        }
-      }, 2000);
+        },
+        onError: e => {
+          setLog("轮询出错：" + (e instanceof Error ? e.message : "请求失败"));
+          if (e instanceof ApiError && [400, 401, 403, 404, 410].includes(e.status)) {
+            setLoginFailed(true);
+            return false;
+          }
+        },
+        onTimeout: () => { setLog("授权超时，请重新获取链接"); setLoginFailed(true); },
+      });
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "获取授权链接失败");
+      if (run === generation.current) {
+        setLoginFailed(true);
+        toast.error(e instanceof Error ? e.message : "获取授权链接失败");
+      }
     } finally {
-      setBusy(false);
+      if (run === generation.current) setBusy(false);
     }
   }
 
@@ -319,7 +375,7 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOp
         <div className="space-y-4">
           <div className="space-y-2">
             <Label>平台</Label>
-            <Select value={platform} onValueChange={setPlatform}>
+            <Select value={platform} onValueChange={v => { reset(); setPlatform(v); }}>
               <SelectTrigger className="h-9 bg-background">
                 <SelectValue />
               </SelectTrigger>
@@ -362,26 +418,26 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOp
                     className="w-full"
                     disabled={callbackBusy || !callbackUrl.trim()}
                     onClick={async () => {
+                      const run = generation.current;
+                      const controller = new AbortController();
+                      activeRequest.current = controller;
                       setCallbackBusy(true);
                       try {
-                        const result = await apiPost<{ quota_error?: string }>("/api/login/trae_callback", {
+                        const result = await apiPost<JoinPollResp>("/api/login/trae_callback", {
                           callback_url: callbackUrl.trim(),
                           machine_id: traeMachineId,
                           device_id: traeDeviceId,
                           label: label || "后台添加",
-                        });
-                        if (result.quota_error) {
-                          toast.warning(`Trae 账号已加入号池，但额度同步失败：${result.quota_error}`, { duration: 10000 });
-                        } else {
-                          toast.success("Trae 账号已加入号池");
-                        }
+                        }, { signal: controller.signal });
+                        if (run !== generation.current) return;
+                        notifyAccountAdded(result, "Trae 账号已加入号池");
                         reset();
                         onOpenChange(false);
                         onAdded();
                       } catch (e) {
-                        toast.error(e instanceof Error ? e.message : "Trae 回调导入失败");
+                        if (run === generation.current) toast.error(e instanceof Error ? e.message : "Trae 回调导入失败");
                       } finally {
-                        setCallbackBusy(false);
+                        if (run === generation.current) setCallbackBusy(false);
                       }
                     }}
                   >
@@ -410,6 +466,11 @@ function AddAccountDialog({ open, onOpenChange, onAdded }: { open: boolean; onOp
             </Tabs>
             )
           )}
+          {started && loginFailed && !isTrae && (
+            <Button variant="secondary" className="w-full" onClick={start} disabled={busy}>
+              重新获取授权链接
+            </Button>
+          )}
           {started && (
             <pre className="whitespace-pre-wrap break-all rounded-md bg-muted/40 p-3 text-xs text-muted-foreground">
               {log}
@@ -437,12 +498,12 @@ function ImportDialog({ open, onOpenChange, onAdded }: { open: boolean; onOpenCh
         body.access_token = at.trim();
         body.refresh_token = rt.trim();
       }
-      const d = await apiPost<{ added: number; updated: number; refresh_errors?: { id: number; error: string }[] }>("/api/accounts/import_token", body);
-      if (d.refresh_errors?.length) {
-        toast.warning(`导入完成，但 ${d.refresh_errors.length} 个账号额度同步失败；请查看号池状态和错误原因`, { duration: 10000 });
-      } else {
-        toast.success(`导入完成：新增 ${d.added}，更新 ${d.updated}`);
-      }
+      const d = await apiPost<{ added: number; updated: number; refresh_errors?: { id: number; error: string }[]; model_sync_results?: ModelSyncResult[] }>("/api/accounts/import_token", body);
+      const warnings = (d.refresh_errors || []).map(e => `#${e.id} 凭证/额度：${e.error}`);
+      warnings.push(...(d.model_sync_results || []).filter(r => !r.ok).map(r => `#${r.account_id} 模型目录：${r.error}`));
+      const summary = `导入完成：新增 ${d.added}，更新 ${d.updated}`;
+      if (warnings.length) toast.warning(summary, { description: warnings.join("；"), duration: 10000 });
+      else toast.success(summary);
       setJson("");
       setAt("");
       setRt("");
@@ -514,6 +575,7 @@ function ImportDialog({ open, onOpenChange, onAdded }: { open: boolean; onOpenCh
 
 export function Accounts() {
   const [list, setList] = useState<Account[]>([]);
+  const [catalogRevision, setCatalogRevision] = useState(0);
   const [addOpen, setAddOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   // 渠道筛选：all = 全部渠道；其余只显示对应渠道号池
@@ -524,7 +586,7 @@ export function Accounts() {
 
   function load() {
     apiGet<Account[]>("/api/accounts")
-      .then(setList)
+      .then(rows => { setList(rows); setCatalogRevision(v => v + 1); })
       .catch((e) => toast.error(e instanceof Error ? e.message : "加载失败"));
   }
   useEffect(load, []);
@@ -542,7 +604,7 @@ export function Accounts() {
 
   async function toggle(id: number, on: boolean) {
     await apiPatch(`/api/accounts/${id}`, { enabled: on ? 1 : 0 });
-    toast.success(on ? "已启用" : "已停用");
+    toast.success(on ? "已允许调用" : "已停止调用，签到与凭证刷新不受影响");
     load();
   }
   async function del(id: number) {
@@ -640,7 +702,7 @@ export function Accounts() {
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Tile tone="indigo" icon={Users} label="账号总数" value={num(total)} hint="个" delay={0} />
-        <Tile tone="emerald" icon={Activity} label="已启用" value={num(enabled)} hint="个" delay={80} />
+        <Tile tone="emerald" icon={Activity} label="允许调用" value={num(enabled)} hint="个" delay={80} />
         <Tile tone="amber" icon={Gift} label="今日可领积分" value={num(claimable)} hint="分" delay={160} />
         <Tile tone="rose" icon={AlertTriangle} label="即将过期" value={num(expiring)} hint="个" delay={240} />
       </div>
@@ -703,7 +765,7 @@ export function Accounts() {
                   </div>
                   <div className="flex items-center gap-2">
                     <StatusBadge a={a} />
-                    <Switch checked={!!a.enabled} onCheckedChange={(v) => toggle(a.id, v)} />
+                    <Switch aria-label="允许模型调用（关闭不影响签到与凭证刷新）" checked={!!a.enabled} onCheckedChange={(v) => toggle(a.id, v)} />
                   </div>
                 </div>
 
@@ -727,6 +789,15 @@ export function Accounts() {
                       <span className="font-mono text-[11px] text-muted-foreground">{a.has_refresh ? "有刷新凭证" : "无刷新凭证"}</span>
                     </span>
                   </div>
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    <span className="shrink-0 text-muted-foreground">凭证续期</span>
+                    {a.refresh_error ? (
+                      <span className="min-w-0 truncate text-rose-600" title={a.refresh_error}>失败：{a.refresh_error}</span>
+                    ) : (
+                      <span className="text-muted-foreground">{a.last_refresh_at ? `成功于 ${ago(a.last_refresh_at)}` : "尚无成功续期记录"}</span>
+                    )}
+                  </div>
+                  {a.shared_quota && <p className="text-[11px] text-muted-foreground">与另一国际渠道共享额度，汇总只计一次</p>}
                   <div className="flex items-center justify-between text-xs">
                     <span className="text-muted-foreground">签到</span>
                     <span className="flex items-center gap-1.5">
@@ -747,7 +818,7 @@ export function Accounts() {
                       {(a.status_reason || a.last_error || "").slice(0, 80)}…
                     </div>
                   )}
-                  <ProbeCell a={a} />
+                  <ProbeCell a={a} revision={catalogRevision} onSynced={() => setCatalogRevision(v => v + 1)} />
                 </div>
 
                 <div className="mt-3 flex items-center gap-1 border-t pt-3">

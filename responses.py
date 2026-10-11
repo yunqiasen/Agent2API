@@ -113,6 +113,7 @@ def _convert_input(input_field, instructions):
     pending_calls: dict[str, dict] = {}
     pending_order: list[str] = []
     pending_outputs: dict[str, str] = {}
+    pending_reasoning: list[str] = []
 
     def flush_calls():
         if not pending_calls:
@@ -125,13 +126,15 @@ def _convert_input(input_field, instructions):
                 "type": "function",
                 "function": {"name": c["name"], "arguments": c["args"]},
             })
-        messages.append({"role": "assistant", "content": None, "tool_calls": tool_calls})
+        assistant = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+        if pending_reasoning:
+            assistant["reasoning_content"] = "".join(pending_reasoning)
+            pending_reasoning.clear()
+        messages.append(assistant)
         for cid in pending_order:
-            messages.append({
-                "role": "tool",
-                "content": pending_outputs.get(cid, ""),
-                "tool_call_id": cid,
-            })
+            if cid in pending_outputs:
+                messages.append({"role": "tool", "content": pending_outputs[cid],
+                                 "tool_call_id": cid})
         pending_calls.clear()
         pending_order.clear()
         pending_outputs.clear()
@@ -146,8 +149,8 @@ def _convert_input(input_field, instructions):
 
     for item in input_field:
         if not isinstance(item, dict):
-            messages.append({"role": "user", "content": str(item)})
             flush_calls()
+            messages.append({"role": "user", "content": str(item)})
             continue
 
         t = item.get("type", "message")
@@ -155,7 +158,11 @@ def _convert_input(input_field, instructions):
         if t == "message":
             flush_calls()
             role = item.get("role", "user")
-            messages.append({"role": role, "content": _convert_content(item.get("content", ""))})
+            message = {"role": role, "content": _convert_content(item.get("content", ""))}
+            if role == "assistant" and pending_reasoning:
+                message["reasoning_content"] = "".join(pending_reasoning)
+                pending_reasoning.clear()
+            messages.append(message)
         elif t == "system":
             flush_calls()
             messages.append({"role": "system", "content": _convert_content(item.get("content", ""))})
@@ -175,8 +182,11 @@ def _convert_input(input_field, instructions):
             if cid not in pending_calls:
                 messages.append({"role": "tool", "content": item.get("output", ""),
                                  "tool_call_id": cid})
-        elif t in ("reasoning", "item_reference"):
-            # 推理项/引用项：无对应 chat 语义，跳过
+        elif t == "reasoning":
+            # 回传的独立 reasoning 项属于紧随其后的 assistant/function_call。
+            parts = item.get("content") or item.get("summary") or []
+            pending_reasoning.extend(p.get("text", "") for p in parts if isinstance(p, dict))
+        elif t == "item_reference":
             flush_calls()
         else:
             # 未知类型：若带有 role+content 则当作 message
@@ -190,46 +200,32 @@ def _convert_input(input_field, instructions):
 
 def _convert_tools(tools):
     out = []
-    for t in tools or []:
-        if not isinstance(t, dict):
+    for tool in tools or []:
+        if not isinstance(tool, dict):
             continue
-        if t.get("type") == "function":
-            out.append({
-                "type": "function",
-                "function": {
-                    "name": t.get("name"),
-                    "description": t.get("description", ""),
-                    "parameters": t.get("parameters") or {},
-                },
-            })
+        if tool.get("type") == "function" and "function" not in tool:
+            fn = {k: v for k, v in tool.items() if k != "type"}
+            fn.setdefault("parameters", {})
+            out.append({"type": "function", "function": fn})
         else:
-            # file_search / web_search / code_interpreter 等上游不支持，
-            # 原样透传（失败由上游报错，本层不阻断）
-            out.append(t)
+            out.append(tool)
     return out
 
 
 def _convert_tool_choice(tc):
-    """Responses tool_choice → chat tool_choice。
-
-    上游 chat 接口只接受字符串形式的 tool_choice（"auto"/"none"/"required"），
-    不支持 OpenAI 的 {"type":"function","function":{...}} 对象形式（会 11101）。
-    因此把对象形式做有损降级：
-      - {type:"function", name:X} → "required"（强制调用某个函数；
-        当仅一个工具时等价于指定该函数；多工具时为尽力而为）
-      - {type:"auto"} / {type:"none"} → 同名字串
-    """
-    if tc is None:
-        return None
-    if isinstance(tc, str):
-        return tc                      # auto / none / required 两 API 一致
+    """先保持标准 Chat 语义，各渠道适配器再转换其上游要求的格式。"""
+    if tc is None or isinstance(tc, str):
+        return tc
     if isinstance(tc, dict):
-        t = tc.get("type")
-        if t == "function":
-            return "required"
-        if t in ("auto", "none"):
-            return t
-        return "auto"
+        typ = tc.get("type")
+        if typ == "function":
+            name = tc.get("name") or (tc.get("function") or {}).get("name")
+            if not name:
+                raise ValueError("指定工具缺少 name")
+            return {"type": "function", "function": {"name": name}}
+        if typ in ("auto", "none", "required"):
+            return typ
+        return tc
     return None
 
 
@@ -311,12 +307,9 @@ def chat_to_response(chat: dict, response_id: str | None = None,
             "annotations": [],
         })
     if reasoning:
-        msg_item["content"].append({
-            "type": "reasoning",
-            "summary": [],
-            "text": reasoning,
-        })
-    if content_text or reasoning:
+        output.append({"id": _new_id("rs_"), "type": "reasoning", "status": "completed",
+                       "summary": [], "content": [{"type": "reasoning_text", "text": reasoning}]})
+    if content_text:
         output.append(msg_item)
 
     if tool_calls:
@@ -333,16 +326,21 @@ def chat_to_response(chat: dict, response_id: str | None = None,
                 "created_at": created,
             })
 
+    finish = (chat.get("choices") or [{}])[0].get("finish_reason")
+    status, incomplete = _completion_status(finish)
+    if status == "incomplete":
+        for item in output:
+            item["status"] = "incomplete"
     return {
         "id": response_id or _new_id("resp_"),
         "object": "response",
         "created_at": created,
-        "status": "completed",
+        "status": status,
         "model": model,
         "output": output,
         "usage": _map_usage(chat.get("usage")),
         "error": None,
-        "incomplete_details": None,
+        "incomplete_details": incomplete,
         "instructions": instructions,
         "metadata": {},
         "temperature": None,
@@ -371,217 +369,144 @@ def _chat_sse_lines(resp, model: str):
     yield from proxy._sse_lines(resp)
 
 
+def _completion_status(finish):
+    if finish in ("length", "content_filter"):
+        return "incomplete", {"reason": "max_output_tokens" if finish == "length" else finish}
+    return "completed", None
+
+
 def stream_chat_to_responses(resp, model: str, response_id: str | None = None,
                              instructions=None):
-    """生成器：读取上游 chat 流式响应，逐块 yield Responses SSE 字节。"""
+    """Chat SSE → Responses：独立文本/推理/工具项，共享递增 output_index。"""
     response_id = response_id or _new_id("resp_")
     created_at = int(time.time())
-    msg_id = _new_id("msg_")
-    part_id = _new_id("cp_")
-
-    # 状态
-    item_added = False        # 助手文本消息项是否已 emit added
-    part_added = False        # 文本 content part 是否已 emit added
-    text_parts: list[str] = []
-    text_done = False
-    # 工具调用：index -> {id, name, args, added}
-    tools: dict[int, dict] = {}
-    next_index = 0
-
-    def base_resp(status: str) -> dict:
-        return {
-            "id": response_id,
-            "object": "response",
-            "created_at": created_at,
-            "status": status,
-            "model": model,
-            "output": [],
-            "usage": None,
-        }
-
-    def ensure_msg_item():
-        nonlocal item_added, part_added, next_index
-        if not item_added:
-            yield _sse("response.output_item.added", {
-                "output_index": 0,
-                "item": {
-                    "id": msg_id, "type": "message", "status": "in_progress",
-                    "role": "assistant", "content": [], "created_at": created_at,
-                },
-            })
-            item_added = True
-            next_index = 1          # 文本消息占 index 0，工具调用从 1 起
-        if not part_added:
-            yield _sse("response.content_part.added", {
-                "item_id": msg_id, "content_index": 0,
-                "part": {"type": "output_text", "text": "", "annotations": []},
-            })
-            part_added = True
-
-    yield _sse("response.created", base_resp("in_progress"))
-    yield _sse("response.in_progress", {})
-
+    output = []
+    tools = {}
+    text_index = reasoning_index = None
     usage = None
-    finish_reason = None
-    saw_content = False
-    saw_tool = False
+    finish = None
+    saw_choice = False
+    sequence = 0
 
+    def emit(event, data):
+        nonlocal sequence
+        payload = {"type": event, "sequence_number": sequence, **data}
+        sequence += 1
+        return _sse(event, payload)
+
+    def response(status="in_progress", incomplete=None):
+        return {"id": response_id, "object": "response", "created_at": created_at,
+                "status": status, "model": model, "output": output,
+                "usage": _map_usage(usage), "instructions": instructions,
+                "error": None, "incomplete_details": incomplete}
+
+    def add_tool(t):
+        if not t["added"]:
+            t["item"]["call_id"] = t["item"]["call_id"] or _new_id("call_")
+            t["added"] = True
+            yield emit("response.output_item.added", {
+                "output_index": t["index"], "item": {**t["item"], "arguments": ""}})
+            if t["item"]["arguments"]:
+                yield emit("response.function_call_arguments.delta", {
+                    "output_index": t["index"], "item_id": t["item"]["id"],
+                    "delta": t["item"]["arguments"]})
+
+    yield emit("response.created", {"response": response()})
+    yield emit("response.in_progress", {"response": response()})
     for line in _chat_sse_lines(resp, model):
         if not line or not line.startswith("data:"):
             continue
-        chunk = line[5:].strip()
-        if not chunk or chunk == "[DONE]":
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
             continue
         try:
-            j = json.loads(chunk)
-        except Exception:
+            chunk = json.loads(payload)
+        except (ValueError, TypeError):
             continue
-
-        if j.get("usage"):
-            usage = j["usage"]
-        err = proxy._sse_business_error(j)
+        err = proxy._sse_business_error(chunk)
         if err:
             raise proxy.ProxyError("上游业务错误: %s" % err, status=502)
-        if not j.get("choices"):
+        if not isinstance(chunk, dict):
             continue
-        ch = j["choices"][0]
-        delta = ch.get("delta") or {}
-        finish_reason = ch.get("finish_reason") or finish_reason
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+        if not chunk.get("choices"):
+            continue
+        saw_choice = True
+        choice = chunk["choices"][0]
+        delta = choice.get("delta") or choice.get("message") or {}
+        finish = choice.get("finish_reason") or finish
 
-        # ---- 文本内容 ----
-        content = delta.get("content")
-        if content:
-            saw_content = True
-            yield from ensure_msg_item()
-            text_parts.append(content)
-            yield _sse("response.output_text.delta", {
-                "item_id": msg_id, "content_index": 0,
-                "delta": content, "logprobs": None,
-            })
-
-        # 推理内容（如上游返回 reasoning_content），按文本增量处理
         reasoning = delta.get("reasoning_content")
         if reasoning:
-            saw_content = True
-            yield from ensure_msg_item()
-            text_parts.append(reasoning)
-            yield _sse("response.output_text.delta", {
-                "item_id": msg_id, "content_index": 0,
-                "delta": reasoning, "logprobs": None,
-            })
+            if reasoning_index is None:
+                reasoning_index = len(output)
+                item = {"id": _new_id("rs_"), "type": "reasoning", "status": "in_progress",
+                        "summary": [], "content": [{"type": "reasoning_text", "text": ""}]}
+                output.append(item)
+                yield emit("response.output_item.added", {"output_index": reasoning_index, "item": item})
+            item = output[reasoning_index]
+            item["content"][0]["text"] += reasoning
+            yield emit("response.reasoning_text.delta", {
+                "output_index": reasoning_index, "item_id": item["id"], "content_index": 0, "delta": reasoning})
 
-        # ---- 工具调用 ----
-        for tc in (delta.get("tool_calls") or []):
-            saw_tool = True
-            idx = tc.get("index", 0)
-            t = tools.get(idx)
-            if t is None:
-                t = {
-                    "id": tc.get("id") or _new_id("call_"),
-                    "name": "",
-                    "args": "",
-                    "added": False,
-                }
-                tools[idx] = t
-            if tc.get("id") and not t["id"].startswith("call_"):
-                t["id"] = tc.get("id")
+        content = delta.get("content")
+        if content:
+            if text_index is None:
+                text_index = len(output)
+                item = {"id": _new_id("msg_"), "type": "message", "status": "in_progress",
+                        "role": "assistant", "content": []}
+                output.append(item)
+                yield emit("response.output_item.added", {"output_index": text_index, "item": item})
+                part = {"type": "output_text", "text": "", "annotations": []}
+                item["content"].append(part)
+                yield emit("response.content_part.added", {
+                    "output_index": text_index, "item_id": item["id"], "content_index": 0, "part": part})
+            item = output[text_index]
+            item["content"][0]["text"] += content
+            yield emit("response.output_text.delta", {
+                "output_index": text_index, "item_id": item["id"], "content_index": 0,
+                "delta": content, "logprobs": []})
+
+        for position, tc in enumerate(delta.get("tool_calls") or []):
+            index = tc.get("index", position)
+            if index not in tools:
+                item = {"id": _new_id("fc_"), "type": "function_call", "status": "in_progress",
+                        "call_id": "", "name": "", "arguments": ""}
+                tools[index] = {"item": item, "index": len(output), "added": False}
+                output.append(item)
+            t = tools[index]
+            item = t["item"]
+            if tc.get("id"):
+                item["call_id"] = tc["id"]
             fn = tc.get("function") or {}
             if fn.get("name"):
-                t["name"] = fn["name"]
-            arg_frag = fn.get("arguments", "")
-            if arg_frag:
-                if not t["added"]:
-                    t["out_index"] = next_index
-                    yield _sse("response.output_item.added", {
-                        "output_index": next_index,
-                        "item": {
-                            "id": t["id"], "type": "function_call",
-                            "status": "in_progress", "call_id": t["id"],
-                            "name": t["name"], "arguments": "",
-                            "created_at": created_at,
-                        },
-                    })
-                    t["added"] = True
-                    next_index += 1
-                t["args"] += arg_frag
-                yield _sse("response.function_call_arguments.delta", {
-                    "item_id": t["id"], "delta": arg_frag,
-                })
+                item["name"] += fn["name"]
+            fragment = fn.get("arguments") or ""
+            item["arguments"] += fragment
+            if t["added"] and fragment:
+                yield emit("response.function_call_arguments.delta", {
+                    "output_index": t["index"], "item_id": item["id"], "delta": fragment})
+            elif not t["added"] and fragment and item["call_id"] and item["name"]:
+                yield from add_tool(t)
 
-    # ---- 收尾：文本 ----
-    if saw_content and not text_done:
-        full = "".join(text_parts)
-        if part_added:
-            yield _sse("response.output_text.done", {
-                "item_id": msg_id, "content_index": 0,
-                "text": full, "logprobs": None,
-            })
-            yield _sse("response.content_part.done", {
-                "item_id": msg_id, "content_index": 0,
-                "part": {"type": "output_text", "text": full, "annotations": []},
-            })
-        if item_added:
-            yield _sse("response.output_item.done", {
-                "output_index": 0,
-                "item": {
-                    "id": msg_id, "type": "message", "status": "completed",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": full, "annotations": []}],
-                    "created_at": created_at,
-                },
-            })
-
-    # ---- 收尾：工具调用 ----
-    final: dict = {}
-    if saw_content:
-        final[0] = {
-            "id": msg_id, "type": "message", "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": "".join(text_parts), "annotations": []}],
-            "created_at": created_at,
-        }
-    for idx in sorted(tools.keys()):
-        t = tools[idx]
-        if not t["added"]:
-            # 没有参数片段但也算一次调用
-            t["out_index"] = next_index
-            yield _sse("response.output_item.added", {
-                "output_index": next_index,
-                "item": {
-                    "id": t["id"], "type": "function_call", "status": "in_progress",
-                    "call_id": t["id"], "name": t["name"], "arguments": "",
-                    "created_at": created_at,
-                },
-            })
-            next_index += 1
-        yield _sse("response.function_call_arguments.done", {
-            "item_id": t["id"], "arguments": t["args"],
-        })
-        oi = t.get("out_index", idx)
-        yield _sse("response.output_item.done", {
-            "output_index": oi,
-            "item": {
-                "id": t["id"], "type": "function_call", "status": "completed",
-                "call_id": t["id"], "name": t["name"], "arguments": t["args"],
-                "created_at": created_at,
-            },
-        })
-        final[oi] = {
-            "id": t["id"], "type": "function_call", "status": "completed",
-            "call_id": t["id"], "name": t["name"], "arguments": t["args"],
-            "created_at": created_at,
-        }
-
-    out_items = [final[k] for k in sorted(final.keys())]
-
-    status = "incomplete" if finish_reason in ("length", "content_filter") else "completed"
-    completed = base_resp(status)
-    completed["output"] = out_items
-    completed["usage"] = _map_usage(usage)
-    completed["instructions"] = instructions
-    # 供 app.py 流式请求结束后记录上游真实 tokens / credit；不改变对外响应。
-    try:
-        resp._hy3_usage = usage
-    except Exception:
-        pass
-    yield _sse("response.completed", completed)
+    if not saw_choice:
+        raise proxy.ProxyError("上游返回空响应流 (empty SSE)", status=502)
+    for t in tools.values():
+        yield from add_tool(t)
+    status, incomplete = _completion_status(finish)
+    for index, item in enumerate(output):
+        item["status"] = "incomplete" if status == "incomplete" else "completed"
+        common = {"output_index": index, "item_id": item["id"]}
+        if item["type"] == "message":
+            part = item["content"][0]
+            yield emit("response.output_text.done", {**common, "content_index": 0, "text": part["text"], "logprobs": []})
+            yield emit("response.content_part.done", {**common, "content_index": 0, "part": part})
+        elif item["type"] == "reasoning":
+            yield emit("response.reasoning_text.done", {**common, "content_index": 0, "text": item["content"][0]["text"]})
+        else:
+            yield emit("response.function_call_arguments.done", {**common, "arguments": item["arguments"]})
+        yield emit("response.output_item.done", {"output_index": index, "item": item})
+    # app.py 用原始 usage 记录真实 credit，Responses usage 只做协议字段映射。
+    resp._hy3_usage = usage
+    yield emit("response." + status, {"response": response(status, incomplete)})

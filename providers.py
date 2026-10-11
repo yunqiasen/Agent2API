@@ -2,22 +2,26 @@
 """
 Agent2API - 平台适配层
 
-支持三个平台的账号、令牌、额度与模型管理：
+支持四个平台的账号、令牌、额度与模型管理：
   - workbuddy  WorkBuddy      (www.codebuddy.cn, platform=workbuddy)
   - trae       TraeWork       (www.trae.cn, SOLO Cloud IDE)
   - codebuddy  CodeBuddy 国际 (www.codebuddy.ai, platform=ide)
+  - workbuddy_intl WorkBuddy 国际 (www.workbuddy.ai, platform=workbuddy-ai)
 
 流程与常量来自 cockpit-tools 源码（crates/cockpit-core/src/modules/*_oauth.rs），
 对话接口来自本地客户端日志实测。
 """
 from __future__ import annotations
 
+import copy
 import datetime as _dt
 import json
 import time
 import uuid
 
 import db
+import credentials
+import model_pricing
 import requests
 import trae
 
@@ -32,7 +36,9 @@ PLATFORMS = {
         "api_base": "https://www.codebuddy.cn",
         "prefix": "/v2/plugin",
         "platform": "workbuddy",
-        "model_base": "https://copilot.tencent.com",
+        "model_base": "https://www.workbuddy.cn",
+        "models_path": "/v2/enterprises/personal/models",
+        "user_agent": "WorkBuddy/5.7.6 WorkBuddy/5.7.6 CLI/2.156.0",
         "chat_path": "/v2/chat/completions",
         "config_path": "/v3/config",
         "session_header": "X-WorkBuddy-Session-Id",
@@ -56,15 +62,32 @@ PLATFORMS = {
     },
     "codebuddy": {
         "key": "codebuddy",
-        "label": "CodeBuddy",
+        "label": "CodeBuddy 国际",
         "api_base": "https://www.codebuddy.ai",
         "prefix": "/v2/plugin",
         "platform": "ide",
         "model_base": "https://www.codebuddy.ai",
+        "models_path": "/v2/enterprises/personal/models",
+        "user_agent": "CLI/2.162.0 CodeBuddy/2.162.0",
         "chat_path": "/v2/chat/completions",
         "config_path": "/v3/config",
         "session_header": "X-CodeBuddy-Session-Id",
         # 实测：国际站要求 messages[0].role 必须是 system，否则 400 Parse message failed
+        "require_leading_system": True,
+        "supports_checkin": False,
+    },
+    "workbuddy_intl": {
+        "key": "workbuddy_intl",
+        "label": "WorkBuddy 国际",
+        "api_base": "https://www.workbuddy.ai",
+        "prefix": "/v2/plugin",
+        "platform": "workbuddy-ai",
+        "model_base": "https://www.workbuddy.ai",
+        "chat_path": "/v2/chat/completions",
+        "config_path": "/v3/config",
+        "models_path": "/v2/enterprises/personal/models",
+        "session_header": "X-WorkBuddy-Session-Id",
+        "user_agent": "WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0",
         "require_leading_system": True,
         "supports_checkin": False,
     },
@@ -99,9 +122,10 @@ def get_platform(key: str) -> dict:
 
 
 PLATFORM_NOTES = {
-    "workbuddy": "国内网关 copilot.tencent.com；原 CodeBuddy CN 与其同额度同模型，已合并",
+    "workbuddy": "当前 WorkBuddy 网关 www.workbuddy.cn；原 CodeBuddy CN 已合并",
     "trae": "Trae SOLO Cloud IDE 网关，账号/额度独立",
-    "codebuddy": "国际站，独立账号与独立网关",
+    "codebuddy": "CodeBuddy 国际站；与 WorkBuddy 国际同账号可共享额度",
+    "workbuddy_intl": "WorkBuddy 国际客户端；与 CodeBuddy 国际共享账号体系，独立模型目录",
 }
 
 
@@ -119,7 +143,7 @@ def _session() -> requests.Session:
     """带重试的会话。
 
     实测 www.codebuddy.cn / copilot.tencent.com 偶发 SSLEOFError 与连接重置，
-    额度、刷新这类幂等调用挂上重试后成功率明显提升。
+    额度查询允许网络重试；凭证刷新会单独禁用 HTTP 重放。
     """
     s = requests.Session()
     s.headers.update({
@@ -224,7 +248,7 @@ def start_login(platform_key: str, timeout: int = 20) -> dict:
         }
     url = "%s%s/auth/state?platform=%s" % (p["api_base"], p["prefix"], p["platform"])
     try:
-        r = _session().post(url, json={}, timeout=timeout)
+        r = _session().post(url, json={}, headers={"User-Agent": p.get("user_agent", UA)}, timeout=timeout)
         body = r.json()
     except Exception as e:
         raise ProviderError("请求 auth/state 失败: %s" % e)
@@ -256,45 +280,58 @@ def start_login(platform_key: str, timeout: int = 20) -> dict:
 # 步骤 2：轮询 token
 # --------------------------------------------------------------------------
 
-def poll_token(platform_key: str, state: str, timeout: int = 20) -> dict | None:
-    """GET {api_base}{prefix}/auth/token?state=...
+class LoginError(ProviderError):
+    """授权的终止错误；网络/服务端暂时错误仍使用 ProviderError。"""
 
-    返回 None 表示尚未授权（code=11217 login ing...），成功返回 token 字典。
-    """
-    # Trae 没有 /auth/token 轮询端点（网页授权只能回调导入），直接返回等待中，
-    # 避免对错误端点轮询抛出 "Expecting value" 误导报错。
+
+def poll_token(platform_key: str, state: str, timeout: int = 20) -> dict | None:
     if _is_trae(platform_key):
         return None
     p = get_platform(platform_key)
-    url = "%s%s/auth/token?state=%s" % (p["api_base"], p["prefix"], state)
+    url = "%s%s/auth/token" % (p["api_base"], p["prefix"])
     try:
-        r = _session().get(url, timeout=timeout)
+        session = _session()
+        # 轮询的下一次重试由调用方安排，不在 HTTP 层重放成功的 token 领取。
+        if isinstance(session, requests.Session):
+            session.mount(url, requests.adapters.HTTPAdapter(max_retries=0))
+        r = session.get(url, params={"state": state},
+                        headers={"User-Agent": p.get("user_agent", UA)}, timeout=timeout)
+        status = getattr(r, "status_code", 200)
+        if status == 429 or status >= 500:
+            raise ProviderError("轮询服务暂时出错 HTTP %s" % status)
+        if status >= 400:
+            raise LoginError("授权失败 HTTP %s，请重新获取授权链接" % status)
         body = r.json()
+    except (LoginError, ProviderError):
+        raise
     except Exception as e:
-        raise ProviderError("轮询 token 失败: %s" % e)
-
-    raw_code = body.get("code", -1)
+        raise ProviderError("轮询 token 失败: %s" % credentials.redact(e)) from None
+    if not isinstance(body, dict):
+        raise LoginError("授权响应格式错误，请重新获取授权链接")
     try:
-        code = int(raw_code)
+        code = int(body.get("code", -1))
     except (TypeError, ValueError):
         code = -1
+    if code == 11217:
+        return None
     if code not in (0, 200):
-        # 11217 = 尚在登录中
-        return None
-
+        raise LoginError("授权失败(code=%s): %s" % (code, credentials.redact(_msg(body))))
     data = body.get("data") or {}
-    access = data.get("accessToken") or data.get("access_token") or ""
-    if not access:
-        return None
-
-    return {
-        "access_token": access,
-        "refresh_token": data.get("refreshToken") or data.get("refresh_token"),
-        "expires_at": data.get("expiresAt") or data.get("expires_at"),
-        "domain": data.get("domain"),
-        "token_type": data.get("tokenType") or data.get("token_type") or "Bearer",
-        "raw": data,
-    }
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        data = data["data"]
+    if not isinstance(data, dict):
+        raise LoginError("授权响应缺少 access token")
+    access = data.get("accessToken") or data.get("access_token")
+    refresh = data.get("refreshToken") or data.get("refresh_token") or ""
+    if not isinstance(access, str) or not access.strip():
+        raise LoginError("授权响应缺少 access token，请重新获取授权链接")
+    if not isinstance(refresh, str):
+        raise LoginError("授权响应 refresh token 格式错误")
+    return {"access_token": access, "refresh_token": refresh,
+            "expires_at": credentials.expiry(access, data.get("expiresAt") or data.get("expires_at"),
+                                              data.get("expiresIn") or data.get("expires_in")),
+            "domain": data.get("domain"),
+            "token_type": data.get("tokenType") or data.get("token_type") or "Bearer", "raw": data}
 
 
 # --------------------------------------------------------------------------
@@ -307,7 +344,8 @@ def fetch_account_info(platform_key: str, access_token: str, state: str | None =
         return trae.get_user_info(access_token, timeout=timeout)
     """GET {prefix}/login/account?state=...  或退化到 {prefix}/accounts"""
     p = get_platform(platform_key)
-    headers = {"Authorization": "Bearer %s" % access_token}
+    headers = {"Authorization": "Bearer %s" % access_token,
+               "User-Agent": p.get("user_agent", UA)}
     if domain:
         headers["X-Domain"] = domain
 
@@ -352,34 +390,46 @@ def refresh_token(platform_key: str, access_token: str, refresh_tok: str,
         return trae.exchange_token(refresh_tok, timeout=timeout)
     p = get_platform(platform_key)
     url = "%s%s/auth/token/refresh" % (p["api_base"], p["prefix"])
+    # 官方 refresh 使用刷新凭证，不携带可能已经过期的 Bearer。
     headers = {
-        "Authorization": "Bearer %s" % access_token,
         "X-Refresh-Token": refresh_tok,
+        "X-Auth-Refresh-Source": "plugin",
         "Content-Type": "application/json",
+        "User-Agent": p.get("user_agent", UA),
+        "Origin": p["api_base"],
+        "Referer": p["api_base"] + "/",
     }
+    uid = credentials.claims(access_token).get("sub")
+    if uid:
+        headers["X-User-Id"] = str(uid)
     if domain:
         headers["X-Domain"] = domain
-
     try:
-        r = _session().post(url, headers=headers, json={}, timeout=timeout)
+        session = _session()
+        # 刷新会轮换凭证，不是幂等 POST；已发出请求后禁止 HTTP 层静默重放。
+        session.mount(url, requests.adapters.HTTPAdapter(max_retries=0))
+        r = session.post(url, headers=headers, json={}, timeout=timeout)
         body = r.json()
+        if r.status_code >= 400 or not isinstance(body, dict) or not _ok(body):
+            raise ProviderError("刷新请求失败 HTTP %s: %s" % (r.status_code, _msg(body) if isinstance(body, dict) else "响应格式错误"))
+        data = body.get("data") or {}
+        if isinstance(data, dict) and isinstance(data.get("data"), dict):
+            data = data["data"]
+        token = data.get("accessToken") or data.get("access_token") if isinstance(data, dict) else None
+        if not isinstance(token, str) or not token.strip():
+            raise ProviderError("刷新响应缺少 access token")
+        rotated_refresh = data.get("refreshToken") or data.get("refresh_token") or refresh_tok
+        if not isinstance(rotated_refresh, str):
+            raise ProviderError("刷新响应的 refresh token 格式错误")
+        return {
+            "access_token": token,
+            "refresh_token": rotated_refresh,
+            "expires_at": credentials.expiry(token, data.get("expiresAt") or data.get("expires_at"),
+                                             data.get("expiresIn") or data.get("expires_in")),
+            "domain": data.get("domain") or domain,
+        }
     except Exception as e:
-        raise ProviderError("刷新 token 失败: %s" % e)
-
-    if not _ok(body):
-        raise ProviderError("刷新 token 失败 (code=%s): %s" % (body.get("code"), _msg(body)))
-
-    data = body.get("data")
-    if not data:
-        raise ProviderError("刷新响应缺少 data")
-
-    return {
-        "access_token": data.get("accessToken") or data.get("access_token") or access_token,
-        "refresh_token": data.get("refreshToken") or data.get("refresh_token") or refresh_tok,
-        "expires_at": data.get("expiresAt") or data.get("expires_at"),
-        "domain": data.get("domain") or domain,
-        "raw": data,
-    }
+        raise ProviderError(credentials.redact(e, access_token, refresh_tok)) from None
 
 
 # --------------------------------------------------------------------------
@@ -604,7 +654,7 @@ def build_model_headers(platform_key, access_token, uid=None, session_id=None,
         "Authorization": "Bearer %s" % access_token,
         "Content-Type": "application/json",
         "Accept": "*/*",
-        "User-Agent": UA,
+        "User-Agent": p.get("user_agent", UA),
     }
     h[p["session_header"]] = session_id or str(uuid.uuid4())
     if uid:
@@ -636,10 +686,44 @@ def normalize_body(platform_key: str, body: dict,
         return trae.normalize_body(body, body.get("model") or "")
 
     p = get_platform(platform_key)
-    out = dict(body)
+    out = copy.deepcopy(body)
     out["stream"] = True
 
+    # 腾讯网关的 tool_choice 为字符串；保留指定函数名而非降为 required。
+    tc = out.get("tool_choice")
+    if isinstance(tc, dict):
+        typ = tc.get("type")
+        if typ == "function":
+            name = (tc.get("function") or {}).get("name") or tc.get("name")
+            if not name:
+                raise ProviderError("指定工具缺少 function.name")
+            out["tool_choice"] = name
+        elif typ in ("auto", "required", "none"):
+            out["tool_choice"] = typ
+    if out.get("tool_choice") == "none":
+        for key in ("tools", "functions", "tool_choice"):
+            out.pop(key, None)
+    if platform_key == "workbuddy_intl":
+        if "max_completion_tokens" in out:
+            limit = out.pop("max_completion_tokens")
+            if limit is not None:
+                out.setdefault("max_tokens", limit)
+        if isinstance(out.get("tools"), list):
+            out["tools"] = [
+                {"type": "function", "function": {k: v for k, v in t.items() if k != "type"}}
+                if isinstance(t, dict) and t.get("type") == "function" and "function" not in t
+                else t for t in out["tools"]]
+        out.pop("stream_options", None)
     msgs = list(out.get("messages") or [])
+    if platform_key == "workbuddy_intl":
+        for m in msgs:
+            if m.get("role") == "developer":
+                m["role"] = "system"
+        if str(out.get("model", "")).lower().startswith("deepseek") and any(
+                "reasoning_content" in m or m.get("reasoning") for m in msgs):
+            for m in msgs:
+                if m.get("role") == "assistant" and "reasoning_content" not in m:
+                    m["reasoning_content"] = str(m.get("reasoning") or "")
     if p.get("require_leading_system"):
         if not msgs or (msgs[0].get("role") != "system"):
             msgs.insert(0, {"role": "system",
@@ -668,7 +752,7 @@ def image_url(platform_key: str, image_base: str | None = None,
     """
     p = get_platform(platform_key)
     # 图像后端统一落在 copilot.tencent.com，与 platform 的 model_base 无关
-    base = (image_base or "https://copilot.tencent.com").rstrip("/")
+    base = (image_base or (p["model_base"] if platform_key in ("codebuddy", "workbuddy_intl") else "https://copilot.tencent.com")).rstrip("/")
     return "%s%s" % (base, image_path or "/v2/images/generations")
 
 
@@ -677,7 +761,27 @@ def config_url(platform_key: str, model_base: str | None = None) -> str:
     return "%s%s" % ((model_base or p["model_base"]).rstrip("/"), p["config_path"])
 
 
-def _fetch_config_models(platform_key, access_token, timeout=20) -> list:
+def _catalog_chat_ids(data: dict) -> list[str]:
+    """当前主代理白名单，补齐客户端显式定义的免费/付费线路。"""
+    ids = []
+    for agent in data.get("agents") or []:
+        if isinstance(agent, dict) and agent.get("name") == "cli":
+            ids.extend(x.strip() for x in agent.get("models") or []
+                       if isinstance(x, str) and x.strip())
+    if not ids:
+        return []
+    config = data.get("productFeaturesConfig") or {}
+    lines = (config.get("ModelRateLimitCap") or {}).get("lines") or []
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        free, paid = line.get("freeId"), line.get("paidId")
+        if isinstance(free, str) and free.strip() and isinstance(paid, str) and paid.strip():
+            ids.extend([free.strip(), paid.strip()])
+    return list(dict.fromkeys(ids))
+
+
+def _fetch_config_models(platform_key, access_token, timeout=20, *, strict=False, metadata=None) -> list:
     """读取 /v3/config 的 CLI 模型目录（国内、国际站各自返回）。"""
     p = get_platform(platform_key)
     headers = {
@@ -685,65 +789,78 @@ def _fetch_config_models(platform_key, access_token, timeout=20) -> list:
         "Accept": "application/json",
         "Origin": p["api_base"],
         "Referer": p["api_base"] + "/",
-        "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2",
+        "User-Agent": p.get("user_agent", "CLI/2.63.2 CodeBuddy/2.63.2"),
     }
     try:
-        r = _session().get(config_url(platform_key), headers=headers, timeout=timeout)
+        session = _session()
+        if strict and isinstance(session, requests.Session):
+            session.mount(config_url(platform_key), requests.adapters.HTTPAdapter(max_retries=0))
+        r = session.get(config_url(platform_key), headers=headers, timeout=timeout)
         if r.status_code != 200:
-            return []
+            raise ProviderError("/v3/config HTTP %s" % r.status_code)
         body = r.json() or {}
         if not _ok(body):
-            return []
-        agents = (body.get("data") or {}).get("agents") or []
-        for agent in agents:
-            if agent.get("name") == "cli":
-                ids = agent.get("models") or []
-                return [str(x).strip() for x in ids if str(x).strip()]
-        return []
-    except Exception:
+            raise ProviderError("/v3/config code=%s: %s" % (body.get("code"), _msg(body)))
+        data = body.get("data") or {}
+        if metadata is not None:
+            metadata.update(source=config_url(platform_key), credits={
+                m["id"]: m.get("credits") for m in data.get("models") or []
+                if isinstance(m, dict) and isinstance(m.get("id"), str)})
+        return _catalog_chat_ids(data)
+    except Exception as e:
+        if strict:
+            raise ProviderError(credentials.redact(e, access_token)) from None
         return []
 
 
 def fetch_upstream_models(platform_key, access_token, timeout=20, uid=None,
-                           machine_id=None, device_id=None) -> list:
-    """合并控制台与运行时配置的官方 CLI 模型白名单。
+                           machine_id=None, device_id=None, *, strict=False, metadata=None) -> list:
+    """以当前客户端 /v3/config 为准；旧目录仅在当前目录失败时回退。
 
-    两个接口独立更新：控制台成功也可能缺少 /v3/config 新增的模型。
-    仅收录 agents[cli].models，不把 data.models 元数据全集当作白名单；
-    任一接口失败仍保留另一个接口的结果。
+    客户端云配置覆盖基础 agents[cli].models，不把新旧白名单直接并集。
+    保留显式免费/付费线路，不把图片、视频和内部元数据混入聊天目录。
     """
     p = get_platform(platform_key)
     if _is_trae(platform_key):
+        if metadata is not None:
+            metadata.update(source=config_url(platform_key), credits={})
         return fetch_trae_models(platform_key, access_token, uid=uid,
-                                 machine_id=machine_id, device_id=device_id)
+                                 machine_id=machine_id, device_id=device_id, timeout=timeout)
     base = (p.get("model_base") or "").rstrip("/")
     headers = {
         "Authorization": "Bearer %s" % access_token,
         "Accept": "application/json",
         "Origin": p["api_base"],
         "Referer": p["api_base"] + "/",
-        "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2",
+        "User-Agent": p.get("user_agent", "CLI/2.63.2 CodeBuddy/2.63.2"),
     }
-    ids = []
+    ids, errors = [], []
     try:
-        r = _session().get(base + "/console/enterprises/personal/models",
-                           headers=headers, timeout=timeout)
-        if r.status_code == 200:
-            body = r.json() or {}
-            if _ok(body):
-                for agent in (body.get("data") or {}).get("agents") or []:
-                    if agent.get("name") == "cli":
-                        ids.extend(str(x).strip() for x in agent.get("models") or []
-                                   if str(x).strip())
-    except Exception:
-        # 国际站控制台持续 500 时 Retry 会抛异常；运行时目录仍应继续读取。
-        pass
-    ids.extend(_fetch_config_models(platform_key, access_token, timeout))
+        current = _fetch_config_models(platform_key, access_token, timeout, strict=True, metadata=metadata)
+        if current:
+            return current
+        raise ProviderError("/v3/config 当前客户端模型目录为空")
+    except Exception as e:
+        errors.append(credentials.redact(e, access_token))
+        if strict:
+            raise ProviderError("当前模型目录读取失败: " + errors[-1]) from None
+    path = p.get("models_path", "/console/enterprises/personal/models")
+    try:
+        session = _session()
+        r = session.get(base + path, headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            raise ProviderError("%s HTTP %s" % (path, r.status_code))
+        body = r.json() or {}
+        if not _ok(body):
+            raise ProviderError("%s code=%s: %s" % (path, body.get("code"), _msg(body)))
+        ids.extend(_catalog_chat_ids(body.get("data") or {}))
+    except Exception as e:
+        errors.append(credentials.redact(e, access_token))
     return list(dict.fromkeys(ids))
 
 
-def merge_upstream_model_ids(platform_key: str, ids) -> list:
-    """把一个平台上多个账号的官方模型目录并集合并进注册表。"""
+def merge_upstream_model_ids(platform_key: str, ids, *, replace: bool = True) -> list:
+    """合并渠道目录；单账号同步用 replace=False，保留其他账号及探测模型。"""
     ids = list(dict.fromkeys(str(x).strip() for x in (ids or []) if str(x).strip()))
     if not ids:
         return []
@@ -751,7 +868,7 @@ def merge_upstream_model_ids(platform_key: str, ids) -> list:
 
     def mutate(reg):
         current_ids = set(ids)
-        for old_mid, old_rec in list(reg.items()):
+        for old_mid, old_rec in (list(reg.items()) if replace else []):
             if not isinstance(old_rec, dict) or old_rec.get("type", "chat") != "chat":
                 continue
             if platform_key not in (old_rec.get("platforms") or []) or old_mid in current_ids:
@@ -818,10 +935,10 @@ TRAE_MODEL_DISPLAY_NAMES = {
 
 
 def fetch_trae_models(platform_key, access_token, uid=None, machine_id=None,
-                      device_id=None) -> list:
+                      device_id=None, timeout=20) -> list:
     """Trae 官方模型目录（过滤内部/子代理/占位模型）。"""
     items = trae.fetch_model_catalog(access_token, uid=uid, machine_id=machine_id,
-                                     device_id=device_id)
+                                     device_id=device_id, timeout=timeout)
     # 上游 display_name 会把多个 config_name 映射成同一显示名（如 seed-code-pro-0430
     # 也显示 Seed-2.1-Pro），仅在缺省映射不存在时写入，避免覆盖人工准确命名。
     for x in items:
@@ -834,12 +951,7 @@ def fetch_trae_models(platform_key, access_token, uid=None, machine_id=None,
 
 
 def available_models(platform_key: str) -> list:
-    """返回该平台「真实探测确认可用」的模型 id 列表。
-
-    上游无模型枚举接口（/v3/config 仅 productFeatures，/v1/models 404），因此模型
-    目录完全来自运行时探测并持久化在 DB 注册表（见 discovery.py）。本函数只读取
-    注册表中「该平台可用」的模型，不再内置任何静态清单。
-    """
+    """读取该渠道已登记模型（官方目录或真实探测）；账号可用性另行测活。"""
     return [e["id"] for e in catalog_entries(platform_key)]
 
 
@@ -887,6 +999,7 @@ def catalog_entries(platform_key: str) -> list:
     reg = db.get_model_registry()
     aliases = {"codebuddy_cn": "workbuddy", "ide": "codebuddy"}
     out = []
+    pricing = model_pricing.for_platform(platform_key, reg)
     for mid, rec in reg.items():
         if not isinstance(rec, dict):
             continue
@@ -894,7 +1007,7 @@ def catalog_entries(platform_key: str) -> list:
         if platform_key and platform_key not in platforms:
             continue
         out.append({"id": mid, "name": model_name(mid),
-                    "kind": rec.get("type", "chat")})
+                    "kind": rec.get("type", "chat"), "pricing": pricing[mid]})
     return out
 
 

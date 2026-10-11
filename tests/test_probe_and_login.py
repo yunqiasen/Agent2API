@@ -96,8 +96,8 @@ def test_fetch_upstream_models_falls_back_after_console_retry_error(monkeypatch)
     assert P.fetch_upstream_models("codebuddy", "tok") == ["glm-5.3"]
 
 
-def test_fetch_upstream_models_unions_console_and_config_catalogs(monkeypatch):
-    """One successful catalog must not hide models advertised by the other endpoint."""
+def test_fetch_upstream_models_prefers_current_config_over_legacy_catalog(monkeypatch):
+    """Current client cloud config replaces the old base model list."""
     import providers as P
 
     class Resp:
@@ -123,7 +123,7 @@ def test_fetch_upstream_models_unions_console_and_config_catalogs(monkeypatch):
 
     monkeypatch.setattr(P, "_session", lambda: Session())
     assert P.fetch_upstream_models("workbuddy", "tok") == [
-        "shared", "console-only", "config-only",
+        "shared", "config-only",
     ]
 
 

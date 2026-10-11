@@ -4,6 +4,7 @@ export const PLATFORMS = [
   { key: "workbuddy", name: "WorkBuddy" },
   { key: "trae", name: "TraeWork" },
   { key: "codebuddy", name: "CodeBuddy 国际" },
+  { key: "workbuddy_intl", name: "WorkBuddy 国际" },
 ] as const;
 
 export type PlatformKey = (typeof PLATFORMS)[number]["key"];
@@ -46,11 +47,11 @@ async function request<T>(path: string, opts: RequestInit = {}): Promise<T> {
   return data as T;
 }
 
-export function apiGet<T>(path: string): Promise<T> {
-  return request<T>(path);
+export function apiGet<T>(path: string, opts?: RequestInit): Promise<T> {
+  return request<T>(path, opts);
 }
-export function apiPost<T>(path: string, body?: unknown): Promise<T> {
-  return request<T>(path, { method: "POST", body: body ? JSON.stringify(body) : undefined });
+export function apiPost<T>(path: string, body?: unknown, opts?: RequestInit): Promise<T> {
+  return request<T>(path, { ...opts, method: "POST", body: body ? JSON.stringify(body) : undefined });
 }
 export function apiPatch<T>(path: string, body?: unknown): Promise<T> {
   return request<T>(path, { method: "PATCH", body: body ? JSON.stringify(body) : undefined });
@@ -77,10 +78,32 @@ export function num(v?: number): string {
 }
 
 // ---------- 类型 ----------
+export interface ModelPricing {
+  status: "free" | "multiplier" | "unpublished";
+  multiplier: string | null;
+  label: string;
+  source: string;
+  updated_at: number;
+  stale: boolean;
+  note: string;
+  observations?: { account_id: number; raw: string | null; source: string; updated_at: number; stale: boolean }[];
+}
+
 export interface ModelEntry {
   id: string; // 实际请求时发往上游网关的模型 id
   name: string; // 面板展示名
+  pricing?: ModelPricing;
   kind?: "chat" | "image" | "audio"; // chat=对话, image=图像生成, audio=语音/合成
+}
+
+export interface ModelSyncResult {
+  ok: boolean;
+  account_id: number;
+  platform: string;
+  count: number;
+  added: string[];
+  error?: string;
+  models?: ModelEntry[];
 }
 
 export interface PlatformInfo {
@@ -93,11 +116,17 @@ export interface PlatformInfo {
 }
 
 export interface ModelDiscoverResponse {
+  catalog_status?: Record<string, {
+    ok: boolean | null;
+    count: number;
+    reason: string;
+    accounts: { id: number; ok: boolean; count?: number; error?: string }[];
+  }>;
   ok: boolean;
   platforms: {
     platform: string;
     label: string;
-    models: ModelEntry[]; // 该平台可用的真实模型（探测确认）
+    models: ModelEntry[]; // 该平台已登记目录（官方配置或历史探测）
     note?: string;
   }[];
   exposed: ModelEntry[]; // 对外 /v1/models 暴露的清单
@@ -131,6 +160,11 @@ export interface Account {
   quota_updated_at?: number;
   expires_at_sec?: number;
   has_refresh?: boolean;
+  last_refresh_at?: number;
+  last_refresh_attempt?: number;
+  refresh_error?: string;
+  refresh_retry_at?: number;
+  shared_quota?: boolean;
   supports_checkin?: boolean;
   checkin_today?: number;
   checkin_streak?: number;
@@ -152,6 +186,9 @@ export interface ApiKey {
   name: string;
   api_key: string;
   platform: string;
+  model_scope: string;
+  allowed_models: string[];
+  model_scope_error?: string;
   req_count?: number;
   last_used?: number;
   enabled?: boolean;
@@ -210,6 +247,8 @@ export interface JoinPollResp {
   msg?: string;
   error?: string;
   quota_error?: string;
+  model_sync?: ModelSyncResult;
+  expired?: boolean;
 }
 
 export interface OverviewUsage {

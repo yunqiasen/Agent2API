@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import time
 import uuid
@@ -23,7 +24,9 @@ IDE_VERSION = "0.1.43"
 IDE_VERSION_CODE = "20260716"
 DEVICE_BRAND = "83DG"
 OS_VERSION = "Windows 11 Pro"
-FUNCTION = "solo_work_lite"
+# TraeWork 0.1.69 的 Work 远端场景；目录和聊天必须保持一致。
+# 2026-10-07 同账号实测：lite 漏掉 Step-5 / GLM-5.3 / DeepSeek-V4.1。
+FUNCTION = "solo_work_remote"
 
 EP_CHAT = "/api/agent/v3/llm_utils_chat"
 EP_MODELS = "/api/ide/v1/get_detail_param"
@@ -231,7 +234,7 @@ def fetch_model_catalog(access_token, uid=None, machine_id=None, device_id=None,
 
 def normalize_body(body: dict, model: str) -> dict:
     """OpenAI chat body → Trae SOLO body。"""
-    out = dict(body)
+    out = copy.deepcopy(body)
     out["stream"] = True
     out["function"] = FUNCTION
     model = str(model or "").strip() or "DeepSeek-V4-Flash-Official"

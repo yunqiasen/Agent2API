@@ -1,24 +1,21 @@
 # -*- coding: utf-8 -*-
-"""运行时动态模型发现 —— 程序不内置任何模型目录。
+"""动态模型目录：官方 CLI 白名单 + 运行时最小请求探测。
 
-设计原则（来自需求「程序不要内置任何模型，探测到什么模型就提供什么模型」）：
-  - 对外暴露的模型目录 100% 来自真实账号的最小请求探测结果，存在 DB 注册表；
-  - 本文件的 PROBE_SEED 只是「要尝试探测的候选 ID 列表」，绝不是对外目录，
-    探测不到的候选会被自动丢弃，探测到的才会进入注册表；
-  - 类型（chat / image / audio）由「哪个端点真正接受该模型」判定，而非写死；
-  - 客户端请求一个注册表外的模型时，会触发实时探测回退（见 proxy.live_resolve）。
-
-上游无模型枚举接口（/v3/config 仅 productFeatures，/v1/models 404），因此发现
-只能通过「对候选 ID 做真实请求」实现。
+目录登记与账号测活分别处理：上游列出模型不保证每个账号都调用成功。
+PROBE_SEED 只是探测候选，不直接对外暴露；所有结果持久化到 DB 注册表。
+新账号接入采用增量同步，保留同渠道其他账号与历史探测模型。
 """
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import db
+import credentials
+import model_pricing
 import proxy
 import providers as P
 
@@ -305,34 +302,70 @@ def _run_image_discovery():
             _image_discovery_running = False
 
 
-def sync_upstream_catalogs() -> dict:
-    """合并每个平台所有可用账号的官方 CLI 模型目录。
+def sync_account_catalog(account_row) -> dict:
+    """接入/重试只同步该账号目录，增量收录，不覆盖同渠道历史模型。"""
+    acc = dict(account_row)
+    result = {"account_id": acc["id"], "platform": acc["platform"],
+              "ok": False, "count": 0, "added": []}
+    try:
+        acc = proxy.ensure_token(account_row)
+        metadata = {}
+        ids = P.fetch_upstream_models(
+            acc["platform"], acc["access_token"], timeout=(4, 10), strict=True, metadata=metadata,
+            uid=acc.get("uid") or None, machine_id=acc.get("machine_id") or None,
+            device_id=acc.get("device_id") or None)
+        if not ids:
+            raise P.ProviderError("上游模型目录为空或读取失败，已保留原目录，请点击刷新模型重试")
+        model_pricing.record_success(acc["platform"], acc["id"], ids, metadata)
+        result["added"] = P.merge_upstream_model_ids(acc["platform"], ids, replace=False)
+        result.update(ok=True, count=len(set(ids)))
+    except Exception as e:
+        model_pricing.record_failure(acc["platform"], acc["id"])
+        result["error"] = credentials.redact(
+            e, acc.get("access_token"), acc.get("refresh_token"))[:1000]
+    logging.getLogger("agent2api.catalog").warning(
+        "catalog_sync account_id=%s platform=%s ok=%s count=%s error=%s",
+        result["account_id"], result["platform"], result["ok"],
+        result["count"], result.get("error", ""))
+    return result
 
-    账号之间的套餐/灰度可能不同，单取第一个账号会漏掉其它账号拥有的模型。
-    本次至少成功读取一个账号后才清理平台旧目录，单账号失败不影响并集。
-    """
+
+def sync_upstream_catalogs(*, statuses: dict | None = None) -> dict:
+    """合并当前客户端的各账号目录；部分失败时只增量更新，保留其他账号模型。"""
     result = {}
     for platform in P.PLATFORMS:
-        ids = []
+        ids, outcomes = [], []
         rows = [r for r in db.list_accounts(platform)
-                if r["enabled"] and r["status"] != "banned"]
+                if r["enabled"] and r["status"] not in ("banned", "disabled")]
         for row in rows:
+            acc = dict(row)
             try:
                 acc = proxy.ensure_token(row)
                 token = (acc.get("access_token") or "").strip()
                 if not token:
-                    continue
+                    raise P.ProviderError("账号缺少访问凭证")
+                metadata = {}
                 got = P.fetch_upstream_models(
                     platform, token, uid=acc.get("uid") or None,
                     machine_id=acc.get("machine_id") or None,
-                    device_id=acc.get("device_id") or None)
-                ids.extend(got or [])
-            except Exception:
-                continue
-        if ids:
-            result[platform] = P.merge_upstream_model_ids(platform, ids)
-        else:
-            result[platform] = []
+                    device_id=acc.get("device_id") or None,
+                    timeout=(4, 10), strict=True, metadata=metadata)
+                if not got:
+                    raise P.ProviderError("当前客户端模型目录为空")
+                model_pricing.record_success(platform, row["id"], got, metadata)
+                ids.extend(got)
+                outcomes.append({"id": row["id"], "ok": True, "count": len(got)})
+            except Exception as e:
+                model_pricing.record_failure(platform, row["id"])
+                outcomes.append({"id": row["id"], "ok": False,
+                                 "error": credentials.redact(e, acc.get("access_token"),
+                                                             acc.get("refresh_token"))[:500]})
+        complete = bool(outcomes) and all(x["ok"] for x in outcomes)
+        result[platform] = P.merge_upstream_model_ids(platform, ids, replace=complete) if ids else []
+        if statuses is not None:
+            statuses[platform] = {"ok": complete if outcomes else None,
+                                  "count": len(set(ids)), "accounts": outcomes,
+                                  "reason": "" if rows else "无可用账号，保留原目录"}
     return result
 
 

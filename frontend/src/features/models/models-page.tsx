@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { ModelPrice } from "./model-price";
 import {
   Boxes,
   RefreshCw,
@@ -18,6 +19,8 @@ import {
   apiPost,
   type ModelDiscoverResponse,
   type PlatformInfo,
+  type ModelEntry,
+  type ModelPricing,
   PLATFORMS,
 } from "@/lib/api";
 import {
@@ -54,12 +57,14 @@ function ModelChip({
   id,
   name,
   kind,
+  pricing,
   enabled,
   onToggle,
 }: {
   id: string;
   name: string;
   kind?: string;
+  pricing?: ModelPricing;
   enabled?: boolean; // 传入即显示渠道×模型开关；不传则纯展示（对外暴露区）
   onToggle?: (enabled: boolean) => void;
 }) {
@@ -75,6 +80,7 @@ function ModelChip({
         <span className="flex items-center gap-1 leading-tight font-medium">
           {name}
           {kindBadge(kind)}
+          {pricing && <ModelPrice name={name} pricing={pricing} />}
           {switchable && (
             <Switch
               checked={enabled}
@@ -102,7 +108,7 @@ function PlatformCard({
 }: {
   keyId: string;
   label: string;
-  models: { id: string; name: string; kind?: string }[];
+  models: ModelEntry[];
   loading: boolean;
   note?: string;
   delay?: number;
@@ -149,6 +155,7 @@ function PlatformCard({
                 id={m.id}
                 name={m.name}
                 kind={m.kind}
+                pricing={m.pricing}
                 enabled={!(disabledIds?.has(m.id))}
                 onToggle={
                   onToggleModel ? (v) => onToggleModel(m.id, v) : undefined
@@ -259,7 +266,16 @@ export function Models() {
         setImageDiscovering(true);
         pollImageProgress(60); // 每 4s 一次，约 240s 上限（后台图像探测预算 180s）
       } else {
-        toast.success(`目录已刷新，共收录 ${total} 个平台模型条目`);
+        setImageDiscovering(false);
+        const statuses = Object.values(d.catalog_status ?? {});
+        const failed = statuses.flatMap((s) => s.accounts.filter((a) => !a.ok));
+        const skipped = statuses.filter((s) => s.ok === null).length;
+        const suffix = skipped ? `；${skipped} 个渠道无可用账号，保留原目录` : "";
+        if (failed.length) {
+          toast.error(`目录部分更新：${failed.length} 个账号失败，旧目录已保留。#${failed[0].id} ${failed[0].error ?? "读取失败"}${suffix}`, { duration: 10000 });
+        } else {
+          toast.success(`官方目录已刷新，共 ${total} 个平台模型条目${suffix}；未执行模型测试`);
+        }
       }
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "拉取失败");
@@ -273,18 +289,14 @@ export function Models() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const skeletons = [
-    { k: "workbuddy", l: "WorkBuddy" },
-    { k: "trae", l: "TraeWork" },
-    { k: "codebuddy", l: "CodeBuddy 国际" },
-  ];
+  const skeletons = PLATFORMS.map((p) => ({ k: p.key, l: p.name }));
 
   return (
     <div className="mx-auto w-full max-w-[1280px] space-y-5 p-5 md:p-7">
       <PageHeader
         icon={Boxes}
         title="模型"
-        subtitle="各平台可用模型由真实账号探测得到（不内置目录）：探测到什么就提供什么，文本 / 图像 / 音频全部收录"
+        subtitle="按各客户端当前官方配置同步模型；刷新只读取目录，不发起聊天或生图测试"
         right={
           <>
             <Button onClick={discover} disabled={loading} className="min-w-[150px] gap-1.5">

@@ -1,6 +1,6 @@
 # Agent2API
 
-WorkBuddy / TraeWork / CodeBuddy（国际）三平台 **hy3 模型反向代理 + 号池控制面板**。
+WorkBuddy / TraeWork / CodeBuddy 国际 / WorkBuddy 国际 四渠道 **多模型反向代理 + 号池控制面板**。
 对外暴露标准 OpenAI 兼容接口，对内做 SSO 登录、令牌自动续期、号池调度、额度监控与调用鉴权。
 
 > 接口契约以仓库内 `tests/` 的回归测试和当前容器实测为准；上游模型、额度与签到结果会随账号和服务端状态变化。
@@ -13,6 +13,7 @@ WorkBuddy / TraeWork / CodeBuddy（国际）三平台 **hy3 模型反向代理 +
 |---|---|---|---|
 | **直接代码上游** | [DearLicy/hy3api](https://github.com/DearLicy/hy3api) | 最初的 Python 反代、号池、管理后台、模型发现与 Docker 部署基线 | `app.py`、`db.py`、`proxy.py`、`discovery.py`、`frontend/` |
 | **Trae 适配移植来源** | [itamzxm/ai-multi-platform-proxy](https://github.com/itamzxm/ai-multi-platform-proxy) | TraeWork / Trae SOLO 的登录、Token 交换、请求头、请求体、SSE 解析、额度与签到接口适配 | [`trae.py`](trae.py) |
+| **WorkBuddy 国际协议参考** | [ardeyouxipianyi/workbuddy2api-intl](https://github.com/ardeyouxipianyi/workbuddy2api-intl/tree/7c93b46ad045798c5da5953f0a5bc4e9e8a7b8f9) | 国际客户端登录、刷新头/响应、JWT 到期时间、模型 profile 及工具请求兼容；复用本项目 SQLite 号池和公共反代，不引入其独立网关或静态对外目录 | `providers.py`、`credentials.py`、`proxy.py`；[MIT 声明](THIRD_PARTY_NOTICES.md) |
 | **间接协议参考，非直接代码上游** | [jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools) | hy3api 原实现注明的 WorkBuddy / CodeBuddy OAuth、平台常量、账号信息、Token 刷新及额度接口参考 | [`providers.py`](providers.py) |
 
 **cockpit-tools 的定位**：Agent2API 不是从它 fork 的，它也不是本服务的运行依赖。
@@ -23,15 +24,19 @@ WorkBuddy / TraeWork / CodeBuddy（国际）三平台 **hy3 模型反向代理 +
 和 [Trae OAuth](https://github.com/jlcodes99/cockpit-tools/blob/cc4a3f4a1573143f8551fa27825aec443e2df09f/src-tauri/src/modules/trae_oauth.rs) 模块；
 **本项目的 Trae 适配仍以 ai-multi-platform-proxy 为移植来源**，不因参考仓库也支持 Trae 而混同来源。
 
-最近一次代码上游、参考项目与三渠道模型目录核对：**2026-09-13**，详见 [更新核对报告与完整模型清单](docs/upstream-review-2026-09-13.md)。
+最近一次代码上游与参考项目核对：**2026-09-13**，详见 [更新核对报告与完整模型清单](docs/upstream-review-2026-09-13.md)。
+第四渠道接入补齐与最新实测：**2026-09-17**，详见 [WorkBuddy 国际验收记录](docs/workbuddy-intl-parity-2026-09-17.md)（233 项 Python 回归、7 项前端轮询测试及真实双轮工具调用）。
+
+最新官方客户端模型目录核对：**2026-10-08**，详见 [Buddy 三渠道目录修复记录](docs/buddy-model-catalog-2026-10-08.md)。当前目录：WorkBuddy 18项、WorkBuddy 国际25项、CodeBuddy 国际 CLI兼容线路21项；TraeWork维持21项。目录刷新只读取配置，不执行生成测试。
 
 ### 本项目的扩展与维护
 
 Agent2API 在原有服务上整合、扩展并维护以下能力：
 
-- WorkBuddy、TraeWork、CodeBuddy 国际三渠道号池；
+- WorkBuddy、TraeWork、CodeBuddy 国际、WorkBuddy 国际四渠道号池；
 - 账号导入、Token 自动刷新、额度同步、签到和单账号测活；
-- 模型动态发现、渠道×模型开关、模型调用优先级；
+- 模型动态发现、渠道×模型开关、模型调用优先级及渠道倍率展示；
+- 调用密钥按渠道和模型多选分配权限，支持原 Key 编辑；
 - OpenAI Chat Completions / Responses / Images 兼容接口；
 - 管理后台、调用鉴权、请求日志和 Docker 持久化部署。
 
@@ -80,24 +85,25 @@ curl http://127.0.0.1:8530/v1/chat/completions \
 
 ---
 
-## 2. 三平台对照（实测确认）
+## 2. 四渠道对照
 
 | 平台 | key | 登录域 | platform 参数 | 模型网关 | 会话头 |
 |---|---|---|---|---|---|
-| WorkBuddy | `workbuddy` | `www.codebuddy.cn` | `workbuddy` | `copilot.tencent.com` | `X-WorkBuddy-Session-Id` |
+| WorkBuddy | `workbuddy` | `www.codebuddy.cn` | `workbuddy` | `www.workbuddy.cn` | `X-WorkBuddy-Session-Id` |
 | TraeWork | `trae` | `www.trae.cn` | `trae` | `trae-api-cn.mchost.guru` | SOLO 专用头 |
 | CodeBuddy 国际 | `codebuddy` | `www.codebuddy.ai` | `ide` | `www.codebuddy.ai` | `X-CodeBuddy-Session-Id` |
+| WorkBuddy 国际 | `workbuddy_intl` | `www.workbuddy.ai` | `workbuddy-ai` | `www.workbuddy.ai` | `X-WorkBuddy-Session-Id` |
 
 ### 关键实测结论
 
 1. **WorkBuddy 与 CodeBuddy CN 使用同一套账号体系，本项目只保留 WorkBuddy 渠道。**
-   两者共用国内账号、额度和 `copilot.tencent.com` 网关；旧注册表里的 `codebuddy_cn` 引用会在启动和模型刷新时迁入 `workbuddy`，避免重复号池，同时不丢历史模型。
+   两者共用国内账号和额度；当前 WorkBuddy 客户端模型网关为 `www.workbuddy.cn`。旧注册表里的 `codebuddy_cn` 引用会在启动和模型刷新时迁入 `workbuddy`，避免重复号池，同时不丢历史模型。
 
 2. **TraeWork 是独立渠道。**
    Trae 使用 SOLO 专用请求头、请求体和 `trae-api-cn.mchost.guru` 网关，账号与国内 WorkBuddy 额度分开。
 
-3. **CodeBuddy 国际站是完全独立的账号与网关。**
-   国际账号使用 `www.codebuddy.ai`，与国内 WorkBuddy、TraeWork 的账号和额度分开。
+3. **两个国际客户端共享国际账号体系，与国内 WorkBuddy、TraeWork 分开。**
+   CodeBuddy 国际与 WorkBuddy 国际保留独立渠道、模型目录和调用统计。相同 UID/租户的国际额度汇总去重；同一 refresh 凭证跨渠道导入后统一串行轮换并同步保存，不同登录会话的 token 不相互覆盖。不自动复制旧账号到新渠道。
 
 4. **上游只支持流式。**
    `stream=false` 一律返回 `400 {"code":11101,"msg":"Non-stream chat request is currently not supported"}`。
@@ -109,7 +115,7 @@ curl http://127.0.0.1:8530/v1/chat/completions \
    → `providers.normalize_body()` 会在命中该平台时自动插入一条 system 消息（内容取设置里的「兜底 system 提示词」）。CN 网关无此限制，补齐也无副作用。
 
 6. **刷新令牌走请求头，不是 body。**
-   `POST {api_base}/v2/plugin/auth/token/refresh`，头里带 `Authorization: Bearer {access}` + `X-Refresh-Token: {refresh}`，body 为 `{}`。三平台一致。
+   腾讯三个渠道使用 `POST {api_base}/v2/plugin/auth/token/refresh`，携带 `X-Refresh-Token`、`X-Auth-Refresh-Source: plugin`，不携带过期 Bearer；刷新 POST 禁止 HTTP 层自动重放。Trae 使用自己的 `ExchangeToken`。四渠道统一由 `proxy.ensure_token` 提前续期并持久化轮换结果。
 
 7. **上游没有 `responses` 接口，但本代理提供。** `/v1/responses`、`/v2/responses` 上游均 404。
    → 本服务在反代层**把 OpenAI Responses API 转译为 `chat/completions`**（`responses.py`）：
@@ -117,30 +123,26 @@ curl http://127.0.0.1:8530/v1/chat/completions \
    上游 SSE 流实时转写成 Responses 事件（或聚合成 `response` 对象返回非流式）。
    详见第 5 节。
 
-8. **程序不内置对外模型目录，模型列表来自官方 CLI 目录与运行时真实探测。** WorkBuddy / CodeBuddy 合并控制台 `/console/enterprises/personal/models` 与 `/v3/config` 的 CLI 白名单（两者独立更新，任一失败仍保留另一来源），TraeWork 读取 `get_detail_param`；官方目录不可用或未覆盖的模型再用最小请求验证。探测逻辑集中在 `discovery.py`：
-   - `PROBE_SEED` 只是一份「要尝试探测的候选 ID 清单」（文本/图像/音频都涵盖），**绝不是对外目录**；探测不到的候选会被自动丢弃，探测到的才进入注册表；
-   - 每次「刷新模型目录」或首次部署启动，会合并各平台所有启用账号能读取到的官方 CLI 目录，再对候选做最小请求，把确认结果写入 **数据库注册表**（`db.get_model_registry()` / `discovered_models` 设置），并记录其 `type`（chat / image / audio）与可用 `platforms`；
-   - 客户端请求一个注册表外的模型时，请求链路会触发 `live_probe_model` 实时探测回退，命中即写入注册表；探测不到则记入负面缓存并在限定 TTL 内直接返回 503，避免反复盲打上游；
-   - 对外 `/v1/models`、面板「模型」页、以及请求调度（chat / 图像端点分流）**全部读这张注册表**，代码里不写死任何模型名。
-   已探测固化的真实模型示例（仅供理解，不作为代码内常量）：
-   - **文本**：`hy3`、`glm-5.2/5.1/5.0`、`glm-5v-turbo`、`minimax-m3`、`kimi-k3/k-2.7/k-2.6/k-2.5`、`auto`、`deepseek-v4-flash`、`deepseek-v3.2`
-   - **图像**：`hunyuan-image-v3.0-art`、`hunyuan-image-v3.0`（走独立的 `/v2/images/generations` 端点）
-   - **音频**：`hunyuan-tts` 等（类型标注 audio，具体可用 ID 以运行时探测为准）
-   - `kimi-k2.7-code` 三网关均返回 `11102`（上游未注册），不进入目录、请求时直接 503 拦截。
-   展示目录不等于每个平台都支持全部模型，实际请求由注册表里的 `platforms` 决定（见下）。
+8. **程序不内置固定对外目录，刷新以各客户端当前官方配置为准。** WorkBuddy、WorkBuddy 国际和 CodeBuddy 国际 CLI兼容线路读取各自网关的 `/v3/config`；云配置覆盖旧基础目录，不再将旧目录直接并回。只取主 `cli` 白名单及明确的免费/付费线路，忽略图像、视频和内部模型元数据。TraeWork读取 `get_detail_param` 的 `solo_work_remote` 场景。
+   - 账号导入/网页登录后自动增量同步该账号目录；失败保留旧目录，可在卡片点“刷新模型”重试。
+   - 「刷新模型目录」合并各渠道所有启用账号的目录；该渠道全部读取成功才清理旧聊天模型，部分失败仅增量更新并明确报错；无可用账号时提示保留原目录。既有图像/音频登记不受聊天目录清理影响。
+   - 刷新按钮与首次启动的目录初始化**只读取配置，不发起聊天、生图或音频生成**。正常同步的结果写入数据库注册表（`discovered_models`）。
+   - 账号卡片“测活”仍是用户主动发起的真实模型调用，会按上游规则计费。外部请求未知模型时仍有实时探测回退；它属于该次外部请求链路，不是定时测速任务。
+   - `/v1/models`、模型页和请求路由读取同一张注册表，渠道开关及优先级继续生效。
+   - CodeBuddy 国际保留原有 CLI命名模型兼容方式，与官网IDE的主代理档位目录分开；详情见 [当前客户端目录说明](docs/buddy-model-catalog-2026-10-08.md)。
+   目录可见只证明该客户端配置返回此ID，不代表所有账号已测活，也不代表全部免费。
 
-9. **请求按模型类型与注册表平台分流，不盲选账号。** 未绑定平台的 Key 使用数据库注册表里该模型的 `platforms`（由 `proxy.model_route()` 读取，必要时触发 `live_probe_model` 实时探测）：
-   - 文本模型 `hy3 / glm-* / minimax-m3 / kimi-k3 / kimi-k2.5 / kimi-k2.6` 可走 **三平台**，优先国内 WorkBuddy，国际 CodeBuddy 作故障/额度兜底；
-   - `auto / deepseek-v4-flash / deepseek-v3.2 / kimi-k2.7` 仅国内两网关（国际站返回 `11102`）；
-   - 图像模型 `hunyuan-image-*` **只走国内网关的 `/v2/images/generations`**（国际站 `11102`；chat 网关返回 `11103 aiart 不支持`）；
-   - 音频模型按 `audio` 类型标注，走 chat 网关（端点能力由上游决定，探测确认即收录）。
+9. **请求按模型类型、渠道开关与优先级分流，不盲选账号。** 未绑定渠道的 Key 在该模型已登记且开启的渠道中，按“逐模型优先级 → 默认优先级”选择，再进入对应号池。第四渠道沿用同一套机制；旧三渠道相对顺序保持，新渠道默认追加末尾。
+   - 模型支持范围来自当前目录/实测，不以固定的“三平台同模型”矩阵推断；
+   - 图像按 `image` 路由独立端点，国际凭证不发往国内图像网关；
+   - 音频仍按现有 `audio` 分流，端点能力以实测为准。
    Key 显式绑定平台时绑定优先，不会越权切到其它平台。上游返回 `11102 / 11103 / service info not found / model [...] not found` 这类明确的「模型未注册」错误时，会先继续尝试该渠道的其它账号（账号套餐可能不同），该渠道都失败后再切换候选渠道；普通参数 400 原样返回，避免掩盖客户端错误。模型 ID 在注册表里无可用平台（且实时探测也失败）时，服务返回清晰 503，绝不在所有账号中随机碰运气。
 
 10. **图像生成走独立端点 `/v1/images/generations`。** 图像模型（混元图像系列）与对话模型不共用 chat 网关，请求体为 OpenAI 兼容格式 `{"model","prompt","n","size",...}`，上游返回 `data.data[].url` 与 `usage.credit`。任务队列上限（`13212 JobNumExceed`）按可重试限流处理。
 
 11. **Token 与积分统计只认上游真实 `usage`。** 非流式请求从聚合后的最终 SSE 帧读取 `prompt_tokens` / `completion_tokens` / `total_tokens`；流式 chat 使用旁路解析器，在不改动透传字节的前提下捕获最终帧；Responses 流也会把原始 usage 回传给日志层。积分直接记录上游 `usage.credit`，包括有效的 `credit=0`，不再使用 `tokens × 固定单价` 人工换算。老版本产生的估算积分因无法无损恢复，保留日志但标记为非真实来源，不计入面板的真实积分合计与扣费明细；上游未返回 usage 时 token 记为 0（未知），不会按字符数伪造。
 
-12. **上游偶发 SSL 抖动。** `copilot.tencent.com` 会间歇性 `SSLEOFError`。已在两处加重试：同账号网络层重试（`proxy.NET_RETRY = 2`）+ 登录/额度类幂等请求的 `urllib3.Retry`。
+12. **上游偶发 SSL 抖动。** 网络与额度查询保留有限重试；OAuth token 领取、刷新轮换及交互式单号目录同步不做 HTTP 层透明重放。登录轮询串行执行，失败/过期会停止并提示重试。
 
 13. **上游 SSE 不带 charset。** requests 会退化成 ISO-8859-1 解码导致中文乱码。已强制 UTF-8 解码，流式透传则直接转发原始字节。
 
@@ -149,23 +151,47 @@ curl http://127.0.0.1:8530/v1/chat/completions \
 ## 3. 功能
 
 **号池**
+- 接入后自动同步模型；卡片可刷新目录、选择模型测活。目录失败、额度失败和凭证续期失败独立反馈，成功重新授权会清除旧续期失败退避。
 - 三种方式加号：网页 SSO 登录、手填 access/refresh token、粘贴 Cockpit Tools 导出的 JSON（支持数组，按平台+uid 原位更新；旧渠道迁移会自动合并重复账号）
-- 令牌自动续期：按 `expires_at` 提前 `refresh_ahead` 秒刷新，带账号级锁避免并发重复刷新；后台线程每 5 分钟巡检
+- 令牌自动续期：后台每 5 分钟检查，默认提前 900 秒；兼容秒/毫秒、上游期限和 JWT `exp`，历史缺失时间自动补齐。未知有效期且有 refresh 的账号每小时尝试续期，失败指数退避。新旧令牌原子保存，账号卡片单独展示最后续期成功时间/失败原因，额度成功不会覆盖续期失败。详情见 [凭证保活说明](docs/credential-refresh-2026-09-13.md)。
 - 调度策略：先按模型路由到国内/国际候选平台，再在平台内执行 `least_used`（默认）/ `round_robin` / `random`
 - 失败自动换号重试；401 触发强制刷新后再试；HTTP 200 包装的 SSE 业务错误也会在返回客户端前识别并换号；单次请求最多尝试 9 个账号，按候选渠道均分，避免坏号池长期占满 Worker
 - 额度展示严格使用上游实时口径：TraeWork 读取 `usage_summary.total_amount / consumed_amount` 并保留真实套餐列表；刷新失败保留上一份成功数据并报错，不用 0 覆盖；真实同步到 0 时明确显示 0，不再写成“未同步”
 - 账号卡片使用事实标签：`已接入`、`未过期`、`本站调用`；TraeWork 未返回连签天数时隐藏该字段，不伪造“连续 0 天”
 - 单号启停、删除、权重、备注
+- 账号卡片开关仅控制模型调用：关闭后不再参与外部 API 调度，但单号签到、全部签到、自动签到/补签及凭证自动刷新继续执行；删除账号才会移出维护范围。
 - 批量签到以上游为准：单号、批量、自动签到都逐号查询上游状态；上游未签才领取，已签才跳过。本地 `checkin_today` 只做页面缓存，不参与是否请求的判断；状态查询失败或领取后的状态回读失败会直接记为失败，不把本地卡片伪造成“已签到”；支持按当前渠道签到，前端将“新签到 / 已签跳过 / 失败”分开显示，容器日志记录每个账号的 status / claim / status_after_claim 阶段
+- TraeWork 模型目录及聊天请求统一使用当前 Work 场景 `solo_work_remote`，动态获取模型，不沿用旧 `solo_work_lite` 目录；2026-10-07 六个账号实测新增 `step-5-preview`、`deepseek-v4.1-flash`、`glm-5.3`。目录可见不等于模型推理已测，详见 [目录修复记录](docs/trae-remote-catalog-2026-10-07.md)。
 - TraeWork 每日签到：当前统一使用凭证中的 `uid` 作为 `X-Device-Id`，因为实测它同时适配扫码登录与 Token 导入账号；模型/额度请求仍会携带凭证里的 machine/device 字段。实测（2026-08-31）全号池签到链路均能得到上游已签到结果；9074 文案「参与用户太多」不能直接当作容量结论，面板会保留原始错误。
 - 渠道×模型开关：模型页每个渠道卡片内按模型开/关（如关闭 WorkBuddy 的 glm-5.3）；
   开关全局生效——真实调用、Key 显式绑定、对外 `/v1/models` 清单一并拦截；
-  三渠道全关的模型从清单隐藏；测活与模型探测不受开关影响
+  所有渠道全关的模型从清单隐藏；测活与模型探测不受开关影响
+
+**模型倍率**
+- 「模型」页各渠道条目显示 **免费 / ×倍率 / 未公布**；点击徽标查看官方原值、来源、同步时间和各账号样本。
+- 精确零倍率才标免费；缺失、异常或同渠道账号返回冲突时显示未公布。刷新失败保留旧数据并标记，成功响应缺少价格则更新为未公布。
+- 同一 ID 在不同渠道价格独立；顶部聚合列表没有统一价格，公共 `/v1/models` 不增加价格字段。
+- 复用官方目录响应提取倍率，查看/刷新不调用生成接口；Trae 未核验的价格字段显示未公布。倍率只是提示，不改渠道优先级或实际积分账本。
 
 **调用鉴权**
 - 自定义 API Key，支持 `Authorization: Bearer`、`x-api-key`、`?key=` 三种传法
-- Key 可绑定平台 —— 该 Key 的请求只命中对应平台的账号；模型与绑定冲突时返回清晰错误，不会越权切平台
+- Key 可绑定单渠道或全池，并选择「不限模型 / 指定模型」；指定模式多选且至少 1 项，新模型不自动加入白名单。旧 Key 升级后保持不限模型。
+- 在「API Key → 新建调用密钥」选渠道和模型；已有 Key 在卡片点击「编辑」。编辑保留原密钥字符串、启停状态及调用统计。
+- 模型页关闭的模型，在 Key 多选区灰显且鼠标/键盘均不可选；全池按模型 ID 去重，只要任一支持渠道开启即可选择，单渠道绑定不借用其他渠道的开关。
+- 历史选择被全局关闭后保留为停用标签，实际调用同步停用；可以单独移除标签，也可以在模型页重新开启后恢复原 ID。切换渠道产生失效选择时，先移除或恢复再保存。
+- 支持按名称/ID搜索；目录读取和保存失败保留表单内容，保存时后端重新校验。渠道与模型权限原子更新，失败保持原权限。重复自定义 Key 返回409。
+- `/v1/models` 只列出 Key 名单、绑定渠道及全局开关的交集；仍为原 OpenAI 字段结构，不附带倍率。
+- 聊天、Responses、图像及别名入口共同执行模型权限校验。指定 Key 的越界请求返回403 `model_not_allowed`，在路由与探测前拦截；默认模型及系统内部替换后的模型也要在许可范围内。
+- 指定模式的空名单、损坏配置保持收紧并在管理页提示；明确切到不限模式会清空白名单。不限模型 Key 的既有外部未知模型探测行为保持，指定 Key 不探测名单外/已移出目录的模型。
 - Key 可单独启停、统计调用次数；无合法 Key 一律 401
+
+管理接口 `POST /api/keys` 和 `PATCH /api/keys/{id}`（管理员会话）示例参数：
+
+```json
+{"platform":"workbuddy","model_scope":"selected","allowed_models":["glm-5.3","deepseek-v4.1-flash"]}
+```
+
+以上 ID 以模型页当前已收录且开启的条目为准；新建可另填 `name` 和 `api_key`。旧创建请求省略权限字段时为不限，PATCH 省略的字段保持原值；`{"model_scope":"all"}` 明确清空名单并切回不限。仅启停 Key 的 PATCH 不清理历史停用选择。
 
 **其它**
 - 调用日志：时间 / 平台 / 账号 / 模型 / 流式 / 状态码 / 耗时 / 输入字符数 / 错误
@@ -179,9 +205,12 @@ curl http://127.0.0.1:8530/v1/chat/completions \
 ```
 Agent2API/
 ├── app.py               Flask 应用：OpenAI 接口 + 面板 API + 后台维护线程
+├── credentials.py       到期时间解析与凭证错误脱敏
 ├── providers.py         平台适配层：SSO、刷新、额度、请求头、body 规范化
 ├── proxy.py             反代引擎：令牌保活、号池调度、流式转发、非流式聚合
 ├── responses.py         Responses API 翻译层：input/tools → chat，SSE 实时转写
+├── model_pricing.py     官方倍率快照、价格状态与来源信息
+├── key_permissions.py   Key模型范围校验、可见目录过滤与调用权限
 ├── db.py                SQLite 数据层：settings/accounts/api_keys/logs/pending_login
 ├── frontend/             React + Vite + shadcn 风格控制面板源码
 │   ├── src/               页面与 UI 组件
@@ -213,8 +242,8 @@ Agent2API/
 ### 5.1 Responses API（`/v1/responses`）
 
 上游（WorkBuddy / CodeBuddy）只暴露 `chat/completions` 且只支持流式。本服务在反代层
-把 OpenAI Responses API 翻译过去，因此**任何使用 Responses API 的 SDK / 工具都能直接对接**
-（把 `base_url` 指到 `http://<host>:8530/v1`、API Key 用面板里的 Key 即可）。
+提供下列 Responses API 兼容能力（不是完整的 OpenAI 托管工具/会话存储服务）。
+把 `base_url` 指到 `http://<host>:8530/v1`，API Key 使用面板创建的 Key。
 
 **支持的入参翻译**
 
@@ -226,8 +255,8 @@ Agent2API/
   - `system` 角色消息 → system message
 - `instructions` → 置顶的 system message
 - `tools` / `tool_choice` → chat 的 `tools` / `tool_choice`
-  - 注意：上游仅接受**字符串** `tool_choice`（`auto`/`none`/`required`），
-    不支持 OpenAI 的对象形式 `{type:"function",...}`，本层会**降级为 `required`**（单工具场景等价）。
+  - 指定函数对象先保留标准 Chat 语义，腾讯渠道转换为准确的函数名字串，多个工具时也不再丢失选择；`none` 移除新工具定义。
+  - 保留工具 `strict`、调用 ID 与参数分片；历史 `function_call`/`function_call_output` 原样关联，不补造缺失的工具结果。
 - `text.format` → `response_format`（如 `{"type":"json_object"}`）
 - `max_output_tokens` → `max_tokens`；`temperature` / `top_p` 等其余字段透传
 - `previous_response_id` / `include` / `store` / `truncation` 等：本层不持久化对话，忽略
@@ -235,14 +264,14 @@ Agent2API/
 **返回格式**
 
 - 非流式：`stream:false`（或省略）→ 返回标准 `response` 对象
-  （`output` 含 `message` 项与 `function_call` 项，附 `usage`）
+  （`output` 含 `message`、`function_call` 与独立 `reasoning` 项，附 `usage`）
 - 流式：`stream:true` → 返回 Responses 格式的 SSE 事件流：
   `response.created` → `response.in_progress` → `response.output_item.added`
   → `response.content_part.added` → `response.output_text.delta`（逐片）
   → `response.output_text.done` → `response.content_part.done`
   → `response.output_item.done` → `response.completed`
   （工具调用场景额外产生 `response.output_item.added`(function_call) /
-  `response.function_call_arguments.delta` / `.done`）
+  `response.function_call_arguments.delta` / `.done`）。事件 JSON 含 `type`/`sequence_number`，创建/完成事件通过 `response` 字段携带对象；截断返回 `response.incomplete` 与原因，推理不混入正文。
 
 调用示例（非流式）：
 
@@ -253,8 +282,8 @@ curl http://127.0.0.1:8530/v1/responses \
   -d '{"model":"hy3","input":"用一句中文介绍你自己","stream":false}'
 ```
 
-> 说明：是否真正触发函数调用取决于上游模型本身（如 `hy3`/混元当前不会主动调用工具），
-> 但 `input` → `messages` 与 `tool_calls` → `function_call` 的双向翻译均已实现并通过单测。
+> 说明：是否支持工具调用以当前上游模型的实际响应为准，不按模型名称推断。
+> 2026-09-17 已用 WorkBuddy 国际的 glm-5.3、deepseek-v4.1-flash 实测双轮工具调用。其他模型的工具能力仍以实际响应为准。
 
 ---
 

@@ -19,11 +19,12 @@ import time
 import uuid
 
 import db
+import credentials
 import providers as P
 import requests
 import trae
 
-_refresh_locks: dict[int, threading.Lock] = {}
+_refresh_locks: dict[object, threading.Lock] = {}
 _checkin_locks: dict[int, threading.Lock] = {}
 _locks_guard = threading.Lock()
 
@@ -59,7 +60,7 @@ NET_RETRY = 2
 DEFAULT_FAILOVER_ATTEMPTS = 9
 
 
-def _lock_for(account_id: int) -> threading.Lock:
+def _lock_for(account_id: object) -> threading.Lock:
     with _locks_guard:
         lk = _refresh_locks.get(account_id)
         if lk is None:
@@ -78,14 +79,8 @@ def _checkin_lock_for(account_id: int) -> threading.Lock:
 
 
 def _norm_ts(v) -> int:
-    """expires_at 可能是秒或毫秒，统一成秒。"""
-    try:
-        v = int(v or 0)
-    except Exception:
-        return 0
-    if v > 10_000_000_000:      # 毫秒
-        v //= 1000
-    return v
+    """兼容历史调用方；统一时间格式。"""
+    return credentials.epoch(v)
 
 
 class ProxyError(Exception):
@@ -100,56 +95,76 @@ class ProxyError(Exception):
 # --------------------------------------------------------------------------
 
 def ensure_token(account_row, force: bool = False) -> dict:
-    """确保账号 access_token 有效，必要时刷新并落库。返回最新账号 dict。"""
-    acc = dict(account_row)
-    aid = acc["id"]
-
-    if db.get_setting("auto_refresh", "1") != "1" and not force:
-        return acc
-
-    ahead = int(db.get_setting("refresh_ahead", "900") or 900)
-    exp = _norm_ts(acc.get("expires_at"))
-    now = int(time.time())
-
-    need = force or (exp > 0 and now >= exp - ahead)
-    if not need:
-        return acc
-
-    rt = (acc.get("refresh_token") or "").strip()
-    if not rt:
-        return acc
-
-    with _lock_for(aid):
+    """统一保活：补齐有效期、提前续期、持久化轮换、退避；force 失败明确抛错。"""
+    original = dict(account_row)
+    aid = original["id"]
+    with _lock_for(db.credential_scope(original)):
         fresh = db.get_account(aid)
         if fresh is None:
-            return acc
+            raise ProxyError("账号已删除", status=404)
         acc = dict(fresh)
-        exp = _norm_ts(acc.get("expires_at"))
-        if not force and exp > 0 and now < exp - ahead:
-            return acc  # 其它线程已刷新
-
-        try:
-            res = P.refresh_token(acc["platform"], acc["access_token"],
-                                  acc["refresh_token"], domain=acc.get("domain") or None)
-        except Exception as e:
-            db.update_account(aid, status="error", status_reason="刷新失败: %s" % e,
-                              last_error=str(e)[:400])
+        now = int(time.time())
+        exp = credentials.expiry(acc["access_token"], acc.get("expires_at"))
+        if exp != acc.get("expires_at"):
+            db.update_account(aid, expires_at=exp)
+            acc["expires_at"] = exp
+        if not force and db.get_setting("auto_refresh", "1") != "1":
             return acc
-
-        fields = {
-            "access_token": res["access_token"],
-            "status": "active",
-            "status_reason": "",
-            "last_error": "",
-        }
-        if res.get("refresh_token"):
-            fields["refresh_token"] = res["refresh_token"]
-        if res.get("expires_at"):
-            fields["expires_at"] = int(res["expires_at"])
+        # 等锁期间其他请求已轮换，401 的旧快照不应再次轮换同一会话。
+        if ((acc["access_token"] != original.get("access_token") or
+             int(acc.get("last_refresh_at") or 0) > int(original.get("last_refresh_at") or 0))
+                and acc.get("last_refresh_at") and (not exp or exp > now)):
+            return acc
+        ahead = max(0, int(db.get_setting("refresh_ahead", "900") or 900))
+        rt = (acc.get("refresh_token") or "").strip()
+        rt_exp = credentials.expiry(rt)
+        deadlines = [v for v in (exp, rt_exp) if v]
+        deadline = min(deadlines, default=0)
+        need = force or (deadline and now >= deadline - ahead) or (
+            not exp and now >= int(acc.get("last_refresh_at") or 0) + 3600)
+        if not need:
+            return acc
+        if not rt:
+            if force or (exp and exp <= now):
+                raise ProxyError("缺少刷新凭证，请重新登录或导入完整凭证", status=401)
+            return acc
+        if not force and now < int(acc.get("refresh_retry_at") or 0):
+            if exp and exp <= now:
+                raise ProxyError(acc.get("refresh_error") or "续期重试等待中", status=502)
+            return acc
+        try:
+            res = P.refresh_token(acc["platform"], acc["access_token"], rt,
+                                  domain=acc.get("domain") or None)
+            token = res.get("access_token")
+            if not isinstance(token, str) or not token.strip():
+                raise P.ProviderError("刷新响应缺少 access token")
+            new_exp = credentials.expiry(token, res.get("expires_at"))
+            if new_exp and new_exp <= now:
+                raise P.ProviderError("刷新返回的凭证已过期")
+        except Exception as e:
+            error = "续期失败: " + credentials.redact(e, acc["access_token"], rt)
+            failures = int(acc.get("refresh_failures") or 0) + 1
+            fields = dict(last_refresh_attempt=now, refresh_error=error,
+                          refresh_failures=failures,
+                          refresh_retry_at=now + min(3600, 60 * 2 ** min(failures - 1, 6)))
+            acc = db.save_refresh_result(acc, fields)
+            logging.getLogger("agent2api.refresh").warning(
+                "refresh_trace account_id=%s platform=%s stage=failed error=%s",
+                aid, acc["platform"], error)
+            if force or not exp or exp <= now:
+                raise ProxyError(error, status=502) from None
+            return acc  # 未过期 access 仍可使用，但独立续期错误不被额度刷新覆盖。
+        fields = dict(access_token=token, refresh_token=res.get("refresh_token") or rt,
+                      expires_at=new_exp, last_refresh_at=now, last_refresh_attempt=now,
+                      refresh_error="", refresh_failures=0, refresh_retry_at=0)
         if res.get("domain"):
             fields["domain"] = res["domain"]
-        db.update_account(aid, **fields)
-        acc.update(fields)
+        acc = db.save_refresh_result(acc, fields)
+        if not acc:
+            raise ProxyError("账号已删除", status=404)
+        logging.getLogger("agent2api.refresh").warning(
+            "refresh_trace account_id=%s platform=%s stage=success expires_at=%s",
+            aid, acc["platform"], new_exp)
         return acc
 
 
@@ -358,14 +373,12 @@ def _checkin_account_locked(acc: dict) -> dict:
 
 
 def checkin_all(silent: bool = False, platform: str | None = None) -> dict:
-    """遍历启用且支持签到的账号，逐个领取。platform 指定时只签该渠道。"""
+    """遍历所有支持签到的账号（调用开关不影响签到），逐个领取。platform 指定时只签该渠道。"""
     results = []
     want = str(platform or "").strip()
     for row in db.list_accounts():
         a = dict(row)
         if want and a["platform"] != want:
-            continue
-        if not a["enabled"]:
             continue
         if not P.supports_checkin(a["platform"]):
             continue
@@ -420,8 +433,6 @@ def retry_failed_checkins():
         # 不能在这里信任本地标记：上一次状态查询可能失败，但仍留下了
         # 当天的缓存。统一交给 checkin_account() 再查上游，已签到的账号
         # 会由上游幂等跳过，未签到的账号才会领取。
-        if not a["enabled"]:
-            continue
         if not P.supports_checkin(a["platform"]):
             continue
         try:
@@ -537,7 +548,7 @@ def _normalize_platform_order(order, active=None) -> list[str]:
 
 
 def normalize_route_priority(raw) -> dict:
-    """返回只含当前三渠道、且始终为全排列的优先级配置。"""
+    """返回只含当前渠道、且始终为全排列的优先级配置。"""
     if isinstance(raw, str):
         try:
             raw = json.loads(raw or "")
@@ -1079,8 +1090,14 @@ def stream_chat(body: dict, platform: str | None = None,
             if row is None:
                 break
             any_account = True
-            acc = ensure_token(row)
-            tried_accounts.append(acc["id"])
+            tried_accounts.append(row["id"])
+            try:
+                acc = ensure_token(row)
+            except ProxyError as e:
+                last_err = str(e)
+                last_failure_was_route = False
+                db.bump_account(row["id"], False, last_err)
+                continue
 
             try:
                 resp = open_upstream(acc, body)
@@ -1107,7 +1124,7 @@ def stream_chat(body: dict, platform: str | None = None,
                     # 不能把它提前放进排除表后直接跳到其它账号。
                     refreshed_401.add(acc["id"])
                     try:
-                        fresh = ensure_token(db.get_account(acc["id"]), force=True)
+                        fresh = ensure_token(acc, force=True)
                         if fresh.get("access_token") != acc.get("access_token"):
                             retry_rows.append(fresh)
                             continue
@@ -1203,8 +1220,14 @@ def generate_image(body: dict, platform: str | None = None,
             if row is None:
                 break
             any_account = True
-            acc = ensure_token(row)
-            tried_accounts.append(acc["id"])
+            tried_accounts.append(row["id"])
+            try:
+                acc = ensure_token(row)
+            except ProxyError as e:
+                last_err = str(e)
+                last_failure_was_route = False
+                db.bump_account(row["id"], False, last_err)
+                continue
 
             try:
                 resp = open_image_upstream(acc, body)
@@ -1232,7 +1255,7 @@ def generate_image(body: dict, platform: str | None = None,
                 if status == 401 and acc["id"] not in refreshed_401:
                     refreshed_401.add(acc["id"])
                     try:
-                        fresh = ensure_token(db.get_account(acc["id"]), force=True)
+                        fresh = ensure_token(acc, force=True)
                         if fresh.get("access_token") != acc.get("access_token"):
                             retry_rows.append(fresh)
                             continue
@@ -1410,65 +1433,69 @@ def probe_account(account_row, model: str, timeout=(5, 30)) -> dict:
 
 
 def aggregate_stream(resp, model: str) -> dict:
-    """把上游 SSE 流聚合成一个标准的 OpenAI 非流式响应体。"""
-    content_parts = []
-    reasoning_parts = []
-    finish_reason = "stop"
+    """聚合 SSE，每个 choice/tool index 独立累积，保留工具调用与真实 usage。"""
+    choices = {}
     resp_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     usage = None
-    role = "assistant"
-
     for line in _sse_lines(resp):
         if not line or not line.startswith("data:"):
             continue
-        chunk = line[5:].strip()
-        if not chunk or chunk == "[DONE]":
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
             continue
         try:
-            j = json.loads(chunk)
-        except Exception:
+            j = json.loads(payload)
+        except (ValueError, TypeError):
             continue
-
+        err = _sse_business_error(j)
+        if err:
+            raise ProxyError("上游业务错误: %s" % err, status=502)
+        if not isinstance(j, dict):
+            continue
         resp_id = j.get("id") or resp_id
         created = j.get("created") or created
         model = j.get("model") or model
         if j.get("usage"):
             usage = j["usage"]
-        err = _sse_business_error(j)
-        if err:
-            raise ProxyError("上游业务错误: %s" % err, status=502)
-
-        for ch in (j.get("choices") or []):
+        for ch in j.get("choices") or []:
+            idx = ch.get("index", 0)
+            c = choices.setdefault(idx, {"role": "assistant", "text": [],
+                                         "reasoning": [], "tools": {}, "finish": None})
             delta = ch.get("delta") or ch.get("message") or {}
-            if delta.get("role"):
-                role = delta["role"]
+            c["role"] = delta.get("role") or c["role"]
             if delta.get("content"):
-                content_parts.append(delta["content"])
+                c["text"].append(delta["content"])
             if delta.get("reasoning_content"):
-                reasoning_parts.append(delta["reasoning_content"])
-            if ch.get("finish_reason"):
-                finish_reason = ch["finish_reason"]
-
-    message = {"role": role, "content": "".join(content_parts)}
-    if reasoning_parts:
-        message["reasoning_content"] = "".join(reasoning_parts)
-
-    out = {
-        "id": resp_id,
-        "object": "chat.completion",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-    }
-    if usage:
-        out["usage"] = usage
-    else:
-        # 上游未返回 usage 时只能标记为未知，不能按字符数伪造 token。
-        # 保留 OpenAI 兼容字段，但日志侧会把它视为非真实积分来源。
-        out["usage"] = {"prompt_tokens": 0, "completion_tokens": 0,
-                        "total_tokens": 0}
-    return out
+                c["reasoning"].append(delta["reasoning_content"])
+            for position, tc in enumerate(delta.get("tool_calls") or []):
+                tool = c["tools"].setdefault(tc.get("index", position), {
+                    "id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                if tc.get("id"):
+                    tool["id"] = tc["id"]
+                if tc.get("type"):
+                    tool["type"] = tc["type"]
+                fn = tc.get("function") or {}
+                for key in ("name", "arguments"):
+                    if fn.get(key):
+                        tool["function"][key] += fn[key]
+            c["finish"] = ch.get("finish_reason") or c["finish"]
+    if not choices:
+        raise ProxyError("上游返回空响应流 (empty SSE)", status=502)
+    output = []
+    for idx, c in sorted(choices.items()):
+        message = {"role": c["role"], "content": "".join(c["text"])}
+        if c["reasoning"]:
+            message["reasoning_content"] = "".join(c["reasoning"])
+        if c["tools"]:
+            message["tool_calls"] = [t for _, t in sorted(c["tools"].items())]
+            if not c["text"]:
+                message["content"] = None
+        output.append({"index": idx, "message": message,
+                       "finish_reason": c["finish"] or ("tool_calls" if c["tools"] else "stop")})
+    return {"id": resp_id, "object": "chat.completion", "created": created,
+            "model": model, "choices": output,
+            "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
 
 
 def aggregate_trae_stream(resp, model: str) -> dict:

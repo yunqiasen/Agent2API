@@ -1,3 +1,4 @@
+import { startLoginPoll } from "@/lib/login-poll";
 import { useEffect, useRef, useState } from "react";
 import { useTheme } from "next-themes";
 import { toast } from "sonner";
@@ -18,7 +19,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { PLATFORMS, apiPost, type JoinQuota, type JoinPollResp, type JoinStartResp } from "@/lib/api";
+import { PLATFORMS, ApiError, apiPost, type JoinQuota, type JoinPollResp, type JoinStartResp } from "@/lib/api";
 
 type Step = "form" | "auth" | "done" | "closed";
 
@@ -40,80 +41,81 @@ export function JoinPage() {
     quota?: JoinQuota | null;
   } | null>(null);
   const [busy, setBusy] = useState(false);
-  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  useEffect(() => {
-    return () => {
-      if (timer.current) clearInterval(timer.current);
-    };
-  }, []);
+  const cancelPoll = useRef<(() => void) | null>(null);
+  const activeRequest = useRef<AbortController | null>(null);
+  const generation = useRef(0);
+  const [loginFailed, setLoginFailed] = useState(false);
 
   function stopTimer() {
-    if (timer.current) {
-      clearInterval(timer.current);
-      timer.current = null;
-    }
+    generation.current += 1;
+    cancelPoll.current?.();
+    cancelPoll.current = null;
+    activeRequest.current?.abort();
+    activeRequest.current = null;
   }
+  useEffect(() => () => stopTimer(), []);
 
   async function start() {
+    stopTimer();
+    const run = generation.current;
+    const controller = new AbortController();
+    activeRequest.current = controller;
     setBusy(true);
+    setLoginFailed(false);
     setLog("等待授权…");
     try {
       const d = await apiPost<JoinStartResp>("/api/join/start", {
-        platform,
-        label: note || "用户贡献",
-      });
+        platform, label: note || "用户贡献",
+      }, { signal: controller.signal });
+      if (run !== generation.current) return;
       setAuthUrl(d.auth_url);
       setState(d.state);
       setStep("auth");
-      poll(d.state);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "获取授权链接失败";
-      if (/公共接入已关闭/.test(msg)) {
-        setStep("closed");
-      } else {
-        toast.error(msg);
-      }
-      setBusy(false);
-    }
-  }
-
-  function poll(st: string) {
-    let n = 0;
-    stopTimer();
-    timer.current = setInterval(async () => {
-      n += 1;
-      if (n > 150) {
-        stopTimer();
-        setLog("超时，请返回重试");
-        return;
-      }
-      try {
-        const r = await apiPost<JoinPollResp>("/api/join/poll", { state: st });
-        if (r.ok) {
-          stopTimer();
-          setDone({ id: r.account_id!, nickname: r.nickname, email: r.email, quota: r.quota });
-          setStep("done");
-          if (r.quota_error) {
-            toast.warning(`已加入共享号池，但额度同步失败：${r.quota_error}`, { duration: 10000 });
+      cancelPoll.current = startLoginPoll({
+        request: signal => apiPost<JoinPollResp>("/api/join/poll", { state: d.state }, { signal }),
+        onResult: (r, elapsed) => {
+          if (run !== generation.current) return;
+          if (r.ok || r.done) {
+            stopTimer();
+            setDone(r.account_id ? { id: r.account_id, nickname: r.nickname, email: r.email, quota: r.quota } : null);
+            setStep("done");
+            setBusy(false);
+            const warnings = [];
+            if (r.quota_error) warnings.push(`额度同步失败：${r.quota_error}`);
+            if (r.model_sync && !r.model_sync.ok) warnings.push(`模型目录同步失败：${r.model_sync.error || "请联系管理员重试"}`);
+            if (warnings.length) toast.warning("已加入共享号池", { description: warnings.join("；"), duration: 10000 });
+            else toast.success("已加入共享号池");
+          } else if (r.pending === false) {
+            setLog(r.error || r.msg || "授权已结束，请重新获取链接");
+            setLoginFailed(true);
           } else {
-            toast.success("已加入共享号池");
+            setLog(`等待授权… (${elapsed}s) ${r.msg || r.error || ""}`);
           }
-        } else if (r.done) {
-          // 重叠轮询命中已完成终态时立即停下，避免继续跑到 150 次超时。
-          stopTimer();
-          setLog(r.msg || "接入流程已完成");
-        } else {
-          setLog(`等待授权… (${n}s) ${r.msg || r.error || ""}`);
-        }
-      } catch (e) {
-        setLog("轮询出错：" + (e instanceof Error ? e.message : ""));
-      }
-    }, 2000);
+        },
+        onError: e => {
+          const msg = e instanceof Error ? e.message : "请求失败";
+          setLog("轮询出错：" + msg);
+          if (e instanceof ApiError && [400, 401, 403, 404, 410].includes(e.status)) {
+            if (e.status === 403) setStep("closed");
+            setLoginFailed(true);
+            return false;
+          }
+        },
+        onTimeout: () => { setLog("授权超时，请返回重试"); setLoginFailed(true); },
+      });
+    } catch (err) {
+      if (run !== generation.current) return;
+      const msg = err instanceof Error ? err.message : "获取授权链接失败";
+      if (/公共接入已关闭/.test(msg)) setStep("closed");
+      else toast.error(msg);
+    } finally {
+      if (run === generation.current) setBusy(false);
+    }
   }
 
   function reset() {
     stopTimer();
+    setLoginFailed(false);
     setState("");
     setAuthUrl("");
     setDone(null);
@@ -293,7 +295,7 @@ export function JoinPage() {
                       className="mt-3 w-full text-muted-foreground hover:text-foreground"
                       onClick={reset}
                     >
-                      取消
+                      {loginFailed ? "返回重新授权" : "取消"}
                     </Button>
                   </div>
                 )}
@@ -314,6 +316,7 @@ export function JoinPage() {
                           <div className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
                             <Coins className="size-3.5 text-primary" /> 你的账号额度
                           </div>
+                          {done.quota ? (
                           <div className="mt-1.5 flex items-baseline gap-1.5">
                             <span className="text-2xl font-semibold tabular-nums text-foreground">
                               {(done.quota?.remain ?? 0).toLocaleString()}
@@ -323,6 +326,7 @@ export function JoinPage() {
                               {done.quota?.unit ?? "credits"} 剩余
                             </span>
                           </div>
+                          ) : <p className="mt-2 text-sm text-muted-foreground">额度尚未同步</p>}
                           {done.quota?.packages && done.quota.packages.length > 0 && (
                             <div className="mt-3 space-y-1.5 border-t border-border pt-3">
                               {done.quota.packages.map((p, i) => (

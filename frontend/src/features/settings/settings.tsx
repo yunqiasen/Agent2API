@@ -12,7 +12,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { PageHeader, SectionCard } from "@/lib/design";
-import { apiGet, apiPost, type Settings as SettingsData } from "@/lib/api";
+import { PLATFORMS, apiGet, apiPost, type Settings as SettingsData } from "@/lib/api";
 
 const STRATEGIES = [
   { v: "least_used", l: "最少使用 least_used" },
@@ -55,11 +55,7 @@ function Sel({
   );
 }
 
-const PLAT_ORDER = [
-  { v: "workbuddy", l: "WorkBuddy" },
-  { v: "trae", l: "TraeWork" },
-  { v: "codebuddy", l: "CodeBuddy 国际" },
-];
+const PLAT_ORDER = PLATFORMS.map((p) => ({ v: p.key, l: p.name }));
 
 type PriorityCfg = { default: string[]; overrides: Record<string, string[]> };
 
@@ -88,16 +84,16 @@ function parsePriority(raw?: string): PriorityCfg {
       return { default: normalizeOrder(source.default), overrides };
     }
   } catch { /* ignore */ }
-  return { default: ["workbuddy", "trae", "codebuddy"], overrides: {} };
+  return { default: PLAT_ORDER.map((p) => p.v), overrides: {} };
 }
 
 function OrderSels({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
-  // 三个下拉必须构成全排列：改一个位置 = 与被选中平台交换位置。
+  // 渠道下拉必须构成全排列：改一个位置 = 与被选中平台交换位置。
   // 旧实现允许重复值（如 [trae,trae,codebuddy]），导致平台"消失"且路由坏数据入库。
-  const arr = [0, 1, 2].map((i) => value[i] || PLAT_ORDER[i].v);
+  const arr = PLAT_ORDER.map((_, i) => value[i] || PLAT_ORDER[i].v);
   return (
-    <div className="grid grid-cols-3 gap-2">
-      {[0, 1, 2].map((i) => (
+    <div className="grid grid-cols-2 xl:grid-cols-4 gap-2">
+      {PLAT_ORDER.map((_, i) => (
         <Select
           key={i}
           value={arr[i]}
@@ -105,7 +101,7 @@ function OrderSels({ value, onChange }: { value: string[]; onChange: (v: string[
             if (v === arr[i]) return;
             const next = [...arr];
             const j = next.indexOf(v);
-            // 目标平台已在其它位置：交换，保证始终是三平台全排列
+            // 目标平台已在其它位置：交换，保证始终是渠道全排列
             if (j >= 0) {
               next[j] = next[i];
             }
@@ -132,7 +128,7 @@ function OrderSels({ value, onChange }: { value: string[]; onChange: (v: string[
 export function Settings() {
   const [s, setS] = useState<SettingsData>({});
   const [saving, setSaving] = useState(false);
-  const [prio, setPrio] = useState<PriorityCfg>({ default: ["workbuddy", "trae", "codebuddy"], overrides: {} });
+  const [prio, setPrio] = useState<PriorityCfg>({ default: PLAT_ORDER.map((p) => p.v), overrides: {} });
   const [ovModel, setOvModel] = useState("");
 
   function load() {
@@ -275,7 +271,7 @@ export function Settings() {
         delay={240}
         bodyClassName="space-y-5 p-5"
       >
-        <Field label="全局默认顺序" hint="外部请求不指定渠道时，按 1 → 2 → 3 顺序尝试">
+        <Field label="全局默认顺序" hint={`外部请求不指定渠道时，按 ${PLAT_ORDER.map((_, i) => i + 1).join(" → ")} 顺序尝试`}>
           <OrderSels value={prio.default} onChange={(v) => setPrio({ ...prio, default: v })} />
         </Field>
 

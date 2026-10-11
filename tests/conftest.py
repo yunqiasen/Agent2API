@@ -18,3 +18,14 @@ def isolated_db(tmp_path, monkeypatch):
     importlib.reload(db)
     db.init_db()
     yield db
+
+
+@pytest.fixture(autouse=True)
+def block_unstubbed_network(monkeypatch):
+    """回归只访问测试替身，新增接入分支也不会意外请求真实上游。"""
+    import requests
+
+    def blocked(*args, **kwargs):
+        raise AssertionError("test network boundary was not stubbed")
+
+    monkeypatch.setattr(requests.sessions.Session, "request", blocked)
