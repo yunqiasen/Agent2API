@@ -153,6 +153,7 @@ export function Settings() {
         strategy: s.strategy || "least_used",
         auto_refresh: s.auto_refresh || "1",
         refresh_ahead: s.refresh_ahead || "900",
+        rate_limit_default_seconds: s.rate_limit_default_seconds || "60",
         allow_model_passthrough: s.allow_model_passthrough || "1",
         model_base_override: s.model_base_override || "",
         log_retention: s.log_retention || "2000",
@@ -248,6 +249,9 @@ export function Settings() {
         delay={180}
         bodyClassName="grid gap-4 p-5 sm:grid-cols-2"
       >
+        <Field label="限流默认冷却（秒）" hint="上游未给出恢复时间时使用；自动换号，全池失败直接报错，不排队等待。">
+          <Input aria-label="限流默认冷却（秒）" type="number" min={1} max={86400} step={1} className="h-9 bg-background" value={s.rate_limit_default_seconds ?? "60"} onChange={(e) => set("rate_limit_default_seconds", e.target.value)} />
+        </Field>
         <Field label="每日自动签到">
           <Sel value={s.auto_checkin || "1"} onChange={(v) => set("auto_checkin", v)} options={[{ v: "1", l: "开启" }, { v: "0", l: "关闭" }]} />
         </Field>

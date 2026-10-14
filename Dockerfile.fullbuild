@@ -47,7 +47,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py db.py providers.py proxy.py responses.py discovery.py trae.py credentials.py model_pricing.py key_permissions.py ./
+COPY app.py db.py providers.py proxy.py responses.py discovery.py trae.py credentials.py model_pricing.py key_permissions.py daily_rewards.py rate_limits.py ./
 COPY --from=webbuild /fe/dist/ ./frontend/dist/
 
 RUN useradd -r -u 10001 -m -d /home/agent2api agent2api \

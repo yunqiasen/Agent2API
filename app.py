@@ -33,7 +33,7 @@ import discovery
 import trae
 import responses as R
 from flask import (Flask, Response, jsonify, request, send_from_directory,
-                   session, stream_with_context)
+                   session, stream_with_context, g, has_request_context)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -123,16 +123,24 @@ def _log(kr_id, acc_id, platform, model, status, stream, duration_ms,
         pt = int(u.get("prompt_tokens") or 0)
         ct = int(u.get("completion_tokens") or 0)
         tt = int(u.get("total_tokens") or (pt + ct))
-    credit_actual = isinstance(u, dict) and "credit" in u
-    try:
-        cost = float(u.get("credit") or 0) if credit_actual else 0.0
-    except Exception:
+    cost = proxy.usage_credit(u)
+    credit_actual = cost is not None
+    if not credit_actual:
         cost = 0.0
-        credit_actual = False
+    trace = getattr(g, 'call_trace', {}) if has_request_context() else {}
+    attempts = trace.get('attempts', [])
+    if attempts and acc_id is not None and attempts[-1].get('account_id') == acc_id:
+        if not credit_actual and attempts[-1].get('credit') is not None:
+            cost = attempts[-1]['credit']
+            credit_actual = True
+        attempts[-1]['credit'] = cost if credit_actual else None
+        if status < 400:
+            attempts[-1].update(kind='success', outcome='completed')
     _enqueue_stats(lambda: db.add_log(
         kr_id, acc_id, platform, model, status, stream,
         duration_ms, prompt_chars, error,
-        pt, ct, tt, cost, credit_actual=credit_actual))
+        pt, ct, tt, cost, credit_actual=credit_actual,
+        request_id=trace.get("request_id", ""), attempts=attempts))
 
 def migrate_legacy_platforms() -> None:
     """启动时归一旧版本渠道别名，避免未知平台记录让面板/API 失效。"""
@@ -185,6 +193,16 @@ def check_api_key():
 
 def openai_error(msg, status=400, etype="invalid_request_error"):
     return jsonify({"error": {"message": msg, "type": etype, "code": status}}), status
+
+
+def proxy_error_response(error):
+    data = {"message": str(error), "type": "upstream_error", "code": error.status}
+    headers = {}
+    retry_at = error.payload.get('retry_at')
+    if error.status == 429 and retry_at:
+        data['retry_at'] = retry_at
+        headers['Retry-After'] = str(max(1, math.ceil(retry_at - time.time())))
+    return jsonify({"error": data}), error.status, headers
 
 
 def _model_permission_error(key_row, model):
@@ -291,10 +309,12 @@ def api_chat():
 
     try:
         acc, resp = proxy.stream_chat(body, platform=platform)
+        g.call_trace = getattr(resp, "_agent2api_trace", {})
     except proxy.ProxyError as e:
+        g.call_trace = e.payload.get("trace", {})
         _log(kr["id"], None, platform or "", model, e.status, want_stream,
              int((time.time() - t0) * 1000), prompt_chars, str(e))
-        return openai_error(str(e), e.status, "upstream_error")
+        return proxy_error_response(e)
 
     _enqueue_stats(lambda: db.bump_api_key(kr["id"]))
 
@@ -438,10 +458,12 @@ def api_images():
 
     try:
         acc, resp = proxy.generate_image(body, platform=platform)
+        g.call_trace = getattr(resp, "_agent2api_trace", {})
     except proxy.ProxyError as e:
+        g.call_trace = e.payload.get("trace", {})
         _log(kr["id"], None, platform or "", model, e.status, False,
              int((time.time() - t0) * 1000), 0, str(e))
-        return openai_error(str(e), e.status, "upstream_error")
+        return proxy_error_response(e)
 
     _enqueue_stats(lambda: db.bump_api_key(kr["id"]))
 
@@ -460,7 +482,7 @@ def api_images():
             except Exception as e:
                 ok = False
                 err = str(e)
-                raise
+                yield _sse_err("上游流中断: %s" % e)
             finally:
                 usage_tracker.finish()
                 if usage_tracker.error:
@@ -572,10 +594,12 @@ def api_responses():
 
     try:
         acc, resp = proxy.stream_chat(chat_body, platform=platform)
+        g.call_trace = getattr(resp, "_agent2api_trace", {})
     except proxy.ProxyError as e:
+        g.call_trace = e.payload.get("trace", {})
         _log(kr["id"], None, platform or "", model, e.status, want_stream,
              int((time.time() - t0) * 1000), prompt_chars, str(e))
-        return openai_error(str(e), e.status, "upstream_error")
+        return proxy_error_response(e)
 
     _enqueue_stats(lambda: db.bump_api_key(kr["id"]))
 
@@ -742,6 +766,9 @@ def _acc_public(row) -> dict:
     d.pop("quota_raw", None)
     d["expires_at_sec"] = credentials.expiry(at, d.get("expires_at"))
     d["supports_checkin"] = P.supports_checkin(d.get("platform"))
+    d["checkin_kind"] = P.get_platform(d["platform"]).get("checkin_kind", "standard")
+    if d["platform"] in db.INTERNATIONAL_CHANNELS:
+        d["daily_reward"] = proxy.daily_rewards.view(d)
     # checkin_today 是持久化字段，跨天后必须按日期归零，避免页面假显示“已签到”。
     d["checkin_today"] = 1 if proxy.checkin_marked_today(d) else 0
     raw_streak = int(d.get("checkin_streak") if d.get("checkin_streak") is not None else -1)
@@ -750,6 +777,9 @@ def _acc_public(row) -> dict:
     d["checkin_last_date"] = d.get("checkin_last_date") or ""
     d["checkin_credit"] = int(d.get("checkin_credit") or 0)
     d["checkin_updated_at"] = int(d.get("checkin_updated_at") or 0)
+    if d.get("checkin_kind") == "international_activity":
+        d.update(checkin_today=0, checkin_credit=0, checkin_streak_known=False)
+    d["cooldowns"] = db.active_cooldowns(d)
     d["source"] = d.get("source") or ""
     d["shared_quota"] = bool(d.get("uid") and d["platform"] in db.INTERNATIONAL_CHANNELS and any(
         r["id"] != d["id"] and db.quota_identity(dict(r)) == db.quota_identity(d)
@@ -858,9 +888,10 @@ def panel_account_checkin(aid):
         return jsonify({"ok": False, "error": "该平台不支持签到"}), 400
     try:
         res = proxy.checkin_account(db.get_account(aid))
-        app.logger.warning("checkin account_id=%s platform=%s skipped=%s credit=%s",
-                        aid, row["platform"], bool(res.get("skipped")),
-                        res.get("claimed_credit", 0))
+        if res.get('checkin_kind') != 'international_activity':
+            app.logger.warning("checkin account_id=%s platform=%s skipped=%s credit=%s",
+                               aid, row["platform"], bool(res.get("skipped")),
+                               res.get("claimed_credit"))
         return jsonify({"ok": True, **res})
     except Exception as e:
         app.logger.error("checkin account_id=%s platform=%s failed: %s",
@@ -920,12 +951,8 @@ def panel_checkin_all():
         return jsonify({"ok": False, "error": "未知平台"}), 400
     try:
         d = proxy.checkin_all(silent=False, platform=platform or None)
-        ok_count = sum(1 for x in d.get("results", []) if x.get("ok") and not x.get("skipped"))
-        skip_count = sum(1 for x in d.get("results", []) if x.get("skipped"))
-        fail_count = sum(1 for x in d.get("results", []) if not x.get("ok"))
-        app.logger.warning("checkin_all platform=%s success=%s skipped=%s failed=%s results=%s",
-                        platform or "all", ok_count, skip_count, fail_count,
-                        d.get("results", []))
+        app.logger.warning("checkin_all platform=%s summary=%s results=%s",
+                           platform or "all", d.get('summary'), d.get('results'))
         return jsonify(d)
     except Exception as e:
         app.logger.error("checkin_all platform=%s failed: %s", platform or "all", e)
@@ -955,28 +982,13 @@ def panel_import_token():
             parsed = [parsed]
         elif not isinstance(parsed, list):
             return jsonify({"ok": False, "error": "凭证 JSON 必须是对象或数组"}), 400
-        for it in parsed:
+        for idx, it in enumerate(parsed, 1):
             if not isinstance(it, dict):
-                continue
-            # 兼容 ai-multi-platform-proxy 的 auths/*.json：
-            # {"platform":"trae","account":{...},"auth":{...}}
-            if it.get("auth") and isinstance(it["auth"], dict):
-                acc = it.get("account") or {}
-                a = it["auth"]
-                items.append({
-                    "access_token": a.get("accessToken") or a.get("access_token"),
-                    "refresh_token": a.get("refreshToken") or a.get("refresh_token"),
-                    "uid": acc.get("uid") or "",
-                    "nickname": acc.get("nickname") or "",
-                    "enterprise_id": acc.get("enterpriseId") or "",
-                    "domain": a.get("domain") or "",
-                    "expires_at": a.get("expiresAt") or 0,
-                    "machine_id": a.get("machineId") or "",
-                    "device_id": a.get("deviceId") or "",
-                })
-            else:
-                # 保留无 token 项，让统一校验返回具体的项号与字段错误。
-                items.append(it)
+                return jsonify({"ok": False, "error": "第 %d 项凭证必须是对象" % idx}), 400
+            try:
+                items.append(credentials.import_item(it))
+            except ValueError as e:
+                return jsonify({"ok": False, "error": "第 %d 项：%s" % (idx, e)}), 400
     else:
         try:
             at = _string_field(data, "access_token")
@@ -1007,6 +1019,12 @@ def panel_import_token():
             return jsonify({"ok": False, "error": "第 %d 项 refresh_token 必须是字符串" % idx}), 400
         if not raw_access.strip():
             return jsonify({"ok": False, "error": "第 %d 项缺少 access_token" % idx}), 400
+        try:
+            credentials.check_region(platform, it.get("domain") or "", raw_access)
+        except ValueError as e:
+            return jsonify({"ok": False, "error": "第 %d 项：%s" % (idx, e)}), 400
+        if it.get("domain"):
+            it["domain"] = credentials.domain_host(it["domain"])
         try:
             it["_expires_at"] = int(it.get("expires_at") or it.get("expiresAt") or 0)
         except (TypeError, ValueError):
@@ -1393,6 +1411,13 @@ def _normalize_setting_value(key: str, value):
         if text not in {"0", "1", "true", "false", "yes", "no", "on", "off"}:
             raise ValueError("%s 必须是 0/1" % key)
         return "1" if text in {"1", "true", "yes", "on"} else "0"
+    if key == 'rate_limit_default_seconds':
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            raise ValueError('限流默认冷却必须是1至86400的整数秒')
+        text = str(value).strip()
+        if not text.isascii() or not text.isdigit() or not 1 <= int(text) <= 86400:
+            raise ValueError('限流默认冷却必须是1至86400的整数秒')
+        return str(int(text))
     if key == "strategy":
         text = str(value or "").strip()
         if text not in {"least_used", "round_robin", "random"}:
@@ -1458,7 +1483,7 @@ def panel_settings():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"ok": False, "error": "请求体必须是 JSON 对象"}), 400
-    allowed = ("default_model", "strategy", "auto_refresh", "refresh_ahead",
+    allowed = ("default_model", "strategy", "auto_refresh", "refresh_ahead", "rate_limit_default_seconds",
                "model_base_override", "allow_model_passthrough",
                "log_retention", "system_prompt", "auto_checkin", "checkin_time",
                "credit_threshold", "free_models", "public_join_enabled",
@@ -1545,7 +1570,10 @@ def panel_logs():
     except (TypeError, ValueError):
         return jsonify({"ok": False, "error": "limit 必须是整数"}), 400
     limit = max(1, min(limit, 500))
-    return jsonify([dict(r) for r in db.list_logs(limit)])
+    rows = [dict(r) for r in db.list_logs(limit)]
+    for row in rows:
+        row['attempts'] = json.loads(row.get('attempts') or '[]')
+    return jsonify(rows)
 
 
 @app.route("/api/logs", methods=["DELETE"])
@@ -1567,6 +1595,7 @@ def panel_test():
     t0 = time.time()
     try:
         acc, resp = proxy.stream_chat(body, platform=platform)
+        g.call_trace = getattr(resp, "_agent2api_trace", {})
     except proxy.ProxyError as e:
         return jsonify({"ok": False, "error": str(e)}), 200
     try:

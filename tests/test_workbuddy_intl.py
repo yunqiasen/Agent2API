@@ -25,7 +25,8 @@ def test_platform_and_oauth_profile(monkeypatch):
     out = P.start_login(KEY)
     assert 'www.workbuddy.ai/login?platform=workbuddy-ai' in out['auth_url']
     assert 'platform=workbuddy-ai' in session.post.call_args.args[0]
-    assert not P.supports_checkin(KEY)
+    assert P.supports_checkin(KEY)
+    assert p["checkin_kind"] == "international_activity"
 
 
 def test_new_channel_refresh_nested_payload(monkeypatch, isolated_db):

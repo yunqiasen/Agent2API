@@ -14,6 +14,7 @@ WorkBuddy / TraeWork / CodeBuddy 国际 / WorkBuddy 国际 四渠道 **多模型
 | **直接代码上游** | [DearLicy/hy3api](https://github.com/DearLicy/hy3api) | 最初的 Python 反代、号池、管理后台、模型发现与 Docker 部署基线 | `app.py`、`db.py`、`proxy.py`、`discovery.py`、`frontend/` |
 | **Trae 适配移植来源** | [itamzxm/ai-multi-platform-proxy](https://github.com/itamzxm/ai-multi-platform-proxy) | TraeWork / Trae SOLO 的登录、Token 交换、请求头、请求体、SSE 解析、额度与签到接口适配 | [`trae.py`](trae.py) |
 | **WorkBuddy 国际协议参考** | [ardeyouxipianyi/workbuddy2api-intl](https://github.com/ardeyouxipianyi/workbuddy2api-intl/tree/7c93b46ad045798c5da5953f0a5bc4e9e8a7b8f9) | 国际客户端登录、刷新头/响应、JWT 到期时间、模型 profile 及工具请求兼容；复用本项目 SQLite 号池和公共反代，不引入其独立网关或静态对外目录 | `providers.py`、`credentials.py`、`proxy.py`；[MIT 声明](THIRD_PARTY_NOTICES.md) |
+| **国际维护与限流协议参考** | [zidanefaqih/codebuddy-intl-cpa](https://github.com/zidanefaqih/codebuddy-intl-cpa/tree/03001d4599cebcd7a348d9d793f5174a558ea2cb) | 国际凭证格式、每日活动/奖励分阶段与限流冷却思路；保留两个独立客户端及本项目调度 | `daily_rewards.py`、`providers.py`、`proxy.py`；[MIT 声明](THIRD_PARTY_NOTICES.md) |
 | **间接协议参考，非直接代码上游** | [jlcodes99/cockpit-tools](https://github.com/jlcodes99/cockpit-tools) | hy3api 原实现注明的 WorkBuddy / CodeBuddy OAuth、平台常量、账号信息、Token 刷新及额度接口参考 | [`providers.py`](providers.py) |
 
 **cockpit-tools 的定位**：Agent2API 不是从它 fork 的，它也不是本服务的运行依赖。
@@ -155,7 +156,7 @@ curl http://127.0.0.1:8530/v1/chat/completions \
 - 三种方式加号：网页 SSO 登录、手填 access/refresh token、粘贴 Cockpit Tools 导出的 JSON（支持数组，按平台+uid 原位更新；旧渠道迁移会自动合并重复账号）
 - 令牌自动续期：后台每 5 分钟检查，默认提前 900 秒；兼容秒/毫秒、上游期限和 JWT `exp`，历史缺失时间自动补齐。未知有效期且有 refresh 的账号每小时尝试续期，失败指数退避。新旧令牌原子保存，账号卡片单独展示最后续期成功时间/失败原因，额度成功不会覆盖续期失败。详情见 [凭证保活说明](docs/credential-refresh-2026-09-13.md)。
 - 调度策略：先按模型路由到国内/国际候选平台，再在平台内执行 `least_used`（默认）/ `round_robin` / `random`
-- 失败自动换号重试；401 触发强制刷新后再试；HTTP 200 包装的 SSE 业务错误也会在返回客户端前识别并换号；单次请求最多尝试 9 个账号，按候选渠道均分，避免坏号池长期占满 Worker
+- 失败自动换号重试；401 触发强制刷新后再试；HTTP 200 包装的 SSE 业务错误也会在返回客户端前识别并换号；默认遍历同渠道的全部合格账号，再按该模型的渠道优先级切换；全池失败直接返回真实错误，不等待冷却
 - 额度展示严格使用上游实时口径：TraeWork 读取 `usage_summary.total_amount / consumed_amount` 并保留真实套餐列表；刷新失败保留上一份成功数据并报错，不用 0 覆盖；真实同步到 0 时明确显示 0，不再写成“未同步”
 - 账号卡片使用事实标签：`已接入`、`未过期`、`本站调用`；TraeWork 未返回连签天数时隐藏该字段，不伪造“连续 0 天”
 - 单号启停、删除、权重、备注
@@ -467,3 +468,25 @@ docker compose ps
 curl -fsS http://127.0.0.1:8530/health
 curl -fsS http://127.0.0.1:8530/api/health
 ```
+
+
+### 国际每日奖励（2026-10-14）
+
+CodeBuddy 国际与 WorkBuddy 国际沿用卡片「签到」、当前渠道「全部签到」及现有自动签到设置。提交活动、上游活动确认、奖励到账分开记录：HTTP成功不代表到账，不固定承诺每天30分。关闭模型调用仍维护凭证与奖励。
+
+卡片显示活动日期（Asia/Shanghai）、最后查询时间、待核验/待到账、阶段错误及奖励记录。金额按有唯一ID的实际发放记录核验，余额差额不作为收益；缺金额、日期或类型的记录保持待核验。一般平台奖励只显示为平台奖励，不强行归入今天的每日活动。历史已耗尽/过期记录保留，跨客户端共享账本只计一次。
+
+活动提交不做无条件重放；明确拒绝后先查询再重试，传输结果不明则保留待核验。维护过程不调用聊天或生图。开发验收使用隔离账号库及可控上游，实号奖励是否到账以部署后的实际记录为准。
+
+
+### 四渠道限流换号
+
+- 聊天、Responses、已支持的图像接口及无 `/v1` 前缀别名，共用同一选号与限流机制。
+- HTTP429、腾讯错误结构6004/图像队列13212、Trae明确的429限流独立分类；Trae4008/1005是额度或权益不足，不当作短时限流。正常回答中出现数字或“rate limit”不触发冷却。
+- 先尝试同渠道全部合格账号，再按同模型优先级切渠道。Key绑定、模型白名单、渠道模型开关、账号调用开关始终约束范围。401成功续期后同账号最多补试一次。
+- 冷却优先读取有效 `Retry-After` 或上游恢复时间；缺省60秒。在「设置 → 号池与签到 → 限流默认冷却（秒）」调整，支持1–86400整数。不是让当前请求原地等这么久。
+- 冷却持久化，到期自动恢复候选资格，不调用模型测速。只在明确的模型级/共享国际服务级限制时缩小或共享范围；范围不明时只影响当前服务的该账号。
+- 账号卡片显示冷却范围、错误及恢复时间；调用日志展示请求ID、逐次尝试、最终账号及真实/未知费用。维护成功不清除模型冷却。
+- 已向调用方输出模型事件后，遇错按原协议报错结束，不换号拼接另一份回答；单账号测活保持原账号。
+
+本轮实现与验收记录见 [国际维护与限流升级执行记录](docs/implementation/2026-10-14-international-upgrade/index.md)。开发验收与正式部署、实号到账分别记录。

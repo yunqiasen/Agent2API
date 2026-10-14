@@ -18,7 +18,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 后端源码
-COPY app.py db.py providers.py proxy.py responses.py discovery.py trae.py credentials.py model_pricing.py key_permissions.py ./
+COPY app.py db.py providers.py proxy.py responses.py discovery.py trae.py credentials.py model_pricing.py key_permissions.py daily_rewards.py rate_limits.py ./
 
 # 前端构建产物（app.py 的 WEB_DIR = <BASE_DIR>/frontend/dist）
 # ⚠️ 构建镜像前必须先在本地执行：cd frontend && npm run build

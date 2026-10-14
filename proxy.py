@@ -5,11 +5,12 @@
   1. 令牌保活：按 expires_at 提前刷新（refresh 走 X-Refresh-Token 头）
   2. 号池调度：least_used / round_robin / random，失败自动换号重试
   3. 对话反代：上游【只支持流式】，非流式请求由本层聚合后返回标准 OpenAI 响应
-  4. 每日签到：CN 域平台手动/定时自动签到，领取积分并落库状态
+  4. 每日维护：普通签到与国际活动/奖励核验，共用手动、批量及定时入口
 """
 from __future__ import annotations
 
 import datetime as _dt
+import copy
 import json
 import logging
 import math
@@ -20,6 +21,8 @@ import uuid
 
 import db
 import credentials
+import daily_rewards
+import rate_limits
 import providers as P
 import requests
 import trae
@@ -56,8 +59,6 @@ def _checkin_log(acc, stage: str, result: dict | None = None, error=None) -> Non
 
 # 上游网络抖动时，在同一账号上的重试次数
 NET_RETRY = 2
-# 单次下游请求最多尝试的账号次数；按候选渠道均分，避免坏号池长期占满 Worker。
-DEFAULT_FAILOVER_ATTEMPTS = 9
 
 
 def _lock_for(account_id: object) -> threading.Lock:
@@ -291,6 +292,8 @@ def refresh_checkin_status(account_row) -> dict:
     if not P.supports_checkin(acc["platform"]):
         return {"supported": False, "today_checked_in": False,
                 "streak_days": 0, "claimable": False}
+    if acc["platform"] in db.INTERNATIONAL_CHANNELS:
+        return daily_rewards.run(acc, submit=False)
     return _upstream_checkin_status(acc)
 
 
@@ -301,6 +304,8 @@ def checkin_account(account_row) -> dict:
     检查后重复领取。锁内每次仍重新查询上游，状态真值不依赖本地缓存。
     """
     acc = ensure_token(account_row)
+    if acc["platform"] in db.INTERNATIONAL_CHANNELS:
+        return daily_rewards.run(acc, submit=True)
     with _checkin_lock_for(acc["id"]):
         return _checkin_account_locked(acc)
 
@@ -374,7 +379,7 @@ def _checkin_account_locked(acc: dict) -> dict:
 
 def checkin_all(silent: bool = False, platform: str | None = None) -> dict:
     """遍历所有支持签到的账号（调用开关不影响签到），逐个领取。platform 指定时只签该渠道。"""
-    results = []
+    results, identities = [], {}
     want = str(platform or "").strip()
     for row in db.list_accounts():
         a = dict(row)
@@ -384,16 +389,57 @@ def checkin_all(silent: bool = False, platform: str | None = None) -> dict:
             continue
         try:
             res = checkin_account(db.get_account(a["id"]))
-            item = {"id": a["id"], "ok": True,
-                    "claimed_credit": res.get("claimed_credit", 0),
-                    "streak_days": res.get("streak_days", 0)}
-            if res.get("skipped"):
-                item["skipped"] = True
-                item["reason"] = res.get("reason") or "上游确认今日已签到"
+            if a['platform'] in db.INTERNATIONAL_CHANNELS:
+                identity = db.maintenance_identity(a)
+                item = {"id": a["id"], **res, 'deduplicated': identity in identities}
+                if res.get('ok'):
+                    previous = identities.get(identity)
+                    identities[identity] = {**item, 'skipped': bool(item.get('skipped'))
+                        and (previous is None or previous.get('skipped', False))}
+            else:
+                item = {"id": a["id"], "ok": res.get('ok', True),
+                        "claimed_credit": res.get("claimed_credit", 0),
+                        "streak_days": res.get("streak_days", 0)}
+                if res.get("skipped"):
+                    item.update(skipped=True, reason=res.get("reason") or "上游确认今日已签到")
             results.append(item)
         except Exception as e:
-            results.append({"id": a["id"], "ok": False, "error": str(e)})
-    return {"ok": True, "results": results}
+            results.append({"id": a["id"], "ok": False,
+                            "error": credentials.redact(e, a.get('access_token'), a.get('refresh_token'))})
+    summary = dict(new_checkin=0, skipped=0, pending_verification=0, pending_reward=0,
+                   credited=0, not_applicable=0, failed=0, new_credit=0)
+    for item in results:
+        if not item.get('ok'):
+            summary['failed'] += 1
+        elif item.get('checkin_kind') == 'international_activity':
+            # 奖励记录已经在持久层去重；第二张卡片晚查到的新奖励同样要计入。
+            summary['new_credit'] += item['daily_reward'].get('new_credit', 0)
+        else:
+            summary['skipped' if item.get('skipped') else 'new_checkin'] += 1
+    for item in identities.values():
+        # 同一身份取本批最新核验阶段，而非固定采用第一张卡片的旧结果。
+        state = item['daily_reward']
+        if state['activity_status'] == 'unavailable':
+            summary['not_applicable'] += 1
+        elif state['reward_status'] == 'credited':
+            summary['credited'] += 1
+        elif state['activity_status'] == 'confirmed':
+            summary['pending_reward'] += 1
+        else:
+            summary['pending_verification'] += 1
+        if item.get('skipped'):
+            summary['skipped'] += 1
+    return {"ok": True, "results": results, "summary": summary}
+
+
+def _checkin_time_reached():
+    current = _dt.datetime.now()
+    try:
+        hh, mm = (int(x) for x in (db.get_setting('checkin_time', '00:00') or '00:00').split(':'))
+        scheduled = current.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    except (ValueError, TypeError):
+        scheduled = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    return current >= scheduled
 
 
 def run_auto_checkin_if_due():
@@ -404,15 +450,7 @@ def run_auto_checkin_if_due():
     if db.get_setting("_last_checkin_run_date", "") == today:
         return
 
-    ct = (db.get_setting("checkin_time", "00:00") or "00:00").strip() or "00:00"
-    try:
-        hh, mm = (int(x) for x in ct.split(":"))
-        run_at = _dt.datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0)
-    except Exception:
-        run_at = _dt.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-
-    # 未到设定时间则本次跳过，等下一轮（不更新 run_date，避免提前消费当日额度）
-    if _dt.datetime.now() < run_at:
+    if not _checkin_time_reached():
         return
 
     checkin_all(silent=True)
@@ -423,6 +461,8 @@ def retry_failed_checkins():
     """每小时补签一次今日仍未签到的账号（TraeWork 上游量控/风控窗口解除后
     可自动补领；其它平台失败也顺带重试）。由后台维护线程调用。"""
     if db.get_setting("auto_checkin", "1") != "1":
+        return
+    if not _checkin_time_reached():
         return
     now = time.time()
     if now - float(db.get_setting("_last_checkin_retry_ts", "0") or 0) < 3600:
@@ -453,7 +493,7 @@ def choose_account(platform: str | None = None, model: str | None = None,
     strategy = db.get_setting("strategy", "least_used")
     min_quota = _quota_threshold_for(model)
     return db.pick_account(platform=platform or None, strategy=strategy,
-                           exclude=exclude, min_quota=min_quota)
+                           exclude=exclude, min_quota=min_quota, model=model)
 
 
 def _model_costs_credit(model: str | None) -> bool:
@@ -742,15 +782,6 @@ def _is_model_route_error(status: int, text: str, model: str | None = None) -> b
     return any(x in s for x in markers)
 
 
-# 图像端点特有的错误判定
-def _is_image_limit_error(status: int, text: str) -> bool:
-    """图像任务队列上限（13212 RequestLimitExceeded.JobNumExceed）属可重试限流。"""
-    if status != 400:
-        return False
-    s = str(text or "").lower()
-    return "13212" in s or "jobnumexceed" in s or "requestlimitexceeded" in s
-
-
 def _route_error_message(model: str, candidates: list[str], attempted: list[str]) -> str:
     if candidates:
         labels = ", ".join(P.PLATFORMS.get(x, {}).get("label", x) for x in candidates)
@@ -849,10 +880,6 @@ def open_image_upstream(acc: dict, body: dict, timeout: object = 120):
     raise last
 
 
-def _is_retryable(status: int) -> bool:
-    return status in (401, 403, 429) or status >= 500
-
-
 # --------------------------------------------------------------------------
 # 对外：流式 / 非流式
 # --------------------------------------------------------------------------
@@ -929,11 +956,42 @@ class _PrefetchedSSEResponse:
         return self._resp.close()
 
 
-def _prefetch_sse_evidence(resp, is_trae: bool = False):
+def _generation_sse_lines(resp):
+    """合并跨 data 行的 JSON，供预读和后续协议适配共用；单行事件保持原样。"""
+    pending = []
+    for raw in resp.iter_lines(decode_unicode=False):
+        text = raw.decode('utf-8', errors='replace') if isinstance(raw, bytes) else str(raw or '')
+        if text.startswith('data:'):
+            pending.append(text[5:].lstrip())
+            payload = '\n'.join(pending)
+            try:
+                obj = json.loads(payload) if payload != '[DONE]' else None
+            except (ValueError, TypeError):
+                if len(payload) > 1048576:
+                    raise ValueError('上游 SSE 数据帧超长且不是有效 JSON')
+                continue
+            if len(pending) == 1:
+                yield raw
+            else:
+                yield ('data: ' + json.dumps(obj, ensure_ascii=False)).encode('utf-8')
+            pending = []
+        else:
+            if text == '' or text.startswith('event:'):
+                for part in pending:
+                    yield ('data: ' + part).encode('utf-8')
+                pending = []
+            yield raw
+    for part in pending:
+        yield ('data: ' + part).encode('utf-8')
+    # 兼容最后一帧缺少空行的上游；Trae 事件同样需要在 EOF 派发。
+    yield b''
+
+
+def _prefetch_sse_evidence(resp, is_trae: bool = False, is_image: bool = False):
     """预读首个有意义 SSE 事件，返回 (可重放响应, 业务错误)。"""
     if not hasattr(resp, "iter_lines"):
         return resp, ""
-    remaining = iter(resp.iter_lines(decode_unicode=False))
+    remaining = iter(_generation_sse_lines(resp))
     buffered = []
     event = ""
     event_data = []
@@ -944,6 +1002,8 @@ def _prefetch_sse_evidence(resp, is_trae: bool = False):
     for raw in remaining:
         buffered.append(raw)
         line = decode(raw)
+        if line.startswith("event:"):
+            event = line[6:].strip()
         if is_trae:
             if line.startswith("event:"):
                 event = line[6:].strip()
@@ -955,12 +1015,16 @@ def _prefetch_sse_evidence(resp, is_trae: bool = False):
                     obj = json.loads(payload) if payload else {}
                 except Exception:
                     obj = {}
+                if event == 'token_usage' and isinstance(obj, dict):
+                    resp._hy3_usage = obj
                 if event == "error":
                     err = _sse_business_error(obj) or payload or "Trae SSE error"
-                    return _PrefetchedSSEResponse(resp, buffered, remaining), err
+                    wrapped = _PrefetchedSSEResponse(resp, buffered, remaining)
+                    wrapped._hy3_error_payload = obj
+                    return wrapped, err
                 # 只有 output 才证明模型真正产生了响应；token_usage/done 单独出现
                 # 仍是空流，继续读到结尾后按失败换号。
-                if event == "output":
+                if event == "output" and isinstance(obj, dict) and (obj.get("response") or obj.get("reasoning_content")):
                     return _PrefetchedSSEResponse(resp, buffered, remaining), ""
                 event, event_data = "", []
         elif line.startswith("data:"):
@@ -972,13 +1036,26 @@ def _prefetch_sse_evidence(resp, is_trae: bool = False):
                         "HTTP 200 empty SSE")
             try:
                 obj = json.loads(payload)
-            except Exception:
-                continue
-            err = _sse_business_error(obj)
+            except (ValueError, TypeError):
+                if event != 'error':
+                    continue
+                obj = {'error': {'message': payload}}
+            usage = extract_usage(obj)
+            if usage is not None:
+                resp._hy3_usage = usage
+            err = _sse_business_error(obj) or (payload if event == 'error' else '')
             if err:
-                return _PrefetchedSSEResponse(resp, buffered, remaining), err
-            if isinstance(obj, dict) and ("choices" in obj or "usage" in obj):
+                wrapped = _PrefetchedSSEResponse(resp, buffered, remaining)
+                wrapped._hy3_error_payload = obj
+                return wrapped, err
+            if isinstance(obj, dict) and (
+                    (is_image and obj.get('data')) or
+                    any(isinstance(ch, dict) and any(
+                        value for key, value in (ch.get('delta') or ch.get('message') or {}).items()
+                        if key != 'role') for ch in (obj.get('choices') or []))):
                 return _PrefetchedSSEResponse(resp, buffered, remaining), ""
+        if not line:
+            event = ''
         if len(buffered) >= 100:
             break
     return _PrefetchedSSEResponse(resp, buffered, remaining), "HTTP 200 empty SSE"
@@ -1044,267 +1121,243 @@ def extract_usage(obj) -> dict | None:
     return None
 
 
-def stream_chat(body: dict, platform: str | None = None,
-                max_retry: int = DEFAULT_FAILOVER_ATTEMPTS):
-    """按模型路由平台、按号池策略选号，并向上游发起流式请求。
+def usage_credit(usage):
+    """只认上游明确的有限数值；None/空串/布尔值不代表实际零费用。"""
+    raw = usage.get('credit') if isinstance(usage, dict) else None
+    if isinstance(raw, bool):
+        return None
+    try:
+        amount = float(raw)
+        return amount if math.isfinite(amount) else None
+    except (ValueError, TypeError, OverflowError):
+        return None
 
-    API Key 显式绑定平台时只尝试绑定平台；未绑定时按模型路由矩阵依次尝试。
-    只有明确的「模型未注册」400 才会切换候选平台，普通参数 400 直接返回。
-    """
-    tried_accounts = []
-    tried_platforms = []
-    last_err = None
-    last_failure_was_route = False
-    any_account = False
-    refreshed_401 = set()
-    model = body.get("model") or default_model()
 
-    # 解析模型类型与候选平台：注册表驱动，未知模型触发实时探测回退。
-    # 图像生成模型必须走 /v1/images/generations，不能进入 chat 网关。
-    mtype, _ = model_route(model)
-    if mtype == "image":
-        raise ProxyError(
-            "模型 %s 是图像生成模型，请改用 /v1/images/generations 端点调用" % model,
-            status=400)
+def _response_failure(acc, response, model, image=False):
+    resp = response
+    status = resp.status_code
+    error = ''
+    payload = None
+    if status >= 400:
+        error = "HTTP %s %s" % (status, getattr(resp, 'text', '')[:400])
+    elif 'application/json' in (getattr(resp, 'headers', {}).get('Content-Type') or '') or (image and 'text/event-stream' not in (getattr(resp, 'headers', {}).get('Content-Type') or '')):
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = None
+        error = _sse_business_error(payload) if isinstance(payload, dict) else '响应不是 JSON 对象'
+        if not image and not error:
+            error = '上游未返回 SSE'
+        resp._hy3_error_payload = payload
+    else:
+        resp, error = _prefetch_sse_evidence(resp, is_trae=_is_trae_acc(acc), is_image=image)
+    if not error:
+        return resp, None
+    failure = rate_limits.classify(acc, resp, error,
+                                   route_error=_is_model_route_error(status if status >= 400 else 400, error, model))
+    if failure.kind == 'rate_limit':
+        rate_limits.mark(acc, model, resp, error, failure)
+    resp.close()
+    return resp, failure
 
+
+def _attempt_entry(acc):
+    return {'account_id': acc['id'], 'platform': acc['platform'], 'kind': 'selected',
+            'outcome': 'selected', 'status': 200, 'retry_at': 0, 'message': '', 'credit': None}
+
+
+def _failure_fields(failure):
+    return {'kind': failure.kind, 'outcome': 'failed', 'status': failure.status,
+            'http_status': failure.http_status, 'code': failure.code,
+            'retry_at': failure.retry_at, 'message': failure.message}
+
+
+class _GenerationResponse:
+    """交付首帧后的流只观察和报错，不回到调度器重放。"""
+    def __init__(self, response, acc, model, trace):
+        self._response, self._acc, self._model = response, acc, model
+        self._agent2api_trace = trace
+
+    def __getattr__(self, name):
+        return getattr(self._response, name)
+
+    def _observe(self, payload, event):
+        credit = usage_credit(payload if event == 'token_usage' else extract_usage(payload))
+        if credit is not None:
+            self._agent2api_trace['attempts'][-1]['credit'] = credit
+        if not rate_limits.error_details(payload) and event != 'error':
+            return
+        failure = rate_limits.classify(self._acc, self._response,
+            _sse_business_error(payload) or str(payload), payload=payload)
+        rate_limits.mark(self._acc, self._model, self._response, failure.message, failure)
+        self._agent2api_trace['attempts'][-1].update(_failure_fields(failure))
+        raise ProxyError(failure.message, status=failure.status,
+                         payload={'trace': self._agent2api_trace, 'retry_at': failure.retry_at})
+
+    def iter_lines(self, decode_unicode=False):
+        event = ''
+        try:
+            for raw in self._response.iter_lines(decode_unicode=False):
+                text = raw.decode('utf-8', errors='replace') if isinstance(raw, bytes) else str(raw or '')
+                if text.startswith('event:'):
+                    event = text[6:].strip()
+                    if event == 'error':
+                        continue  # 错误帧由本地协议统一脱敏后结束。
+                elif text.startswith('data:'):
+                    data = text[5:].strip()
+                    try:
+                        payload = json.loads(data)
+                    except (ValueError, TypeError):
+                        if event == 'error':
+                            self._observe({'error': {'message': data or '上游 error 事件'}}, event)
+                    else:
+                        self._observe(payload, event)
+                elif not text:
+                    if event == 'error':
+                        self._observe({'error': {'message': '上游 error 事件缺少详情'}}, event)
+                    event = ''
+                yield text if decode_unicode else raw
+        except ProxyError:
+            raise
+        except Exception as e:
+            failure = rate_limits.Failure('network', 502,
+                credentials.redact(e, self._acc.get('access_token'), self._acc.get('refresh_token')))
+            self._agent2api_trace['attempts'][-1].update(_failure_fields(failure))
+            raise ProxyError(failure.message, status=502) from e
+
+
+    def iter_content(self, chunk_size=None):
+        for raw in self.iter_lines():
+            yield (raw.encode('utf-8') if isinstance(raw, str) else raw or b'') + b'\n'
+
+    def close(self):
+        return self._response.close()
+
+
+def _dispatch_generation(body, platform, image, max_retry):
+    trace = {'request_id': uuid.uuid4().hex, 'attempts': []}
+    def error(message, status, **extra):
+        return ProxyError(message, status=status, payload={'trace': trace, **extra})
+    model = body.get('model') or default_model(platform)
     candidates = resolve_platform_candidates(model, platform)
-
     if not candidates:
-        raise ProxyError(_route_error_message(model, candidates, []), status=503)
-
-    attempt_limit = max(1, int(max_retry or 0))
-    per_platform_budget = max(1, math.ceil(attempt_limit / len(candidates)))
-    total_attempts = 0
-
+        raise error(_route_error_message(model, [], []), status=503)
+    minimum = _quota_threshold_for(model)
+    pool_size = sum(len(db.callable_accounts(p, min_quota=minimum)) for p in candidates)
+    # 每个候选至多尝试一次，加上每号一次已刷新的401补救；不按渠道均摊预算。
+    limit = max(1, int(max_retry)) if max_retry is not None else max(1, pool_size * 2)
+    tried, refreshed, failures = [], set(), []
     for candidate in candidates:
-        tried_platforms.append(candidate)
-        retry_rows = []
-        platform_attempts = 0
-
-        while (platform_attempts < per_platform_budget
-               and total_attempts < attempt_limit):
-            row = (retry_rows.pop(0) if retry_rows
-                   else choose_account(candidate, model=model, exclude=tried_accounts))
-            platform_attempts += 1
-            total_attempts += 1
+        for row in db.callable_accounts(candidate, min_quota=minimum):
+            cooldowns = db.active_cooldowns(row, model=model)
+            if cooldowns:
+                cooling = max(cooldowns, key=lambda x: x['retry_at'])
+                trace['attempts'].append({**_attempt_entry(dict(row)), 'kind': 'rate_limit',
+                    'outcome': 'cooldown', 'status': 429, 'retry_at': cooling['retry_at'],
+                    'message': cooling['message']})
+        retry_row = None
+        while len(tried) < limit:
+            if candidate not in resolve_platform_candidates(model, platform):
+                break
+            row = retry_row if retry_row is not None else choose_account(candidate, model=model, exclude=tried)
+            retry_row = None
             if row is None:
                 break
-            any_account = True
-            tried_accounts.append(row["id"])
+            tried.append(row['id'])
+            acc = dict(row)
+            entry = _attempt_entry(acc)
+            trace['attempts'].append(entry)
+            resp = None
             try:
                 acc = ensure_token(row)
-            except ProxyError as e:
-                last_err = str(e)
-                last_failure_was_route = False
-                db.bump_account(row["id"], False, last_err)
-                continue
-
-            try:
-                resp = open_upstream(acc, body)
             except Exception as e:
-                last_err = "连接上游失败: %s" % e
-                last_failure_was_route = False
-                db.bump_account(acc["id"], False, last_err)
-                continue
-
-            if resp.status_code >= 400:
-                status = resp.status_code
-                text = ""
+                failure = rate_limits.Failure('credential', getattr(e, 'status', 401),
+                    credentials.redact(e, acc.get('access_token'), acc.get('refresh_token')))
+            else:
+                current = db.get_account(acc['id'])
+                if (current is None or not current['enabled'] or current['status'] in ('banned', 'disabled')
+                        or (minimum > 0 and current['quota_updated_at'] and current['quota_remain'] < minimum)
+                        or candidate not in resolve_platform_candidates(model, platform)):
+                    entry.update(kind='not_eligible', outcome='skipped', status=503,
+                                 message='调用开关、模型或额度条件已变更')
+                    continue
+                cooldowns = db.active_cooldowns(acc, model=model)
+                if cooldowns:
+                    entry.update(kind='rate_limit', outcome='cooldown', status=429,
+                                 retry_at=max(c['retry_at'] for c in cooldowns), message='并发请求已记录限流')
+                    continue
                 try:
-                    text = resp.text[:400]
+                    resp = (open_image_upstream if image else open_upstream)(acc, copy.deepcopy(body))
+                    resp, failure = _response_failure(acc, resp, model, image=image)
+                    if failure is None:
+                        trace['final_account_id'] = acc['id']
+                        return acc, _GenerationResponse(resp, acc, model, trace)
+                except Exception as e:
+                    if resp is not None:
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                    failure = rate_limits.Failure('network', 502,
+                        credentials.redact(e, acc.get('access_token'), acc.get('refresh_token')))
+            entry.update(_failure_fields(failure))
+            entry['credit'] = usage_credit(extract_usage(failure.details) or getattr(resp, '_hy3_usage', None))
+            failures.append(failure)
+            db.bump_account(acc['id'], False, failure.message)
+            if failure.status == 401 and acc['id'] not in refreshed:
+                refreshed.add(acc['id'])
+                try:
+                    fresh = ensure_token(acc, force=True)
+                    if fresh.get('access_token') != acc.get('access_token'):
+                        retry_row = fresh
+                        continue
                 except Exception:
                     pass
-                resp.close()
-                last_err = "HTTP %s %s" % (status, text)
-                last_failure_was_route = _is_model_route_error(status, text, model)
-                db.bump_account(acc["id"], False, last_err)
-
-                if status == 401 and acc["id"] not in refreshed_401:
-                    # token 可能过期：强制刷新成功后，先重试同一个账号一次；
-                    # 不能把它提前放进排除表后直接跳到其它账号。
-                    refreshed_401.add(acc["id"])
-                    try:
-                        fresh = ensure_token(acc, force=True)
-                        if fresh.get("access_token") != acc.get("access_token"):
-                            retry_rows.append(fresh)
-                            continue
-                    except Exception:
-                        pass
-
-                if last_failure_was_route:
-                    # 同一渠道不同账号可能处于不同套餐/灰度，继续尝试该渠道
-                    # 的其它账号；全部账号都未注册时，外层再切换渠道。
-                    continue
-                if _is_retryable(status):
-                    continue
-                raise ProxyError(last_err, status=status)
-
-            resp, sse_error = _prefetch_sse_evidence(resp, is_trae=_is_trae_acc(acc))
-            if sse_error:
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-                last_err = "SSE 业务错误: %s" % sse_error
-                last_failure_was_route = any(marker in sse_error.lower() for marker in (
-                    "11102", "11103", "model not found", "service info not found",
-                    "backend [aiart]",
-                ))
-                db.bump_account(acc["id"], False, last_err)
-                continue
-            return acc, resp
-
-    if last_failure_was_route:
-        raise ProxyError(_route_error_message(model, candidates, tried_platforms), status=503)
-    if last_err:
-        raise ProxyError("所有候选账号均调用失败: %s" % last_err, status=502)
-
-    # 候选平台存在启用账号但一个都选不出，通常是额度门槛拦截。
-    enabled_count = sum(db.count_accounts(p, enabled=1) for p in candidates)
-    if not any_account and _model_costs_credit(model) and enabled_count > 0:
-        thr = db.get_setting("credit_threshold", "1")
-        scope = ("API Key 绑定平台 %s" % platform) if platform else "模型候选平台"
-        raise ProxyError("%s的账号积分不足（低于阈值 %s），无法调用模型 %s"
-                         % (scope, thr, model), status=403)
-
-    if platform:
-        raise ProxyError("号池中没有 API Key 绑定平台 %s 的可用账号" % platform,
-                         status=503)
-    raise ProxyError("模型 %s 的候选平台号池中没有可用账号" % model, status=503)
+            if not failure.retryable:
+                raise error(failure.message, status=failure.status)
+    candidates = resolve_platform_candidates(model, platform)
+    if not candidates:
+        raise error(_route_error_message(model, [], []), status=503)
+    eligible = [a for p in candidates for a in db.callable_accounts(p, min_quota=minimum)]
+    cooldowns_by_account = [db.active_cooldowns(a, model=model) for a in eligible]
+    if eligible and all(cooldowns_by_account) and (not failures or all(f.kind == 'rate_limit' for f in failures)):
+        # 一个账号的全部限制都解除后才可调用；再取账号之间的最早恢复时间。
+        retry_at = min(max(c['retry_at'] for c in limits) for limits in cooldowns_by_account)
+        raise error('所有合格账号均处于限流冷却', status=429, retry_at=retry_at)
+    if any(a['id'] not in tried and not limits for a, limits in zip(eligible, cooldowns_by_account)):
+        raise error('本次重试预算已用尽，仍有合格账号未尝试', status=503)
+    if failures:
+        kinds = {f.kind for f in failures}
+        cooling_messages = [c['message'] for limits in cooldowns_by_account for c in limits]
+        if cooling_messages:
+            kinds.add('rate_limit')
+        if kinds == {'route'}:
+            raise error(_route_error_message(model, candidates, candidates), status=503)
+        status = failures[-1].status if len(kinds) == 1 else 502
+        messages = [f.message for f in failures] + cooling_messages
+        message = '所有候选账号均调用失败或处于冷却: ' + '; '.join(dict.fromkeys(messages))
+        raise error(message, status=status)
+    if not eligible and not image and minimum > 0 and any(db.count_accounts(p, enabled=1) for p in candidates):
+        raise error('模型 %s 的候选账号积分低于阈值 %s' % (model, minimum), status=403)
+    raise error('模型 %s 的候选平台号池中没有可用账号' % model, status=503)
 
 
-def generate_image(body: dict, platform: str | None = None,
-                   max_retry: int = DEFAULT_FAILOVER_ATTEMPTS):
-    """按模型路由平台、按号池策略选号，向图像端点发起请求。
+def stream_chat(body: dict, platform: str | None = None, max_retry: int | None = None):
+    model = body.get('model') or default_model(platform)
+    mtype, _ = model_route(model)
+    if mtype == 'image':
+        raise ProxyError('模型 %s 是图像生成模型，请使用 /v1/images/generations' % model, status=400)
+    return _dispatch_generation(body, platform, False, max_retry)
 
-    与 stream_chat 同构：先按模型路由矩阵选候选平台，平台内按号池策略选号；
-    只有「模型未注册 / aiart 不支持」这类错误才切下一平台；图像任务队列上限
-    （13212）按可重试限流处理，跳下一账号/平台。
-    """
-    tried_accounts = []
-    tried_platforms = []
-    last_err = None
-    last_failure_was_route = False
-    any_account = False
-    refreshed_401 = set()
-    model = body.get("model") or ""
+
+def generate_image(body: dict, platform: str | None = None, max_retry: int | None = None):
+    model = body.get('model')
     if not model:
-        raise ProxyError("缺少 model 字段", status=400)
-    # 解析模型类型：注册表驱动，未知模型触发实时探测回退。
-    # 只有确实为图像类型的模型才允许走图像端点；文本/音频模型或探测失败的模型
-    # 一律拦截（文本/音频用 chat 网关，探测失败则 503 不盲发）。
+        raise ProxyError('缺少 model 字段', status=400)
     mtype, _ = model_route(model)
-    candidates = resolve_platform_candidates(model, platform)
-    if mtype is not None and mtype != "image":
-        raise ProxyError(
-            "模型 %s 不是图像生成模型（类型=%s），请使用 /v1/chat/completions 或确认模型 id"
-            % (model, mtype), status=400)
-
-    if not candidates:
-        raise ProxyError(_route_error_message(model, candidates, tried_platforms), status=503)
-
-    attempt_limit = max(1, int(max_retry or 0))
-    per_platform_budget = max(1, math.ceil(attempt_limit / len(candidates)))
-    total_attempts = 0
-
-    for candidate in candidates:
-        tried_platforms.append(candidate)
-        retry_rows = []
-        platform_attempts = 0
-        while (platform_attempts < per_platform_budget
-               and total_attempts < attempt_limit):
-            row = (retry_rows.pop(0) if retry_rows
-                   else choose_account(candidate, model=model, exclude=tried_accounts))
-            platform_attempts += 1
-            total_attempts += 1
-            if row is None:
-                break
-            any_account = True
-            tried_accounts.append(row["id"])
-            try:
-                acc = ensure_token(row)
-            except ProxyError as e:
-                last_err = str(e)
-                last_failure_was_route = False
-                db.bump_account(row["id"], False, last_err)
-                continue
-
-            try:
-                resp = open_image_upstream(acc, body)
-            except Exception as e:
-                last_err = "连接上游失败: %s" % e
-                last_failure_was_route = False
-                db.bump_account(acc["id"], False, last_err)
-                continue
-
-            if resp.status_code >= 400:
-                status = resp.status_code
-                text = ""
-                try:
-                    text = resp.text[:400]
-                except Exception:
-                    pass
-                resp.close()
-                last_err = "HTTP %s %s" % (status, text)
-                if _is_image_limit_error(status, text):
-                    # 任务队列上限：当前账号/平台暂时打满，换下一账号继续
-                    db.bump_account(acc["id"], False, last_err)
-                    continue
-                last_failure_was_route = _is_model_route_error(status, text, model)
-                db.bump_account(acc["id"], False, last_err)
-                if status == 401 and acc["id"] not in refreshed_401:
-                    refreshed_401.add(acc["id"])
-                    try:
-                        fresh = ensure_token(acc, force=True)
-                        if fresh.get("access_token") != acc.get("access_token"):
-                            retry_rows.append(fresh)
-                            continue
-                    except Exception:
-                        pass
-
-                if last_failure_was_route:
-                    # 图像模型权限同样可能按账号不同，继续尝试同渠道其它账号。
-                    continue
-                if _is_retryable(status):
-                    continue
-                raise ProxyError(last_err, status=status)
-
-            # 图像网关也可能用 HTTP 200 包装业务错误。JSON 响应必须先验证，
-            # 否则会把 code=11102 等错误当成图片成功并停止故障转移。
-            ctype = (resp.headers.get("Content-Type") or "").lower()
-            if "text/event-stream" not in ctype:
-                try:
-                    payload = resp.json()
-                except Exception:
-                    payload = None
-                business_error = (_sse_business_error(payload)
-                                  if isinstance(payload, dict)
-                                  else "响应不是 JSON 对象")
-                if business_error:
-                    try:
-                        text = json.dumps(payload, ensure_ascii=False)[:400]
-                    except Exception:
-                        text = str(payload)[:400]
-                    resp.close()
-                    last_err = "HTTP 200 图像业务错误: %s" % business_error
-                    last_failure_was_route = _is_model_route_error(400, text, model)
-                    db.bump_account(acc["id"], False, last_err)
-                    continue
-
-            return acc, resp
-
-    if last_failure_was_route:
-        raise ProxyError(_route_error_message(model, candidates, tried_platforms), status=503)
-    if last_err:
-        raise ProxyError("所有候选账号均调用失败: %s" % last_err, status=502)
-
-    enabled_count = sum(db.count_accounts(p, enabled=1) for p in candidates)
-    if not any_account and enabled_count > 0:
-        raise ProxyError("模型 %s 的候选平台号池中没有可用账号" % model, status=503)
-    if platform:
-        raise ProxyError("号池中没有 API Key 绑定平台 %s 的可用账号" % platform,
-                         status=503)
-    raise ProxyError("模型 %s 的候选平台号池中没有可用账号" % model, status=503)
+    if mtype is not None and mtype != 'image':
+        raise ProxyError('模型 %s 不是图像生成模型（类型=%s）' % (model, mtype), status=400)
+    return _dispatch_generation(body, platform, True, max_retry)
 
 
 def _trae_openai_sse_events(resp, model: str):

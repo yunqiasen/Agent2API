@@ -151,6 +151,31 @@ CREATE TABLE IF NOT EXISTS logs (
 );
 CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts DESC);
 
+CREATE TABLE IF NOT EXISTS account_cooldowns (
+    identity TEXT NOT NULL,
+    service TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    retry_at INTEGER NOT NULL,
+    updated_at REAL NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY(identity, service, model)
+);
+
+CREATE TABLE IF NOT EXISTS reward_evidence (
+    identity TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY(identity, record_id)
+);
+
+CREATE TABLE IF NOT EXISTS daily_reward_state (
+    identity TEXT NOT NULL,
+    activity_date TEXT NOT NULL,
+    data TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(identity, activity_date)
+);
+
 CREATE TABLE IF NOT EXISTS pending_login (
     state       TEXT PRIMARY KEY,
     platform    TEXT,
@@ -167,12 +192,13 @@ DEFAULT_SETTINGS = {
     "strategy": "least_used",
     "auto_refresh": "1",
     "refresh_ahead": "900",
+    "rate_limit_default_seconds": "60",
     "model_base_override": "",
     "allow_model_passthrough": "1",
     "log_retention": "2000",
     # 国际站要求首条 system 消息，客户端没传时用它补齐
     "system_prompt": "",
-    # 每日签到：每天到点自动签到 + 手动签到（仅 CN 域平台）
+    # 每日维护：普通签到及国际活动/奖励使用同一日程
     "auto_checkin": "1",
     "checkin_time": "00:00",
     # 积分阈值门控：账号剩余积分低于阈值时，禁止调用「会扣积分」的模型
@@ -318,6 +344,8 @@ def _migrate_logs_columns():
         # 1 = credit_cost 来自上游 usage.credit；0 = 历史人工估算/未知。
         # 统计面板只汇总真实上游积分，避免把旧估算值冒充实际扣费。
         "credit_actual": "INTEGER DEFAULT 0",
+        "request_id": "TEXT DEFAULT ''",
+        "attempts": "TEXT DEFAULT '[]'",
     }
     with _write_lock:
         c = get_conn()
@@ -580,9 +608,9 @@ def list_accounts(platform: str | None = None) -> list:
     return get_conn().execute(sql, args).fetchall()
 
 
-def pick_account(platform: str | None = None, strategy: str = "least_used",
+def callable_accounts(platform: str | None = None, strategy: str = "least_used",
                  exclude: list | None = None, min_quota: float = 0):
-    """按策略选出一个可用账号。exclude 为已失败的 account_id 列表。
+    """按策略列出符合调用开关及额度门槛的账号。exclude 为已失败的 account_id 列表。
 
     min_quota > 0 时仅选「剩余积分 >= min_quota」的账号；若账号从未刷新过额度
     （quota_updated_at=0，无法判断），一律放行，避免误杀未初始化的账号。
@@ -606,7 +634,13 @@ def pick_account(platform: str | None = None, strategy: str = "least_used",
     else:
         sql += " ORDER BY req_count ASC, last_used ASC, id ASC"
 
-    return get_conn().execute(sql + " LIMIT 1", args).fetchone()
+    return get_conn().execute(sql, args).fetchall()
+
+
+def pick_account(platform: str | None = None, strategy: str = 'least_used',
+                 exclude: list | None = None, min_quota: float = 0, model=None):
+    return next((row for row in callable_accounts(platform, strategy, exclude, min_quota)
+                 if not active_cooldowns(row, model=model)), None)
 
 
 def count_accounts(platform: str | None = None, enabled: int | None = None) -> int:
@@ -730,18 +764,18 @@ def bump_api_key(kid: int):
 def add_log(api_key_id, account_id, platform, model, status, stream,
             duration_ms, prompt_chars=0, error="",
             prompt_tokens=0, completion_tokens=0, total_tokens=0,
-            credit_cost=0.0, credit_actual=False):
+            credit_cost=0.0, credit_actual=False, request_id="", attempts=None):
     with _write_lock:
         c = get_conn()
         c.execute("""INSERT INTO logs(ts,api_key_id,account_id,platform,model,status,
                      stream,duration_ms,prompt_chars,error,
-                     prompt_tokens,completion_tokens,total_tokens,credit_cost,credit_actual)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     prompt_tokens,completion_tokens,total_tokens,credit_cost,credit_actual,request_id,attempts)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                   (int(time.time()), api_key_id, account_id, platform, model, status,
                    1 if stream else 0, duration_ms, prompt_chars, (error or "")[:500],
                    int(prompt_tokens or 0), int(completion_tokens or 0),
                    int(total_tokens or 0), float(credit_cost or 0),
-                   1 if credit_actual else 0))
+                   1 if credit_actual else 0, request_id, json.dumps(attempts or [], ensure_ascii=False)))
         c.commit()
 
 
@@ -935,3 +969,70 @@ def cleanup_pending(older_than: int = 3600):
 
 def row_to_dict(row) -> dict:
     return dict(row) if row is not None else {}
+
+
+# 每日活动使用真实计费身份；两张客户端卡片不产生两份账本。
+def maintenance_identity(acc) -> str:
+    return json.dumps(quota_identity(dict(acc)), ensure_ascii=True, separators=(",", ":"))
+
+
+def get_daily_reward_state(acc, day: str) -> dict:
+    row = get_conn().execute(
+        "SELECT data FROM daily_reward_state WHERE identity=? AND activity_date=?",
+        (maintenance_identity(acc), day)).fetchone()
+    return json.loads(row["data"]) if row else {}
+
+
+def save_daily_reward_state(acc, day: str, data: dict) -> None:
+    with _write_lock:
+        get_conn().execute(
+            "INSERT INTO daily_reward_state VALUES(?,?,?,?) "
+            "ON CONFLICT(identity,activity_date) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at",
+            (maintenance_identity(acc), day, json.dumps(data, ensure_ascii=False), int(time.time())))
+
+
+def record_reward_evidence(acc, records: list) -> float:
+    added = 0.0
+    identity = maintenance_identity(acc)
+    with _write_lock, get_conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        for record in records:
+            old = c.execute("SELECT data FROM reward_evidence WHERE identity=? AND record_id=?",
+                            (identity, record["record_id"])).fetchone()
+            previous = json.loads(old["data"]) if old else {}
+            # 缺字段的新查询不抹去已有的到账证据。
+            current = {**record, **previous, **{k: v for k, v in record.items() if v is not None}}
+            if previous.get('kind') == 'daily_activity' and record.get('kind') == 'platform_reward':
+                current['kind'] = 'daily_activity'
+            previously_confirmed = previous.get('amount') is not None and previous.get('credited_at')
+            if not previously_confirmed and current.get("amount") is not None and current.get("credited_at"):
+                added += current["amount"]
+            c.execute("INSERT INTO reward_evidence VALUES(?,?,?) "
+                      "ON CONFLICT(identity,record_id) DO UPDATE SET data=excluded.data",
+                      (identity, record["record_id"], json.dumps(current, ensure_ascii=False)))
+    return added
+
+
+def list_reward_evidence(acc) -> list:
+    return [json.loads(r["data"]) for r in get_conn().execute(
+        "SELECT data FROM reward_evidence WHERE identity=? ORDER BY record_id",
+        (maintenance_identity(acc),))]
+
+
+def save_cooldown(acc, service: str, model: str, data: dict) -> None:
+    with _write_lock:
+        get_conn().execute(
+            "INSERT INTO account_cooldowns VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(identity,service,model) DO UPDATE SET "
+            "retry_at=MAX(account_cooldowns.retry_at,excluded.retry_at), "
+            "updated_at=excluded.updated_at,data=excluded.data "
+            "WHERE excluded.updated_at >= account_cooldowns.updated_at",
+            (maintenance_identity(acc), service, model, data['retry_at'], data['updated_at'], json.dumps(data)))
+
+
+def active_cooldowns(acc, model=None) -> list:
+    rows = get_conn().execute(
+        "SELECT * FROM account_cooldowns WHERE identity=? AND service IN (?,?) AND retry_at>?",
+        (maintenance_identity(acc), acc['platform'], 'intl' if acc['platform'] in INTERNATIONAL_CHANNELS else acc['platform'], time.time()))
+    return [{**json.loads(r['data']), 'retry_at': r['retry_at'], 'service': r['service'], 'model': r['model']}
+            for r in rows if model is None or not r['model'] or r['model'] == model]

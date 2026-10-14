@@ -145,6 +145,31 @@ export interface OverviewStats {
   platforms: PlatformInfo[];
   settings: Record<string, any>;
 }
+export interface DailyReward {
+  activity_date: string;
+  activity_status: "unknown" | "not_completed" | "submitted" | "confirmed" | "unavailable";
+  reward_status: "unknown" | "pending" | "credited" | "not_eligible";
+  amount: number | null;
+  new_credit?: number;
+  reason?: string;
+  error?: string;
+  error_stage?: string;
+  last_success_at?: number;
+  reward_checked_at?: number;
+  rewards: { record_id: string; kind: string; activity_date: string | null; amount: number | null; credited_at: number | null }[];
+}
+export interface CheckinSummary {
+  new_checkin: number; skipped: number; pending_verification: number;
+  pending_reward: number; credited: number; not_applicable: number; failed: number;
+}
+export interface AccountCooldown {
+  service: string; model: string; retry_at: number; kind: string;
+  message: string; code?: string; http_status?: number;
+}
+export interface CallAttempt {
+  account_id: number; platform: string; kind: string; outcome: string; status: number;
+  retry_at?: number; message?: string; code?: string; http_status?: number; credit?: number | null;
+}
 export interface Account {
   id: number;
   platform: string;
@@ -166,6 +191,9 @@ export interface Account {
   refresh_retry_at?: number;
   shared_quota?: boolean;
   supports_checkin?: boolean;
+  checkin_kind?: "standard" | "international_activity";
+  daily_reward?: DailyReward;
+  cooldowns?: AccountCooldown[];
   checkin_today?: number;
   checkin_streak?: number;
   checkin_streak_known?: boolean;
@@ -194,6 +222,10 @@ export interface ApiKey {
   enabled?: boolean;
 }
 export interface CallLog {
+  request_id?: string;
+  attempts?: CallAttempt[];
+  credit_actual?: number;
+  credit_cost?: number;
   ts?: number;
   platform?: string;
   account_id?: number;
@@ -209,6 +241,7 @@ export interface Settings {
   strategy?: string;
   auto_refresh?: string;
   refresh_ahead?: string;
+  rate_limit_default_seconds?: string;
   model_base_override?: string;
   allow_model_passthrough?: string;
   log_retention?: string;

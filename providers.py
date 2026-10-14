@@ -74,7 +74,8 @@ PLATFORMS = {
         "session_header": "X-CodeBuddy-Session-Id",
         # 实测：国际站要求 messages[0].role 必须是 system，否则 400 Parse message failed
         "require_leading_system": True,
-        "supports_checkin": False,
+        "supports_checkin": True,
+        "checkin_kind": "international_activity",
     },
     "workbuddy_intl": {
         "key": "workbuddy_intl",
@@ -89,7 +90,8 @@ PLATFORMS = {
         "session_header": "X-WorkBuddy-Session-Id",
         "user_agent": "WorkBuddy/5.7.6 WorkBuddy AI/5.7.6 CLI/2.156.0",
         "require_leading_system": True,
-        "supports_checkin": False,
+        "supports_checkin": True,
+        "checkin_kind": "international_activity",
     },
 }
 
@@ -107,6 +109,10 @@ UA = (
 
 class ProviderError(Exception):
     pass
+
+
+class ActivitySubmissionRejected(ProviderError):
+    """活动提交收到明确拒绝；区别于传输中断或结果不明。"""
 
 
 def _is_trae(platform_key: str) -> bool:
@@ -134,6 +140,8 @@ def platform_list() -> list:
         {"key": v["key"], "label": v["label"], "name": v["label"],
          "api_base": v["api_base"], "platform": v["platform"],
          "model_base": v["model_base"], "note": PLATFORM_NOTES.get(v["key"], ""),
+         "supports_checkin": bool(v.get("supports_checkin")),
+         "checkin_kind": v.get("checkin_kind", "standard"),
          "models": catalog_entries(v["key"])}
         for v in PLATFORMS.values()
     ]
@@ -1012,14 +1020,14 @@ def catalog_entries(platform_key: str) -> list:
 
 
 # --------------------------------------------------------------------------
-# 每日签到（workbuddy / trae；codebuddy 国际站无签到）
+# 普通每日签到（workbuddy / trae）；国际每日活动由 daily_rewards 统一处理
 # --------------------------------------------------------------------------
 #
 # 实测接口(2026-08-05, 真实账号, cockpit-tools 同款):
 #   状态: POST {api_base}/v2/billing/meter/checkin-activity-status   body {}
 #   领取: POST {api_base}/v2/billing/meter/daily-checkin             body {}
 # api_base 必须是 www.codebuddy.cn（copilot.tencent.com 该接口 404）。
-# 国际站(codebuddy)无签到能力。
+# 国际渠道使用活动/奖励协议，不走下面的国内普通签到接口。
 
 def supports_checkin(platform_key: str) -> bool:
     return bool(get_platform(platform_key).get("supports_checkin"))
@@ -1042,6 +1050,8 @@ def fetch_checkin_status(platform_key, access_token, uid=None, enterprise_id=Non
     if not supports_checkin(platform_key):
         return {"supported": False, "today_checked_in": False,
                 "streak_days": 0, "claimable": False, "raw": {}}
+    if get_platform(platform_key).get('checkin_kind') == 'international_activity':
+        raise ProviderError('国际每日奖励请使用统一每日维护入口')
     url = _checkin_status_url(platform_key)
     try:
         r = _session().post(url, headers=_billing_headers(access_token, uid, enterprise_id, domain),
@@ -1092,6 +1102,8 @@ def do_checkin(platform_key, access_token, uid=None, enterprise_id=None,
     if not supports_checkin(platform_key):
         raise ProviderError("该平台不支持签到")
 
+    if get_platform(platform_key).get('checkin_kind') == 'international_activity':
+        raise ProviderError('国际每日奖励请使用统一每日维护入口')
     url = _checkin_claim_url(platform_key)
     try:
         r = _session().post(url, headers=_billing_headers(access_token, uid, enterprise_id, domain),
@@ -1128,3 +1140,54 @@ def do_checkin(platform_key, access_token, uid=None, enterprise_id=None,
         "msg": str(body.get("msg") or body.get("message") or "OK"),
         "raw": data,
     }
+
+
+# 国际每日活动协议参考 codebuddy-intl-cpa；保留每个客户端自己的网关。
+def growth_request(acc: dict, path: str, method: str = "GET", payload=None) -> dict:
+    p = get_platform(acc["platform"])
+    submitting = method == "POST" and path == "/v2/report"
+    headers = _billing_headers(acc["access_token"], acc.get("uid"),
+                               acc.get("enterprise_id"), acc.get("domain"))
+    headers["User-Agent"] = p.get("user_agent", UA)
+    # 活动提交使用零重试会话；传输结果不明交给后续状态核验。
+    with (requests.Session() if method == "POST" else _session()) as session:
+        r = session.request(method, p["api_base"] + path, headers=headers,
+                            **({"json": payload} if payload is not None else {}), timeout=20,
+                            allow_redirects=not submitting)
+        if submitting and 400 <= r.status_code < 500:
+            raise ActivitySubmissionRejected("国际活动 HTTP %s: %s" % (r.status_code, r.text[:200]))
+        _require_http_success(r, "国际活动")
+        body = r.json()
+    if not _ok(body):
+        error_class = ActivitySubmissionRejected if submitting else ProviderError
+        raise error_class("国际活动 code=%s: %s" % (body.get("code"), _msg(body)))
+    return body.get("data") or {}
+
+
+def fetch_growth_packages(acc: dict) -> list:
+    """查询完整奖励账本（含耗尽/过期包），不沿用余额页的未来到期筛选。"""
+    packages, seen_pages = [], set()
+    for page in range(1, 101):
+        data = growth_request(acc, '/v2/billing/meter/get-user-resource', method='POST', payload={
+            'PageNumber': page, 'PageSize': 100, 'ProductCode': DEFAULT_PRODUCT_CODE,
+            'Status': [], 'PackageEndTimeRangeBegin': '1970-01-01 00:00:00',
+            'PackageEndTimeRangeEnd': '2100-01-01 00:00:00',
+        })
+        inner = (data.get('Response') or {}).get('Data') or {}
+        rows = inner.get('Accounts')
+        if not isinstance(rows, list):
+            raise ProviderError('奖励账本缺少套餐明细，待核验')
+        fingerprint = json.dumps(rows, sort_keys=True)
+        if rows and fingerprint in seen_pages:
+            raise ProviderError('奖励账本分页重复，待核验')
+        seen_pages.add(fingerprint)
+        packages.extend(rows)
+        total = inner.get('TotalCount')
+        if total is not None:
+            if len(packages) >= int(total):
+                return packages
+            if not rows:
+                raise ProviderError('奖励账本分页不完整，待核验')
+        elif len(rows) < 100:
+            return packages
+    raise ProviderError('奖励账本超过分页上限，待核验')

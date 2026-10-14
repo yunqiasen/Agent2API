@@ -1,3 +1,5 @@
+import { CooldownCard } from "./cooldown";
+import { DailyRewardCard, rewardMessage } from "./daily-reward";
 import { startLoginPoll } from "@/lib/login-poll";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -39,6 +41,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   ApiError,
   type JoinPollResp,
+  type DailyReward,
+  type CheckinSummary,
   type ModelEntry,
   type ModelSyncResult,
   apiDelete,
@@ -46,6 +50,7 @@ import {
   apiPatch,
   apiPost,
   ago,
+  fmtTs,
   num,
   platName,
   PLATFORMS,
@@ -521,7 +526,7 @@ function ImportDialog({ open, onOpenChange, onAdded }: { open: boolean; onOpenCh
       <DialogContent>
         <DialogHeader>
           <DialogTitle>导入 Token / JSON</DialogTitle>
-          <DialogDescription>粘贴 Cockpit Tools 导出的 JSON，或手填 access_token。</DialogDescription>
+          <DialogDescription>选择对应客户端，粘贴明文凭证 JSON（支持扁平或 auth/account 格式），或手填访问与刷新令牌。</DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
           <div className="space-y-2">
@@ -594,6 +599,8 @@ export function Accounts() {
   const now = Math.floor(Date.now() / 1000);
   const total = filtered.length;
   const enabled = filtered.filter((a) => a.enabled).length;
+  const internationalCount = filtered.filter(a => a.checkin_kind === "international_activity").length;
+  const onlyInternational = total > 0 && internationalCount === total;
   const claimable = filtered.reduce(
     (s, a) => s + (a.supports_checkin && !a.checkin_today ? a.checkin_credit || 0 : 0),
     0
@@ -628,10 +635,11 @@ export function Accounts() {
     try {
       const d = await apiPost<{
         ok: boolean; claimed_credit?: number; skipped?: boolean;
-        reason?: string; error?: string;
+        reason?: string; error?: string; checkin_kind?: string; daily_reward?: DailyReward;
       }>(`/api/accounts/${id}/checkin`, {});
       if (d.ok) {
-        if (d.skipped) toast.success(d.reason || "上游确认今日已签到");
+        if (d.checkin_kind === "international_activity") toast(rewardMessage(d.daily_reward));
+        else if (d.skipped) toast.success(d.reason || "上游确认今日已签到");
         else toast.success(d.claimed_credit ? `签到成功，获得 ${d.claimed_credit} 积分` : "签到成功");
       } else toast.error("签到失败：" + (d.error || ""));
     } catch (e) {
@@ -651,21 +659,21 @@ export function Accounts() {
     toast(`正在签到${scope}账号…`);
     try {
       const d = await apiPost<{
-        ok: boolean;
+        ok: boolean; summary?: CheckinSummary;
         results: { id: number; ok: boolean; skipped?: boolean; reason?: string; error?: string }[];
       }>("/api/accounts/checkin_all",
         platformFilter === "all" ? {} : { platform: platformFilter });
-      const success = d.results.filter((x) => x.ok && !x.skipped).length;
-      const skipped = d.results.filter((x) => x.skipped).length;
+      const success = d.summary?.new_checkin ?? d.results.filter((x) => x.ok && !x.skipped).length;
+      const skipped = d.summary?.skipped ?? d.results.filter((x) => x.skipped).length;
       const failed = d.results.filter((x) => !x.ok);
+      const summary = `新签到 ${success}，已签/已活跃跳过 ${skipped}，国际待核验 ${d.summary?.pending_verification ?? 0}，国际待到账 ${d.summary?.pending_reward ?? 0}，奖励到账 ${d.summary?.credited ?? 0}，不适用 ${d.summary?.not_applicable ?? 0}，失败 ${failed.length}`;
       if (failed.length > 0) {
         toast.error(
-          `签到结束（${scope}）：新签到 ${success}，已签跳过 ${skipped}，失败 ${failed.length}。` +
-          `首个错误：#${failed[0].id} ${failed[0].error || "未知错误"}`,
+          `签到结束（${scope}）：${summary}。` + failed.map(x => `#${x.id} ${x.error || "未知错误"}`).join("；"),
           { duration: 10000 },
         );
       } else {
-        toast.success(`签到结束（${scope}）：新签到 ${success}，已签跳过 ${skipped}，失败 0`);
+        toast.success(`签到结束（${scope}）：${summary}`);
       }
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "批量签到失败");
@@ -703,7 +711,14 @@ export function Accounts() {
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Tile tone="indigo" icon={Users} label="账号总数" value={num(total)} hint="个" delay={0} />
         <Tile tone="emerald" icon={Activity} label="允许调用" value={num(enabled)} hint="个" delay={80} />
-        <Tile tone="amber" icon={Gift} label="今日可领积分" value={num(claimable)} hint="分" delay={160} />
+        <Tile tone="amber" icon={Gift}
+          label={onlyInternational ? "国际每日奖励" : internationalCount ? "普通签到可领" : "今日可领积分"}
+          value={onlyInternational ? <span>
+            <span className="block whitespace-nowrap text-lg">见账号卡片</span>
+            <span className="mt-1 block text-[11px] font-normal tracking-normal text-muted-foreground">活动确认与到账分别展示</span>
+          </span> : num(claimable)}
+          hint={onlyInternational ? undefined : internationalCount ? "分 · 国际奖励见卡片" : "分"}
+          delay={160} />
         <Tile tone="rose" icon={AlertTriangle} label="即将过期" value={num(expiring)} hint="个" delay={240} />
       </div>
 
@@ -797,8 +812,12 @@ export function Accounts() {
                       <span className="text-muted-foreground">{a.last_refresh_at ? `成功于 ${ago(a.last_refresh_at)}` : "尚无成功续期记录"}</span>
                     )}
                   </div>
+                  {a.refresh_error && !!a.refresh_retry_at && (
+                    <p className="text-[11px] text-muted-foreground">下次重试：{fmtTs(a.refresh_retry_at)}</p>
+                  )}
+                  <CooldownCard items={a.cooldowns} />
                   {a.shared_quota && <p className="text-[11px] text-muted-foreground">与另一国际渠道共享额度，汇总只计一次</p>}
-                  <div className="flex items-center justify-between text-xs">
+                  {a.checkin_kind === "international_activity" ? <DailyRewardCard state={a.daily_reward} /> : <div className="flex items-center justify-between text-xs">
                     <span className="text-muted-foreground">签到</span>
                     <span className="flex items-center gap-1.5">
                       <CheckinBadge a={a} />
@@ -806,7 +825,7 @@ export function Accounts() {
                         <span className="text-[10px] text-muted-foreground">同步于 {ago(a.checkin_updated_at)}</span>
                       ) : null}
                     </span>
-                  </div>
+                  </div>}
                   <div className="flex items-center justify-between text-xs">
                     <span className="text-muted-foreground">本站调用</span>
                     <span className="tabular-nums">

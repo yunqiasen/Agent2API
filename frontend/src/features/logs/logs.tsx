@@ -19,7 +19,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { apiDelete, apiGet, fmtTs, platName, PLATFORMS, type CallLog } from "@/lib/api";
+import { apiDelete, apiGet, fmtTs, num, platName, PLATFORMS, type CallLog } from "@/lib/api";
 import { PageHeader, SectionCard, Chip, toneFor } from "@/lib/design";
 
 type StatusFilter = "all" | "success" | "fail";
@@ -130,13 +130,14 @@ export function Logs() {
                 <th className="px-3 py-2.5 font-medium">状态</th>
                 <th className="px-3 py-2.5 text-right font-medium">耗时</th>
                 <th className="px-3 py-2.5 text-right font-medium">输入字符</th>
+                <th className="px-5 py-2.5 font-medium">换号与费用</th>
                 <th className="px-5 py-2.5 font-medium">错误</th>
               </tr>
             </thead>
             <tbody>
               {filtered.length === 0 && (
                 <tr>
-                  <td colSpan={9} className="px-5 py-10 text-center text-xs text-muted-foreground">
+                  <td colSpan={10} className="px-5 py-10 text-center text-xs text-muted-foreground">
                     暂无匹配日志
                   </td>
                 </tr>
@@ -196,6 +197,22 @@ export function Logs() {
                     </td>
                     <td className="px-3 py-2.5 text-right font-mono text-xs tabular-nums text-muted-foreground">
                       {l.prompt_chars || 0}
+                    </td>
+                    <td className="min-w-[12rem] max-w-[25rem] px-3 py-2.5 text-[11px]">
+                      <p>{l.credit_actual ? `费用 ${num(l.credit_cost)} 积分` : "费用未知（上游未返回）"}</p>
+                      {!!l.attempts?.length && <details className="mt-1">
+                        <summary className="cursor-pointer">{l.attempts.length} 次尝试</summary>
+                        <p className="break-all text-muted-foreground">请求 {l.request_id}</p>
+                        <ol className="space-y-2 py-1">
+                          {l.attempts.map((a, index) => <li key={index} className="break-words">
+                            <p>{index + 1}. #{a.account_id} {platName(a.platform)} · {a.kind} · {a.status}</p>
+                            {!!a.http_status && <p>上游 HTTP {a.http_status}{a.code ? ` / code ${a.code}` : ""}</p>}
+                            {!!a.retry_at && <p>恢复：{fmtTs(a.retry_at)}</p>}
+                            {a.message && <p>{a.message}</p>}
+                            <p>{a.credit == null ? "本次费用未知" : `本次费用 ${num(a.credit)} 积分`}</p>
+                          </li>)}
+                        </ol>
+                      </details>}
                     </td>
                     <td className="max-w-[16rem] truncate px-5 py-2.5 text-xs text-muted-foreground" title={l.error || ""}>
                       {l.error ? l.error.slice(0, 40) : ""}
